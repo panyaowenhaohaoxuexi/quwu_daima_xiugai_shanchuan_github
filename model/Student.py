@@ -1,0 +1,738 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops.layers.torch import Rearrange  # 导入einops库，用于张量维度重排
+import math
+
+
+class ConvBlock(torch.nn.Module):
+    """
+    标准卷积块 (Conv -> Norm -> Activation)
+    """
+
+    def __init__(self, input_size, output_size, kernel_size=3, stride=1, padding=1, bias=True, activation='prelu',
+                 norm=None):
+        super(ConvBlock, self).__init__()
+        self.conv = torch.nn.Conv2d(input_size, output_size, kernel_size, stride, padding, bias=bias)
+
+        # 归一化层
+        self.norm = norm
+        if self.norm == 'batch':
+            self.bn = torch.nn.BatchNorm2d(output_size)
+        elif self.norm == 'instance':
+            self.bn = torch.nn.InstanceNorm2d(output_size)
+
+        # 激活层
+        self.activation = activation
+        if self.activation == 'relu':
+            self.act = torch.nn.ReLU(True)
+        elif self.activation == 'prelu':
+            self.act = torch.nn.PReLU()
+        elif self.activation == 'lrelu':
+            self.act = torch.nn.LeakyReLU(0.2, True)
+        elif self.activation == 'tanh':
+            self.act = torch.nn.Tanh()
+        elif self.activation == 'sigmoid':
+            self.act = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        if self.norm is not None:
+            out = self.bn(self.conv(x))
+        else:
+            out = self.conv(x)
+
+        if self.activation != 'no':  # 'no' 表示不使用激活函数
+            return self.act(out)
+        else:
+            return out
+
+
+class DeconvBlock(torch.nn.Module):
+    """
+    标准反卷积（转置卷积）块 (Deconv -> Norm -> Activation)
+    """
+
+    def __init__(self, input_size, output_size, kernel_size=4, stride=2, padding=1, bias=True, activation='prelu',
+                 norm=None):
+        super(DeconvBlock, self).__init__()
+        self.deconv = torch.nn.ConvTranspose2d(input_size, output_size, kernel_size, stride, padding, bias=bias)
+
+        # 归一化层
+        self.norm = norm
+        if self.norm == 'batch':
+            self.bn = torch.nn.BatchNorm2d(output_size)
+        elif self.norm == 'instance':
+            self.bn = torch.nn.InstanceNorm2d(output_size)
+
+        # 激活层
+        self.activation = activation
+        if self.activation == 'relu':
+            self.act = torch.nn.ReLU(True)
+        elif self.activation == 'prelu':
+            self.act = torch.nn.PReLU()
+        elif self.activation == 'lrelu':
+            self.act = torch.nn.LeakyReLU(0.2, True)
+        elif self.activation == 'tanh':
+            self.act = torch.nn.Tanh()
+        elif self.activation == 'sigmoid':
+            self.act = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        if self.norm is not None:
+            out = self.bn(self.deconv(x))
+        else:
+            out = self.deconv(x)
+
+        if self.activation is not None:
+            return self.act(out)
+        else:
+            return out
+
+
+class Decoder_MDCBlock1(torch.nn.Module):
+    """
+    多尺度解码器/融合块 (MDCBlock)。
+    用于融合来自不同层级（尺度）的特征。
+    """
+
+    def __init__(self, num_filter, num_ft, kernel_size=4, stride=2, padding=1, bias=True, activation='prelu', norm=None,
+                 mode='iter1'):
+        super(Decoder_MDCBlock1, self).__init__()
+        self.mode = mode  # 融合模式 (如 'iter1', 'iter2' 等)
+        self.num_ft = num_ft - 1  # 特征层级的数量
+        self.down_convs = nn.ModuleList()  # 下采样卷积列表
+        self.up_convs = nn.ModuleList()  # 上采样反卷积列表
+        # 根据层级数，创建对应的下采样（Conv）和上采样（Deconv）卷积
+        # 通道数随着层级加深而加倍
+        for i in range(self.num_ft):
+            self.down_convs.append(
+                ConvBlock(num_filter * (2 ** i), num_filter * (2 ** (i + 1)), kernel_size, stride, padding, bias,
+                          activation, norm=None)
+            )
+            self.up_convs.append(
+                DeconvBlock(num_filter * (2 ** (i + 1)), num_filter * (2 ** i), kernel_size, stride, padding, bias,
+                            activation, norm=None)
+            )
+
+    def forward(self, ft_h, ft_l_list):
+        """
+        :param ft_h: 当前层级（高层，High-level）的特征
+        :param ft_l_list: 之前所有（低层，Low-level）特征的列表
+        """
+        if self.mode == 'iter1' or self.mode == 'conv':
+            # 模式1
+            ft_h_list = []
+            for i in range(len(ft_l_list)):
+                ft_h_list.append(ft_h)
+                ft_h = self.down_convs[self.num_ft - len(ft_l_list) + i](ft_h)
+
+            ft_fusion = ft_h
+            for i in range(len(ft_l_list)):
+                ft_fusion = self.up_convs[self.num_ft - i - 1](ft_fusion - ft_l_list[i]) + ft_h_list[
+                    len(ft_l_list) - i - 1]
+
+        if self.mode == 'iter2':
+            # 模式2：(代码中使用的模式)
+            ft_fusion = ft_h  # 融合结果初始化为当前特征
+            for i in range(len(ft_l_list)):  # 遍历所有低层特征
+                ft = ft_fusion
+                # 1. 将当前融合特征下采样到与 ft_l_list[i] 相同的尺度
+                for j in range(self.num_ft - i):
+                    ft = self.down_convs[j](ft)
+
+                ft = ft - ft_l_list[i]  # 2. 计算差异
+
+                # 3. 将差异上采样回原始尺度
+                for j in range(self.num_ft - i):
+                    ft = self.up_convs[self.num_ft - i - j - 1](ft)
+
+                ft_fusion = ft_fusion + ft  # 4. 将差异（校正）加回到融合特征上
+
+        if self.mode == 'iter3':
+            # 模式3
+            ft_fusion = ft_h
+            for i in range(len(ft_l_list)):
+                ft = ft_fusion
+                for j in range(i + 1):
+                    ft = self.down_convs[j](ft)
+                ft = ft - ft_l_list[len(ft_l_list) - i - 1]
+                for j in range(i + 1):
+                    # print(j)
+                    ft = self.up_convs[i + 1 - j - 1](ft)
+                ft_fusion = ft_fusion + ft
+
+        if self.mode == 'iter4':
+            # 模式4
+            ft_fusion = ft_h
+            for i in range(len(ft_l_list)):
+                ft = ft_h
+                for j in range(self.num_ft - i):
+                    ft = self.down_convs[j](ft)
+                ft = ft - ft_l_list[i]
+                for j in range(self.num_ft - i):
+                    ft = self.up_convs[self.num_ft - i - j - 1](ft)
+                ft_fusion = ft_fusion + ft
+
+        return ft_fusion
+
+
+class Encoder_MDCBlock1(torch.nn.Module):
+    """
+    多尺度编码器/融合块 (MDCBlock)。
+    与 Decoder_MDCBlock1 结构对称，用于编码器阶段的特征融合。
+    """
+
+    def __init__(self, num_filter, num_ft, kernel_size=4, stride=2, padding=1, bias=True, activation='prelu', norm=None,
+                 mode='iter1'):
+        super(Encoder_MDCBlock1, self).__init__()
+        self.mode = mode
+        self.num_ft = num_ft - 1
+        self.up_convs = nn.ModuleList()  # 上采样反卷积列表
+        self.down_convs = nn.ModuleList()  # 下采样卷积列表
+        # 注意：这里的通道数变化与Decoder相反，是逐级减半
+        for i in range(self.num_ft):
+            self.up_convs.append(
+                DeconvBlock(num_filter // (2 ** i), num_filter // (2 ** (i + 1)), kernel_size, stride, padding, bias,
+                            activation, norm=None)
+            )
+            self.down_convs.append(
+                ConvBlock(num_filter // (2 ** (i + 1)), num_filter // (2 ** i), kernel_size, stride, padding, bias,
+                          activation, norm=None)
+            )
+
+    def forward(self, ft_l, ft_h_list):
+        """
+        :param ft_l: 当前层级（低层，Low-level）的特征
+        :param ft_h_list: 之前所有（高层，High-level）特征的列表
+        """
+        if self.mode == 'iter1' or self.mode == 'conv':
+            # 模式1
+            ft_l_list = []
+            for i in range(len(ft_h_list)):
+                ft_l_list.append(ft_l)
+                ft_l = self.up_convs[self.num_ft - len(ft_h_list) + i](ft_l)
+
+            ft_fusion = ft_l
+            for i in range(len(ft_h_list)):
+                ft_fusion = self.down_convs[self.num_ft - i - 1](ft_fusion - ft_h_list[i]) + ft_l_list[
+                    len(ft_h_list) - i - 1]
+
+        if self.mode == 'iter2':
+            # 模式2：(代码中使用的模式)
+            ft_fusion = ft_l  # 融合结果初始化为当前特征
+            for i in range(len(ft_h_list)):  # 遍历所有高层特征
+                ft = ft_fusion
+                # 1. 将当前融合特征上采样到与 ft_h_list[i] 相同的尺度
+                for j in range(self.num_ft - i):
+                    ft = self.up_convs[j](ft)
+
+                ft = ft - ft_h_list[i]  # 2. 计算差异
+
+                # 3. 将差异下采样回原始尺度
+                for j in range(self.num_ft - i):
+                    # print(j)
+                    ft = self.down_convs[self.num_ft - i - j - 1](ft)
+
+                ft_fusion = ft_fusion + ft  # 4. 将差异（校正）加回到融合特征上
+
+        if self.mode == 'iter3':
+            # 模式3
+            ft_fusion = ft_l
+            for i in range(len(ft_h_list)):
+                ft = ft_fusion
+                for j in range(i + 1):
+                    ft = self.up_convs[j](ft)
+                ft = ft - ft_h_list[len(ft_h_list) - i - 1]
+                for j in range(i + 1):
+                    # print(j)
+                    ft = self.down_convs[i + 1 - j - 1](ft)
+                ft_fusion = ft_fusion + ft
+
+        if self.mode == 'iter4':
+            # 模式4
+            ft_fusion = ft_l
+            for i in range(len(ft_h_list)):
+                ft = ft_l
+                for j in range(self.num_ft - i):
+                    ft = self.up_convs[j](ft)
+                ft = ft - ft_h_list[i]
+                for j in range(self.num_ft - i):
+                    # print(j)
+                    ft = self.down_convs[self.num_ft - i - j - 1](ft)
+                ft_fusion = ft_fusion + ft
+
+        return ft_fusion
+
+
+class make_dense(nn.Module):
+    """
+    密集连接块的单层实现（用于RDB）
+    """
+
+    def __init__(self, nChannels, growthRate, kernel_size=3):
+        super(make_dense, self).__init__()
+        self.conv = nn.Conv2d(nChannels, growthRate, kernel_size=kernel_size, padding=(kernel_size - 1) // 2,
+                              bias=False)
+
+    def forward(self, x):
+        out = F.relu(self.conv(x))
+        out = torch.cat((x, out), 1)  # 将输入和输出在通道上拼接
+        return out
+
+
+# Residual dense block (RDB) architecture
+class RDB(nn.Module):
+    """
+    残差密集块 (Residual Dense Block)
+    """
+
+    def __init__(self, nChannels, nDenselayer, growthRate, scale=1.0):
+        super(RDB, self).__init__()
+        nChannels_ = nChannels
+        self.scale = scale
+        modules = []
+        for i in range(nDenselayer):  # 堆叠多个 'make_dense' 层
+            modules.append(make_dense(nChannels_, growthRate))
+            nChannels_ += growthRate  # 通道数随层数增加
+        self.dense_layers = nn.Sequential(*modules)
+        self.conv_1x1 = nn.Conv2d(nChannels_, nChannels, kernel_size=1, padding=0, bias=False)  # 1x1卷积，恢复通道数
+
+    def forward(self, x):
+        out = self.dense_layers(x)
+        out = self.conv_1x1(out) * self.scale  # 1x1卷积，并乘以一个缩放因子
+        out = out + x  # 添加残差连接 (Short Skip Connection)
+        return out
+
+
+class ConvLayer(nn.Module):
+    """
+    带反射填充 (ReflectionPad) 的卷积层
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride):
+        super(ConvLayer, self).__init__()
+        reflection_padding = kernel_size // 2
+        self.reflection_pad = nn.ReflectionPad2d(reflection_padding)
+        self.conv2d = nn.Conv2d(in_channels, out_channels, kernel_size, stride)
+
+    def forward(self, x):
+        out = self.reflection_pad(x)
+        out = self.conv2d(out)
+        return out
+
+
+class UpsampleConvLayer(torch.nn.Module):
+    """
+    上采样层，使用 'nearest-exact' 插值 + 1x1 卷积
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride):
+        super(UpsampleConvLayer, self).__init__()
+        self.stride = stride
+        self.kernel_size = kernel_size
+        self.conv2d = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1)
+
+    def forward(self, x):
+        # 计算插值后的目标高宽
+        h = (x.shape[2] - 1) * self.stride + self.kernel_size
+        w = (x.shape[3] - 1) * self.stride + self.kernel_size
+        x = F.interpolate(x, size=(h, w), mode="nearest-exact")  # 最近邻插值
+        out = self.conv2d(x)  # 1x1 卷积
+        return out
+
+
+class Conv2d_cd(nn.Module):
+    """
+    中央差分卷积 (Central Difference Convolution)
+    它不直接执行 'forward'，而是提供 'get_weight' 方法来获取差分卷积核。
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
+                 padding=1, dilation=1, groups=1, bias=False, theta=1.0):
+        super(Conv2d_cd, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding,
+                              dilation=dilation, groups=groups, bias=bias)
+        self.theta = theta  # (在此实现中未使用)
+
+    def get_weight(self):
+        conv_weight = self.conv.weight  # 获取原始卷积核
+        conv_shape = conv_weight.shape
+        # 重排权重以便操作
+        conv_weight = Rearrange('c_in c_out k1 k2 -> c_in c_out (k1 k2)')(conv_weight)
+        conv_weight_cd = torch.cuda.FloatTensor(conv_shape[0], conv_shape[1], 3 * 3).fill_(0)
+        conv_weight_cd[:, :, :] = conv_weight[:, :, :]
+        # 核心：将中心权重替换为 (中心 - 周围总和)
+        conv_weight_cd[:, :, 4] = conv_weight[:, :, 4] - conv_weight[:, :, :].sum(2)
+        # 重排回原始形状
+        conv_weight_cd = Rearrange('c_in c_out (k1 k2) -> c_in c_out k1 k2', k1=conv_shape[2], k2=conv_shape[3])(
+            conv_weight_cd)
+        return conv_weight_cd, self.conv.bias
+
+
+class Conv2d_ad(nn.Module):
+    """
+    各向异性差分卷积 (Anisotropic Difference Convolution)
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
+                 padding=1, dilation=1, groups=1, bias=False, theta=1.0):
+        super(Conv2d_ad, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding,
+                              dilation=dilation, groups=groups, bias=bias)
+        self.theta = theta
+
+    def get_weight(self):
+        conv_weight = self.conv.weight
+        conv_shape = conv_weight.shape
+        conv_weight = Rearrange('c_in c_out k1 k2 -> c_in c_out (k1 k2)')(conv_weight)
+        # 核心：权重 = 原始权重 - theta * 旋转90度的权重
+        conv_weight_ad = conv_weight - self.theta * conv_weight[:, :, [3, 0, 1, 6, 4, 2, 7, 8, 5]]
+        conv_weight_ad = Rearrange('c_in c_out (k1 k2) -> c_in c_out k1 k2', k1=conv_shape[2], k2=conv_shape[3])(
+            conv_weight_ad)
+        return conv_weight_ad, self.conv.bias
+
+
+class Conv2d_rd(nn.Module):
+    """
+    径向差分卷积 (Radial Difference Convolution)
+    这个模块重写了 'forward' 方法。
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
+                 padding=2, dilation=1, groups=1, bias=False, theta=1.0):
+
+        super(Conv2d_rd, self).__init__()
+        # 注意：这里 padding=2
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding,
+                              dilation=dilation, groups=groups, bias=bias)
+        self.theta = theta
+
+    def forward(self, x):
+
+        if math.fabs(self.theta - 0.0) < 1e-8:
+            # theta 接近 0 时，等同于标准卷积
+            out_normal = self.conv(x)
+            return out_normal
+        else:
+            conv_weight = self.conv.weight
+            conv_shape = conv_weight.shape
+            # 创建一个 5x5 的空卷积核
+            if conv_weight.is_cuda:
+                conv_weight_rd = torch.cuda.FloatTensor(conv_shape[0], conv_shape[1], 5 * 5).fill_(0)
+            else:
+                conv_weight_rd = torch.zeros(conv_shape[0], conv_shape[1], 5 * 5)
+
+            # 将 3x3 权重重排
+            conv_weight = Rearrange('c_in c_out k1 k2 -> c_in c_out (k1 k2)')(conv_weight)
+            # 核心：构建 5x5 的径向差分核
+            conv_weight_rd[:, :, [0, 2, 4, 10, 14, 20, 22, 24]] = conv_weight[:, :, 1:]  # 角落
+            conv_weight_rd[:, :, [6, 7, 8, 11, 13, 16, 17, 18]] = -conv_weight[:, :, 1:] * self.theta  # 相邻
+            conv_weight_rd[:, :, 12] = conv_weight[:, :, 0] * (1 - self.theta)  # 中心
+            conv_weight_rd = conv_weight_rd.view(conv_shape[0], conv_shape[1], 5, 5)  # 恢复 5x5 形状
+
+            # 使用构建好的 5x5 核进行卷积
+            out_diff = nn.functional.conv2d(input=x, weight=conv_weight_rd, bias=self.conv.bias,
+                                            stride=self.conv.stride, padding=self.conv.padding, groups=self.conv.groups)
+
+            return out_diff
+
+
+class Conv2d_hd(nn.Module):
+    """
+    水平差分卷积 (Horizontal Difference Convolution)
+    使用 1D 卷积核来构建 2D 卷积核
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
+                 padding=1, dilation=1, groups=1, bias=False, theta=1.0):
+        super(Conv2d_hd, self).__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding,
+                              dilation=dilation, groups=groups, bias=bias)
+
+    def get_weight(self):
+        conv_weight = self.conv.weight  # 获取 1D 卷积核
+        conv_shape = conv_weight.shape
+        conv_weight_hd = torch.cuda.FloatTensor(conv_shape[0], conv_shape[1], 3 * 3).fill_(0)
+        # 核心：构建 [w, 0, -w] 形式的 3x3 核
+        conv_weight_hd[:, :, [0, 3, 6]] = conv_weight[:, :, :]  # 左列
+        conv_weight_hd[:, :, [2, 5, 8]] = -conv_weight[:, :, :]  # 右列
+        conv_weight_hd = Rearrange('c_in c_out (k1 k2) -> c_in c_out k1 k2', k1=3, k2=3)(
+            conv_weight_hd)
+        return conv_weight_hd, self.conv.bias
+
+
+class Conv2d_vd(nn.Module):
+    """
+    垂直差分卷积 (Vertical Difference Convolution)
+    使用 1D 卷积核来构建 2D 卷积核
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
+                 padding=1, dilation=1, groups=1, bias=False):
+        super(Conv2d_vd, self).__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding,
+                              dilation=dilation, groups=groups, bias=bias)
+
+    def get_weight(self):
+        conv_weight = self.conv.weight  # 获取 1D 卷积核
+        conv_shape = conv_weight.shape
+        conv_weight_vd = torch.cuda.FloatTensor(conv_shape[0], conv_shape[1], 3 * 3).fill_(0)
+        # 核心：构建 [w; 0; -w] 形式的 3x3 核
+        conv_weight_vd[:, :, [0, 1, 2]] = conv_weight[:, :, :]  # 顶行
+        conv_weight_vd[:, :, [6, 7, 8]] = -conv_weight[:, :, :]  # 底行
+        conv_weight_vd = Rearrange('c_in c_out (k1 k2) -> c_in c_out k1 k2', k1=3, k2=3)(
+            conv_weight_vd)
+        return conv_weight_vd, self.conv.bias
+
+
+class DEConv(nn.Module):
+    """
+    差分增强卷积 (Difference-Enhanced Convolution)
+    将多种差分卷积（CD, HD, VD, AD）和标准卷积组合。
+    """
+
+    def __init__(self, dim):
+        super(DEConv, self).__init__()
+
+        self.conv1_1 = Conv2d_cd(dim, dim, 3, bias=True)  # 中央差分
+        self.conv1_2 = Conv2d_hd(dim, dim, 3, bias=True)  # 水平差分
+        self.conv1_3 = Conv2d_vd(dim, dim, 3, bias=True)  # 垂直差分
+        self.conv1_4 = Conv2d_ad(dim, dim, 3, bias=True)  # 各向异性差分
+        self.conv1_5 = nn.Conv2d(dim, dim, 3, padding=1, bias=True)  # 标准卷积
+
+    def forward(self, x):
+        # 获取所有卷积核的权重和偏置
+        w1, b1 = self.conv1_1.get_weight()
+        w2, b2 = self.conv1_2.get_weight()
+        w3, b3 = self.conv1_3.get_weight()
+        w4, b4 = self.conv1_4.get_weight()
+        w5, b5 = self.conv1_5.weight, self.conv1_5.bias
+
+        # 核心：将所有权重相加，所有偏置相加
+        w = w1 + w2 + w3 + w4 + w5
+        b = b1 + b2 + b3 + b4 + b5
+        # 使用融合后的权重和偏置进行一次卷积
+        res = nn.functional.conv2d(input=x, weight=w, bias=b, stride=1, padding=1, groups=1)
+        return res
+
+
+class ResidualBlock(torch.nn.Module):
+    """
+    使用 DEConv 构建的残差块
+    """
+
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = DEConv(channels)  # 第一个 DEConv
+        self.conv2 = DEConv(channels)  # 第二个 DEConv
+        self.relu = nn.PReLU()
+
+    def forward(self, x):
+        residual = x
+        out = self.relu(self.conv1(x))
+        out = self.conv2(out) * 0.1  # 残差缩放
+        out = torch.add(out, residual)  # 添加残差
+        return out
+
+
+class Student(nn.Module):
+    """
+    学生模型 (Student Model)
+    这是一个轻量级的编码器-解码器结构，用于知识蒸馏。
+    """
+
+    def __init__(self, res_blocks=1):
+        super(Student, self).__init__()
+
+        # --- 编码器 (Encoder) ---
+
+        # 1. 初始卷积
+        self.conv_input = ConvLayer(3, 8, kernel_size=11, stride=1)
+        self.dense0 = nn.Sequential(
+            ResidualBlock(8)
+        )
+
+        # 2. 阶段 1 (x1 -> x2)
+        self.conv2x = ConvLayer(8, 16, kernel_size=3, stride=2)  # 下采样
+        self.conv1 = RDB(8, 4, 8)  # RDB 处理一半特征
+        self.fusion1 = Encoder_MDCBlock1(8, 2, mode='iter2')  # MDCBlock 融合另一半
+        self.dense1 = nn.Sequential(
+            ResidualBlock(16)
+        )
+
+        # 3. 阶段 2 (x2 -> x4)
+        self.conv4x = ConvLayer(16, 32, kernel_size=3, stride=2)
+        self.conv2 = RDB(16, 4, 16)
+        self.fusion2 = Encoder_MDCBlock1(16, 3, mode='iter2')
+        self.dense2 = nn.Sequential(
+            ResidualBlock(32)
+        )
+
+        # 4. 阶段 3 (x4 -> x8)
+        self.conv8x = ConvLayer(32, 64, kernel_size=3, stride=2)
+        self.conv3 = RDB(32, 4, 32)
+        self.fusion3 = Encoder_MDCBlock1(32, 4, mode='iter2')
+        self.dense3 = nn.Sequential(
+            ResidualBlock(64)
+        )
+
+        # 5. 阶段 4 (x8 -> x16)
+        self.conv16x = ConvLayer(64, 128, kernel_size=3, stride=2)
+        self.conv4 = RDB(64, 4, 64)
+        self.fusion4 = Encoder_MDCBlock1(64, 5, mode='iter2')
+
+        # --- 解码器 (Decoder) ---
+
+        # 6. 瓶颈层 (Bottleneck)
+        self.dehaze = nn.Sequential()
+        for i in range(0, res_blocks):
+            self.dehaze.add_module('res%d' % i, ResidualBlock(128))
+
+        # 7. 解码器阶段 1 (x16 -> x8)
+        self.convd16x = UpsampleConvLayer(128, 64, kernel_size=3, stride=2)
+        self.dense_4 = nn.Sequential(
+            ResidualBlock(64)
+        )
+        self.conv_4 = RDB(32, 4, 32)
+        self.fusion_4 = Decoder_MDCBlock1(32, 2, mode='iter2')
+
+        # 8. 解码器阶段 2 (x8 -> x4)
+        self.convd8x = UpsampleConvLayer(64, 32, kernel_size=3, stride=2)
+        self.dense_3 = nn.Sequential(
+            ResidualBlock(32)
+        )
+        self.conv_3 = RDB(16, 4, 16)
+        self.fusion_3 = Decoder_MDCBlock1(16, 3, mode='iter2')
+
+        # 9. 解码器阶段 3 (x4 -> x2)
+        self.convd4x = UpsampleConvLayer(32, 16, kernel_size=3, stride=2)
+        self.dense_2 = nn.Sequential(
+            ResidualBlock(16)
+        )
+        self.conv_2 = RDB(8, 4, 8)
+        self.fusion_2 = Decoder_MDCBlock1(8, 4, mode='iter2')
+
+        # 10. 解码器阶段 4 (x2 -> x1)
+        self.convd2x = UpsampleConvLayer(16, 8, kernel_size=3, stride=2)
+        self.dense_1 = nn.Sequential(
+            ResidualBlock(8)
+        )
+        self.conv_1 = RDB(4, 4, 4)
+        self.fusion_1 = Decoder_MDCBlock1(4, 5, mode='iter2')
+
+        # 11. 输出卷积
+        self.conv_output = ConvLayer(8, 3, kernel_size=3, stride=1)
+
+    def forward(self, x):
+        ini = x  # 保存原始输入（未使用）
+
+        # --- 编码器 ---
+        res1x = self.conv_input(x)
+        res1x_1, res1x_2 = res1x.split([(res1x.size()[1] // 2), (res1x.size()[1] // 2)], dim=1)  # 特征分割
+        feature_mem = [res1x_1]  # 初始化MDCBlock的特征列表
+        x = self.dense0(res1x) + res1x  # 残差连接
+
+        res2x = self.conv2x(x)  # 下采样
+        res2x_1, res2x_2 = res2x.split([(res2x.size()[1] // 2), (res2x.size()[1] // 2)], dim=1)
+        res2x_1 = self.fusion1(res2x_1, feature_mem)  # 一半MDC融合
+        res2x_2 = self.conv1(res2x_2)  # 一半RDB处理
+        feature_mem.append(res2x_1)  # 添加到列表
+        res2x = torch.cat((res2x_1, res2x_2), dim=1)  # 拼接
+        res2x = self.dense1(res2x) + res2x
+
+        res4x = self.conv4x(res2x)
+        res4x_1, res4x_2 = res4x.split([(res4x.size()[1] // 2), (res4x.size()[1] // 2)], dim=1)
+        res4x_1 = self.fusion2(res4x_1, feature_mem)
+        res4x_2 = self.conv2(res4x_2)
+        feature_mem.append(res4x_1)
+        res4x = torch.cat((res4x_1, res4x_2), dim=1)
+        res4x = self.dense2(res4x) + res4x
+
+        res8x = self.conv8x(res4x)
+        res8x_1, res8x_2 = res8x.split([(res8x.size()[1] // 2), (res8x.size()[1] // 2)], dim=1)
+        res8x_1 = self.fusion3(res8x_1, feature_mem)
+        res8x_2 = self.conv3(res8x_2)
+        feature_mem.append(res8x_1)
+        res8x = torch.cat((res8x_1, res8x_2), dim=1)
+        res8x = self.dense3(res8x) + res8x
+
+        res16x = self.conv16x(res8x)
+        res16x_1, res16x_2 = res16x.split([(res16x.size()[1] // 2), (res16x.size()[1] // 2)], dim=1)
+        res16x_1 = self.fusion4(res16x_1, feature_mem)
+        res16x_2 = self.conv4(res16x_2)
+        res16x = torch.cat((res16x_1, res16x_2), dim=1)
+
+        # 保存编码器输出的特征，用于知识蒸馏
+        res2xx = res2x
+        res4xx = res4x
+        res8xx = res8x
+        res16xx = res16x
+
+        # --- 解码器 ---
+        res_dehaze = res16x
+        in_ft = res16x * 2  # (与Teacher模型中一致的奇怪操作)
+        res16x = self.dehaze(in_ft) + in_ft - res_dehaze  # 瓶颈层
+        res16x_1, res16x_2 = res16x.split([(res16x.size()[1] // 2), (res16x.size()[1] // 2)], dim=1)
+        feature_mem_up = [res16x_1]  # 初始化解码器MDCBlock的特征列表
+
+        # 解码器阶段 1
+        res16x = self.convd16x(res16x)  # 上采样
+        res16x = F.interpolate(res16x, res8x.size()[2:], mode='bilinear')  # 插值
+        res8x = torch.add(res16x, res8x)  # 跳跃连接
+        res8x = self.dense_4(res8x) + res8x - res16x  # 残差
+        res8x_1, res8x_2 = res8x.split([(res8x.size()[1] // 2), (res8x.size()[1] // 2)], dim=1)
+        res8x_1 = self.fusion_4(res8x_1, feature_mem_up)  # 一半MDC融合
+        res8x_2 = self.conv_4(res8x_2)  # 一半RDB
+        feature_mem_up.append(res8x_1)
+        res8x = torch.cat((res8x_1, res8x_2), dim=1)
+
+        # 解码器阶段 2
+        res8x = self.convd8x(res8x)
+        res8x = F.interpolate(res8x, res4x.size()[2:], mode='bilinear')
+        res4x = torch.add(res8x, res4x)
+        res4x = self.dense_3(res4x) + res4x - res8x
+        res4x_1, res4x_2 = res4x.split([(res4x.size()[1] // 2), (res4x.size()[1] // 2)], dim=1)
+        res4x_1 = self.fusion_3(res4x_1, feature_mem_up)
+        res4x_2 = self.conv_3(res4x_2)
+        feature_mem_up.append(res4x_1)
+        res4x = torch.cat((res4x_1, res4x_2), dim=1)
+
+        # 解码器阶段 3
+        res4x = self.convd4x(res4x)
+        res4x = F.interpolate(res4x, res2x.size()[2:], mode='bilinear')
+        res2x = torch.add(res4x, res2x)
+
+        res2x = self.dense_2(res2x) + res2x - res4x
+        res2x_1, res2x_2 = res2x.split([(res2x.size()[1] // 2), (res2x.size()[1] // 2)], dim=1)
+        res2x_1 = self.fusion_2(res2x_1, feature_mem_up)
+        res2x_2 = self.conv_2(res2x_2)
+        feature_mem_up.append(res2x_1)
+        res2x = torch.cat((res2x_1, res2x_2), dim=1)
+
+        # 解码器阶段 4
+        res2x = self.convd2x(res2x)
+        res2x = F.interpolate(res2x, x.size()[2:], mode='bilinear')  # 插值到 x1 尺度
+        x = torch.add(res2x, x)  # 跳跃连接 (与编码器 x1 尺度特征融合)
+        x = self.dense_1(x) + x - res2x  # 残差
+        x_1, x_2 = x.split([(x.size()[1] // 2), (x.size()[1] // 2)], dim=1)
+        x_1 = self.fusion_1(x_1, feature_mem_up)
+        x_2 = self.conv_1(x_2)
+        x = torch.cat((x_1, x_2), dim=1)
+
+        # 输出
+        x = self.conv_output(x)
+
+        # 返回去雾图像 和 用于蒸馏的中间特征列表
+        return x, [res2xx, res4xx, res8xx, res16xx]
+
+
+if __name__ == "__main__":
+    # 测试代码
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = Student().to(device)  # 实例化学生模型
+    dummy_input = torch.randn(1, 3, 256, 256).to(device)  # 创建虚拟输入
+    output_tensor = net(dummy_input)  # 前向传播
+    print(output_tensor[0].shape)  # 打印输出图像的尺寸
+    # 计算并打印模型可训练参数量
+    pytorch_total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    print("Total_params: ==> {}".format(pytorch_total_params))

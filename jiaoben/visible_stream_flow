@@ -1,0 +1,147 @@
+digraph VisibleStreamFlow {
+	graph [rankdir=LR]
+	node [fillcolor=lightblue shape=box style=filled]
+	edge [color=navy]
+	InputVis [label="输入 (可见光)
+(1, 3, 256, 256)" fillcolor=lightgreen]
+	EncoderVis [label="encoder_vis
+(Res2Net)"]
+	CRA1Vis [label="CRA1_vis
+(1024 → 256)"]
+	CRA2Vis [label="CRA2_vis
+(512 → 128)"]
+	CRA3Vis [label="CRA3_vis
+(256 → 64)"]
+	CRA4Vis [label="CRA4_vis
+(64 → 32)"]
+	DehazeVis [label="dehaze_vis
+(18 ResidualBlocks)"]
+	Decoder16x [label="解码器 16x
+(convd16x_vis, dense_4_vis,
+conv_4_vis, fusion_4_vis)"]
+	Decoder8x [label="解码器 8x
+(convd8x_vis, dense_3_vis,
+conv_3_vis, fusion_3_vis)"]
+	Decoder4x [label="解码器 4x
+(convd4x_vis, dense_2_vis,
+conv_2_vis, fusion_2_vis)"]
+	Decoder2x [label="解码器 2x
+(convd2x_vis, dense_1_vis,
+conv_1_vis, fusion_1_vis)"]
+	H1Vis [label="H1_vis
+(256 → 128)"]
+	H2Vis [label="H2_vis
+(128 → 64)"]
+	H3Vis [label="H3_vis
+(64 → 32)"]
+	H4Vis [label="H4_vis
+(32 → 16)"]
+	HOutput [label=vis_h_features fillcolor=lightyellow shape=box]
+	IRFused [label="ir_features
+(1, 16, 256, 256)" fillcolor=lightcoral shape=box]
+	Fusion [label="融合
+(torch.cat)" fillcolor=lightyellow shape=ellipse]
+	ConvOutput [label="conv_output
+(32 → 3)"]
+	Output [label="输出
+(1, 3, 256, 256)" fillcolor=lightgreen]
+	InputVis -> EncoderVis [label="(1, 3, 256, 256)"]
+	EncoderVis -> CRA1Vis [label="x_layer3
+(1, 1024, 16, 16)"]
+	EncoderVis -> CRA2Vis [label="x_layer2
+(1, 512, 32, 32)"]
+	EncoderVis -> CRA3Vis [label="x_layer1
+(1, 256, 64, 64)"]
+	EncoderVis -> CRA4Vis [label="x_layer0
+(1, 64, 128, 128)"]
+	CRA1Vis -> DehazeVis [label="res16x
+(1, 256, 16, 16)"]
+	DehazeVis -> Decoder16x [label="res16x_dehazed
+(1, 256, 16, 16)"]
+	CRA2Vis -> Decoder16x [label="res8x
+(1, 128, 32, 32)"]
+	Decoder16x -> Decoder8x [label="res8x_out
+(1, 128, 32, 32)"]
+	CRA3Vis -> Decoder8x [label="res4x
+(1, 64, 64, 64)"]
+	Decoder8x -> Decoder4x [label="res4x_out
+(1, 64, 64, 64)"]
+	CRA4Vis -> Decoder4x [label="res2x
+(1, 32, 128, 128)"]
+	Decoder4x -> Decoder2x [label="res2x_out
+(1, 32, 128, 128)"]
+	Decoder2x -> Fusion [label="vis_features
+(1, 16, 256, 256)"]
+	CRA1Vis -> H1Vis [label="res16x
+(1, 256, 16, 16)"]
+	CRA2Vis -> H2Vis [label="res8x
+(1, 128, 32, 32)"]
+	CRA3Vis -> H3Vis [label="res4x
+(1, 64, 64, 64)"]
+	CRA4Vis -> H4Vis [label="res2x
+(1, 32, 128, 128)"]
+	H1Vis -> HOutput [label="(1, 128, 16, 16)"]
+	H2Vis -> HOutput [label="(1, 64, 32, 32)"]
+	H3Vis -> HOutput [label="(1, 32, 64, 64)"]
+	H4Vis -> HOutput [label="(1, 16, 128, 128)"]
+	IRFused -> Fusion [label="(1, 16, 256, 256)"]
+	Fusion -> ConvOutput [label="fused_features
+(1, 32, 256, 256)"]
+	ConvOutput -> Output [label="(1, 3, 256, 256)"]
+	{
+		rank=same
+		InputVis
+	}
+	{
+		rank=same
+		EncoderVis
+	}
+	{
+		rank=same
+		CRA1Vis
+		CRA2Vis
+		CRA3Vis
+		CRA4Vis
+	}
+	{
+		rank=same
+		DehazeVis
+	}
+	{
+		rank=same
+		Decoder16x
+	}
+	{
+		rank=same
+		Decoder8x
+	}
+	{
+		rank=same
+		Decoder4x
+	}
+	{
+		rank=same
+		Decoder2x
+	}
+	{
+		rank=same
+		H1Vis
+		H2Vis
+		H3Vis
+		H4Vis
+	}
+	{
+		rank=same
+		Fusion
+		IRFused
+		HOutput
+	}
+	{
+		rank=same
+		ConvOutput
+	}
+	{
+		rank=same
+		Output
+	}
+}

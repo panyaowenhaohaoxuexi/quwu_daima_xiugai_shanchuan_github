@@ -1,0 +1,225 @@
+digraph VisibleStreamFlowDetailed {
+	graph [bgcolor=white fontfamily=SimHei fontsize=12 rankdir=LR splines=polyline]
+	node [fontfamily=SimHei fontsize=12 shape=box style=filled]
+	edge [arrowsize=1.2 color=navy fontfamily=SimHei fontsize=10 penwidth=2]
+	InputVis [label="输入 (可见光)
+(1, 3, 256, 256)" fillcolor=lightgreen]
+	subgraph cluster_encoder_vis {
+		fillcolor=lightblue label="encoder_vis (Res2Net)" penwidth=2 style=filled
+		Layer0Vis [label="layer0
+(1, 64, 128, 128)"]
+		Layer1Vis [label="layer1
+(1, 256, 64, 64)"]
+		Layer2Vis [label="layer2
+(1, 512, 32, 32)"]
+		Layer3Vis [label="layer3
+(1, 1024, 16, 16)"]
+		Layer0Vis -> Layer1Vis
+		Layer1Vis -> Layer2Vis
+		Layer2Vis -> Layer3Vis
+	}
+	subgraph cluster_cra_vis {
+		fillcolor=lightcyan label="CRA 层" penwidth=2 style=filled
+		CRA1Vis [label="CRA1_vis
+(1024 → 256)"]
+		CRA2Vis [label="CRA2_vis
+(512 → 128)"]
+		CRA3Vis [label="CRA3_vis
+(256 → 64)"]
+		CRA4Vis [label="CRA4_vis
+(64 → 32)"]
+		rank=same
+	}
+	subgraph cluster_dehaze_vis {
+		fillcolor=orange label="dehaze_vis (18 ResidualBlocks)" penwidth=2 style=filled
+		ResBlock1 [label="ResidualBlock 1
+(256 → 256)"]
+		ResBlockDots [label="..." shape=plaintext]
+		ResBlock18 [label="ResidualBlock 18
+(256 → 256)"]
+		subgraph cluster_residual_block {
+			fillcolor=lightyellow label="ResidualBlock 结构" penwidth=1 style=filled
+			Conv1RB [label="ConvLayer
+(3x3, 256 → 256)"]
+			PReLURB [label=PReLU]
+			Conv2RB [label="ConvLayer
+(3x3, 256 → 256)"]
+			ResidualRB [label="残差连接
+(*0.1 + input)"]
+			Conv1RB -> PReLURB
+			PReLURB -> Conv2RB
+			Conv2RB -> ResidualRB
+		}
+		ResBlock1 -> ResBlockDots
+		ResBlockDots -> ResBlock18
+	}
+	subgraph cluster_decoder16x {
+		fillcolor=purple label="解码器 16x" penwidth=2 style=filled
+		Convd16xVis [label="convd16x_vis
+上采样"]
+		Dense4Vis [label="dense_4_vis
+密集连接"]
+		Conv4Vis [label="conv_4_vis
+卷积"]
+		Fusion4Vis [label="fusion_4_vis
+特征融合"]
+		Convd16xVis -> Dense4Vis
+		Dense4Vis -> Conv4Vis
+		Conv4Vis -> Fusion4Vis
+	}
+	subgraph cluster_decoder8x {
+		fillcolor=purple label="解码器 8x" penwidth=2 style=filled
+		Convd8xVis [label="convd8x_vis
+上采样"]
+		Dense3Vis [label="dense_3_vis
+密集连接"]
+		Conv3Vis [label="conv_3_vis
+卷积"]
+		Fusion3Vis [label="fusion_3_vis
+特征融合"]
+		Convd8xVis -> Dense3Vis
+		Dense3Vis -> Conv3Vis
+		Conv3Vis -> Fusion3Vis
+	}
+	subgraph cluster_decoder4x {
+		fillcolor=purple label="解码器 4x" penwidth=2 style=filled
+		Convd4xVis [label="convd4x_vis
+上采样"]
+		Dense2Vis [label="dense_2_vis
+密集连接"]
+		Conv2Vis [label="conv_2_vis
+卷积"]
+		Fusion2Vis [label="fusion_2_vis
+特征融合"]
+		Convd4xVis -> Dense2Vis
+		Dense2Vis -> Conv2Vis
+		Conv2Vis -> Fusion2Vis
+	}
+	subgraph cluster_decoder2x {
+		fillcolor=purple label="解码器 2x" penwidth=2 style=filled
+		Convd2xVis [label="convd2x_vis
+上采样"]
+		Dense1Vis [label="dense_1_vis
+密集连接"]
+		Conv1Vis [label="conv_1_vis
+卷积"]
+		Fusion1Vis [label="fusion_1_vis
+特征融合"]
+		Convd2xVis -> Dense1Vis
+		Dense1Vis -> Conv1Vis
+		Conv1Vis -> Fusion1Vis
+	}
+	subgraph cluster_h_layers {
+		fillcolor=lightyellow label="H 层" penwidth=2 style=filled
+		H1Vis [label="H1_vis
+(256 → 128)"]
+		H2Vis [label="H2_vis
+(128 → 64)"]
+		H3Vis [label="H3_vis
+(64 → 32)"]
+		H4Vis [label="H4_vis
+(32 → 16)"]
+		rank=same
+	}
+	IRFused [label="ir_features
+(1, 16, 256, 256)" fillcolor=lightcoral shape=box]
+	Fusion [label="融合
+(torch.cat)" fillcolor=pink shape=ellipse]
+	ConvOutput [label="conv_output
+(32 → 3)" fillcolor=lightblue shape=box]
+	Output [label="输出
+(1, 3, 256, 256)" fillcolor=lightgreen shape=box]
+	InputVis -> Layer0Vis [label="(1, 3, 256, 256)"]
+	Layer3Vis -> CRA1Vis [label="x_layer3
+(1, 1024, 16, 16)"]
+	Layer2Vis -> CRA2Vis [label="x_layer2
+(1, 512, 32, 32)"]
+	Layer1Vis -> CRA3Vis [label="x_layer1
+(1, 256, 64, 64)"]
+	Layer0Vis -> CRA4Vis [label="x_layer0
+(1, 64, 128, 128)"]
+	CRA1Vis -> ResBlock1 [label="res16x
+(1, 256, 16, 16)"]
+	ResBlock18 -> Convd16xVis [label="res16x_dehazed
+(1, 256, 16, 16)"]
+	CRA2Vis -> Fusion4Vis [label="res8x
+(1, 128, 32, 32)"]
+	Fusion4Vis -> Convd8xVis [label="res8x_out
+(1, 128, 32, 32)"]
+	CRA3Vis -> Fusion3Vis [label="res4x
+(1, 64, 64, 64)"]
+	Fusion3Vis -> Convd4xVis [label="res4x_out
+(1, 64, 64, 64)"]
+	CRA4Vis -> Fusion2Vis [label="res2x
+(1, 32, 128, 128)"]
+	Fusion2Vis -> Convd2xVis [label="res2x_out
+(1, 32, 128, 128)"]
+	Fusion1Vis -> Fusion [label="vis_features
+(1, 16, 256, 256)"]
+	CRA1Vis -> H1Vis [label="res16x
+(1, 256, 16, 16)"]
+	CRA2Vis -> H2Vis [label="res8x
+(1, 128, 32, 32)"]
+	CRA3Vis -> H3Vis [label="res4x
+(1, 64, 64, 64)"]
+	CRA4Vis -> H4Vis [label="res2x
+(1, 32, 128, 128)"]
+	H1Vis -> HOutput [label="(1, 128, 16, 16)"]
+	H2Vis -> HOutput [label="(1, 64, 32, 32)"]
+	H3Vis -> HOutput [label="(1, 32, 64, 64)"]
+	H4Vis -> HOutput [label="(1, 16, 128, 128)"]
+	IRFused -> Fusion [label="(1, 16, 256, 256)"]
+	Fusion -> ConvOutput [label="fused_features
+(1, 32, 256, 256)"]
+	ConvOutput -> Output [label="(1, 3, 256, 256)"]
+	{
+		rank=same
+		InputVis
+	}
+	{
+		rank=same
+		cluster_encoder_vis
+	}
+	{
+		rank=same
+		cluster_cra_vis
+	}
+	{
+		rank=same
+		cluster_dehaze_vis
+	}
+	{
+		rank=same
+		cluster_decoder16x
+	}
+	{
+		rank=same
+		cluster_decoder8x
+	}
+	{
+		rank=same
+		cluster_decoder4x
+	}
+	{
+		rank=same
+		cluster_decoder2x
+	}
+	{
+		rank=same
+		cluster_h_layers
+	}
+	{
+		rank=same
+		Fusion
+		IRFused
+		HOutput
+	}
+	{
+		rank=same
+		ConvOutput
+	}
+	{
+		rank=same
+		Output
+	}
+}

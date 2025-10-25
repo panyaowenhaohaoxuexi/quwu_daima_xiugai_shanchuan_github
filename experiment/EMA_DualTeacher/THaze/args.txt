@@ -1,0 +1,21 @@
+{
+  "device": "cuda",
+  "epochs": 20,
+  "iters_per_epoch": 1000,
+  "finer_eval_step": 20000,
+  "start_lr": 1e-07,
+  "end_lr": 1e-08,
+  "no_lr_sche": false,
+  "w_loss_L1_r": 1,
+  "w_loss_Clip": 0.5,
+  "exp_dir": "./experiment",
+  "model_name": "THaze",
+  "saved_model_dir": "./experiment\\EMA_DualTeacher\\THaze\\saved_model",
+  "saved_data_dir": "./experiment\\EMA_DualTeacher\\THaze\\saved_data",
+  "dataset": "EMA_DualTeacher",
+  "vis_real_hazy_path": "./data/real_foggy",
+  "ir_real_hazy_path": null,
+  "teacher_model_path": null,
+  "batch_size": 8,
+  "num_workers": 4
+}

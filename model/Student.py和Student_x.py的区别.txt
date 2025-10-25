@@ -1,0 +1,7 @@
+这两段代码的唯一区别在于它们所使用的**残差块（ResidualBlock）**的实现方式。
+
+第一段代码中的 Student 模型定义了多种复杂的差分卷积（如 Conv2d_cd, Conv2d_hd, Conv2d_vd 等），并将它们组合成一个 DEConv（差分增强卷积）模块，Student 模型的 ResidualBlock 完全是基于这种 DEConv 构建的。
+
+相比之下，第二段代码中的 Student_x 模型完全删除了所有这些自定义的差分卷积（DEConv, Conv2d_cd 等），它使用了一个标准的 ResidualBlock，这个残差块是基于 default_conv（即普通的 nn.Conv2d）构建的。
+
+除了这个核心的 ResidualBlock 实现不同之外，两个模型（Student 和 Student_x）的整体网络架构，包括编码器-解码器的U-Net形状、RDB块、MDCBlock融合策略以及所有层的连接方式，都是完全相同的。

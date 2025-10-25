@@ -1,0 +1,231 @@
+digraph DualStreamTeacher_VisibleStream {
+	nodesep=0.4 rankdir=LR ranksep=0.6 splines=ortho
+	fontname="Microsoft YaHei, Arial"
+	subgraph cluster_overall {
+		color=black fontsize=16 label="可见光流（Visible Stream）— Overall Flow"
+		input [label="Input (x_vis)
+(B, 3, H, W)" fillcolor=gold fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		encoder_blk [label="Encoder (Res2Net)" fillcolor=lightskyblue fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		cra_blk [label="CRA 映射 (CRA1–CRA4)" fillcolor=paleturquoise fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		dehaze_blk [label="Dehaze 残差细化 (×18)" fillcolor=palegreen fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		decoder_blk [label="Decoder 逐级上采样与融合
+(Stage1→4)" fillcolor=lightpink fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		vis_feat_out [label="可见光特征输出 (B, 16, H, W)
+(后续与 IR 特征拼接，未在本图绘制)" fillcolor=lightgray fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		input -> encoder_blk
+		encoder_blk -> cra_blk
+		cra_blk -> dehaze_blk
+		dehaze_blk -> decoder_blk
+		decoder_blk -> vis_feat_out
+	}
+	subgraph cluster_encoder {
+		color=deepskyblue fontsize=14 label="Encoder（Res2Net，输出多尺度特征）"
+		enc_conv1 [label="conv1: 3→64, s=2, k=3
+BN + ReLU" fillcolor=aliceblue fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		enc_maxpool [label="MaxPool k=3, s=2, p=1" fillcolor=aliceblue fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		enc_l1 [label="layer1: Bottle2neck×3
+64→256 @ 1/4" fillcolor=aliceblue fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		enc_l2 [label="layer2: Bottle2neck×4
+128→512 @ 1/8" fillcolor=aliceblue fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		enc_l3 [label="layer3: Bottle2neck×23
+256→1024 @ 1/16" fillcolor=aliceblue fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		enc_conv1 -> enc_maxpool
+		enc_maxpool -> enc_l1
+		enc_l1 -> enc_l2
+		enc_l2 -> enc_l3
+		input -> enc_conv1 [lhead=cluster_encoder]
+	}
+	encoder_blk -> cra1 [color=gray50 lhead=cluster_cra]
+	encoder_blk -> cra2 [color=gray50]
+	encoder_blk -> cra3 [color=gray50]
+	encoder_blk -> cra4 [color=gray50]
+	subgraph cluster_cra {
+		color=teal fontsize=14 label="CRA（Cross-scale Reduction Adapter）
+将不同尺度的 encoder 特征压缩到统一通道"
+		cra1 [label="CRA1: 1024→256 (1×1)
+来自 layer3 @1/16 → res16x" fillcolor=azure fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		cra2 [label="CRA2: 512→128 (1×1)
+来自 layer2 @1/8 → res8x" fillcolor=azure fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		cra3 [label="CRA3: 256→64 (1×1)
+来自 layer1 @1/4 → res4x" fillcolor=azure fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		cra4 [label="CRA4: 64→32 (1×1)
+来自 conv1输出 @1/2 → res2x" fillcolor=azure fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		enc_l3 -> cra1
+		enc_l2 -> cra2
+		enc_l1 -> cra3
+		enc_conv1 -> cra4
+	}
+	cra_blk -> deh_in [lhead=cluster_dehaze]
+	subgraph cluster_dehaze {
+		color=darkgreen fontsize=14 label="Dehaze（深层特征残差细化）"
+		deh_in [label="输入：res16x (B,256,H/16,W/16)
+= CRA1(c3)" fillcolor=honeydew fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		deh_rb_1 [label="ResidualBlock ×6" fillcolor=honeydew fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		deh_rb_2 [label="ResidualBlock ×6" fillcolor=honeydew fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		deh_rb_3 [label="ResidualBlock ×6" fillcolor=honeydew fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		deh_out [label="res16x_dehazed = RBs(res16x) + res16x" fillcolor=honeydew fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		deh_in -> deh_rb_1
+		deh_rb_1 -> deh_rb_2
+		deh_rb_2 -> deh_rb_3
+		deh_rb_3 -> deh_out
+		cra1 -> deh_in
+	}
+	subgraph cluster_decoder {
+		color=firebrick fontsize=14 label="Decoder（四级上采样与跨尺度融合，带记忆栈）"
+		subgraph cluster_mem {
+			color=gray40 fontsize=12 label="Memory Stack（feature_mem_up）"
+			mem_res16x_1 [label="push: res16x_1 (B,128,1/16)
+来自 Split(res16x_dehazed)" fillcolor=whitesmoke fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			mem_res8x_1 [label="push: res8x_1 (B,64,1/8)" fillcolor=whitesmoke fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			mem_res4x_1 [label="push: res4x_1 (B,32,1/4)" fillcolor=whitesmoke fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		}
+		s1_res16x_split -> mem_res16x_1 [color=gray40 style=dashed xlabel=push]
+		mem_res16x_1 -> s1_mdc [color=gray40 style=dashed xlabel=memory]
+		subgraph cluster_stage1 {
+			color=indianred fontsize=12 label="Stage1: 1/16 → 1/8"
+			s1_up [label="UpsampleConvLayer
+256→128, stride=2
+(最近邻+1×1)" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s1_align [label="对齐到 res8x 尺度
+bilinear align" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s1_add [label="Add: (res16x_up + res8x)" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s1_dense [label="Dense: 3×ResidualBlock
++ 残差回加" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s1_split [label="Split: 128 → 64 + 64
+(res8x_1, res8x_2)" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s1_mdc [label="MDCBlock1(iter2)
+输入: res8x_1
+记忆: [res16x_1]" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s1_rdb [label="RDB(64, L=4, g=64)
+conv_4_vis" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s1_concat [label="Concat: [res8x_1', res8x_2']
+= res8x_out (B,128,1/8)" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s1_up -> s1_align
+			s1_align -> s1_add
+			s1_add -> s1_dense
+			s1_dense -> s1_split
+			s1_split -> s1_mdc [label=64]
+			s1_split -> s1_rdb [label=64]
+			s1_mdc -> s1_concat
+			s1_rdb -> s1_concat
+			deh_out -> s1_up
+			cra2 -> s1_add [color=black xlabel=res8x]
+			s1_res16x_split [label="Split: res16x_dehazed →
+res16x_1 + res16x_2" fillcolor=lavenderblush fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			deh_out -> s1_res16x_split
+		}
+		s1_concat -> s2_up
+		s2_push_mem -> mem_res8x_1 [color=gray40 style=dashed]
+		mem_res16x_1 -> s2_mdc [color=gray40 style=dashed]
+		mem_res8x_1 -> s2_mdc [color=gray40 style=dashed]
+		subgraph cluster_stage2 {
+			color=indianred fontsize=12 label="Stage2: 1/8 → 1/4"
+			s2_up [label="UpsampleConvLayer
+128→64, stride=2" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s2_align [label="对齐到 res4x 尺度" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s2_add [label="Add: (res8x_up + res4x)" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s2_dense [label="Dense: 3×ResidualBlock" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s2_split [label="Split: 64 → 32 + 32" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s2_mdc [label="MDCBlock1(iter2)
+记忆: [res16x_1, res8x_1]" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s2_rdb [label="RDB(32, L=4, g=32)
+conv_3_vis" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s2_concat [label="Concat → res4x_out (B,64,1/4)" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s2_up -> s2_align
+			s2_align -> s2_add
+			s2_add -> s2_dense
+			s2_dense -> s2_split
+			s2_split -> s2_mdc
+			s2_split -> s2_rdb
+			s2_mdc -> s2_concat
+			s2_rdb -> s2_concat
+			cra3 -> s2_add [color=black xlabel=res4x]
+			s2_push_mem [label="push: res8x_1" fillcolor=lavenderblush fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s2_split -> s2_push_mem
+		}
+		s2_concat -> s3_up
+		s3_push_mem -> mem_res4x_1 [color=gray40 style=dashed]
+		mem_res16x_1 -> s3_mdc [color=gray40 style=dashed]
+		mem_res8x_1 -> s3_mdc [color=gray40 style=dashed]
+		mem_res4x_1 -> s3_mdc [color=gray40 style=dashed]
+		subgraph cluster_stage3 {
+			color=indianred fontsize=12 label="Stage3: 1/4 → 1/2"
+			s3_up [label="UpsampleConvLayer
+64→32, stride=2" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s3_align [label="对齐到 res2x 尺度" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s3_add [label="Add: (res4x_up + res2x)" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s3_dense [label="Dense: 3×ResidualBlock" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s3_split [label="Split: 32 → 16 + 16" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s3_mdc [label="MDCBlock1(iter2)
+记忆: [res16x_1, res8x_1, res4x_1]" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s3_rdb [label="RDB(16, L=4, g=16)
+conv_2_vis" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s3_concat [label="Concat → res2x_out (B,32,1/2)" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s3_up -> s3_align
+			s3_align -> s3_add
+			s3_add -> s3_dense
+			s3_dense -> s3_split
+			s3_split -> s3_mdc
+			s3_split -> s3_rdb
+			s3_mdc -> s3_concat
+			s3_rdb -> s3_concat
+			cra4 -> s3_add [color=black xlabel=res2x]
+			s3_push_mem [label="push: res4x_1" fillcolor=lavenderblush fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s3_split -> s3_push_mem
+		}
+		s3_concat -> s4_up
+		mem_res16x_1 -> s4_mdc [color=gray40 style=dashed]
+		mem_res8x_1 -> s4_mdc [color=gray40 style=dashed]
+		mem_res4x_1 -> s4_mdc [color=gray40 style=dashed]
+		subgraph cluster_stage4 {
+			color=indianred fontsize=12 label="Stage4: 1/2 → 1/1"
+			s4_up [label="UpsampleConvLayer
+32→16, stride=2" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s4_dense [label="Dense: 3×ResidualBlock" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s4_split [label="Split: 16 → 8 + 8" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s4_mdc [label="MDCBlock1(iter2)
+记忆: [res16x_1, res8x_1, res4x_1]" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s4_rdb [label="RDB(8, L=4, g=8)
+conv_1_vis" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s4_concat [label="Concat → x_out_before_fusion
+(B,16,1/1)" fillcolor=mistyrose fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+			s4_up -> s4_dense
+			s4_dense -> s4_split
+			s4_split -> s4_mdc
+			s4_split -> s4_rdb
+			s4_mdc -> s4_concat
+			s4_rdb -> s4_concat
+		}
+		s4_concat -> vis_feat_out [ltail=cluster_decoder]
+	}
+	decoder_blk -> H1 [label="distill (intermediate)" color=mediumpurple style=dashed]
+	decoder_blk -> H2 [color=mediumpurple style=dashed]
+	decoder_blk -> H3 [color=mediumpurple style=dashed]
+	decoder_blk -> H4 [color=mediumpurple style=dashed]
+	subgraph cluster_H {
+		color=purple fontsize=14 label="H 层（蒸馏特征）"
+		H1 [label="H1_vis: 256→128 (1×1)
+输入: res16x" fillcolor=lavender fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		H2 [label="H2_vis: 128→64 (1×1)
+输入: res8x" fillcolor=lavender fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		H3 [label="H3_vis: 64→32 (1×1)
+输入: res4x" fillcolor=lavender fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		H4 [label="H4_vis: 32→16 (1×1)
+输入: res2x" fillcolor=lavender fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		cra1 -> H1
+		cra2 -> H2
+		cra3 -> H3
+		cra4 -> H4
+	}
+	subgraph cluster_legend {
+		color=gray30 fontsize=12 label="图例（Legend）"
+		lg_enc [label="Encoder 子模块" fillcolor=lightskyblue fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		lg_cra [label="CRA 1×1 压缩映射" fillcolor=paleturquoise fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		lg_deh [label="Dehaze 残差细化" fillcolor=palegreen fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		lg_dec [label="Decoder 上采样融合" fillcolor=lightpink fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		lg_mem [label="虚线：记忆栈/蒸馏连线" fillcolor=whitesmoke fontname="Microsoft YaHei, Arial" penwidth=1.5 shape=box style="rounded,filled"]
+		lg_enc -> lg_cra
+		lg_cra -> lg_deh
+		lg_deh -> lg_dec
+	}
+}
