@@ -23,6 +23,10 @@ parser.add_argument('--no_lr_sche', action='store_true', help='no lr cos schedul
 parser.add_argument('--w_loss_L1_r', default=1, type=float, help='weight of loss L1_r')
 parser.add_argument('--w_loss_Clip', default=0.5, type=float, help='weight of loss Clip')
 
+# --- [新增] ---
+# 添加一个新的损失权重，用于红外边缘一致性
+parser.add_argument('--w_loss_Edge', default=0.1, type=float, help='weight of IR Edge consistency loss')
+# --- [新增结束] ---
 
 parser.add_argument('--exp_dir', type=str, default='./experiment')
 parser.add_argument('--model_name', type=str, default='THaze')

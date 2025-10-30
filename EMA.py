@@ -13,7 +13,7 @@ from metric import psnr, ssim
 from loss import SSIM  # 仅用于测试阶段时可用；训练不直接用
 # 使用你 data/ 下“已修改”的 TestDataset（三模态：hazy/ir/clear）
 from data import MultiModalCLIPLoader, TestDataset
-from model import DualStreamTeacher
+from model import VIFNetInconsistencyTeacher, SobelEdgeDetector
 from CLIP import L_clip_from_feature
 from collections import OrderedDict
 from option.EMA import opt
@@ -137,7 +137,7 @@ def _align_text_features_to_batch(text_features: torch.Tensor, batch_size: int) 
 
 
 # 定义函数 train：执行主要的训练逻辑
-def train(teacher_net, student_net, loader_train, loader_test, optim, criterion, text_features):
+def train(teacher_net, student_net, loader_train, loader_test, optim, criterion, text_features, edge_detector):
     """
     训练主循环：Student 学习，Teacher 以 EMA 跟随。
     - 前向：双输入 (hazy_vis, infrared)
@@ -145,8 +145,8 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
     - 评估：周期性在 test(loader_test) 上评估（真双路）
     """
     losses = []
-    loss_log = {'L1_r': [], 'Clip': [], 'total': []}
-    loss_log_tmp = {'L1_r': [], 'Clip': [], 'total': []}
+    loss_log = {'L1_r': [], 'Clip': [], 'Edge': [], 'total': []}
+    loss_log_tmp = {'L1_r': [], 'Clip': [], 'Edge': [], 'total': []}
     psnr_log = []
 
     start_step = 0
@@ -218,6 +218,7 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
         # ======== 计算损失（参考代码B的 CLIP 调用方式） ========
         loss_L1_r = torch.tensor(0.0, device=opt.device)
         loss_Clip = torch.tensor(0.0, device=opt.device)
+        loss_Edge = torch.tensor(0.0, device=opt.device)  # 新增
 
         # L1(student, teacher.detach())
         if opt.w_loss_L1_r > 0:
@@ -234,8 +235,25 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
         else:
             loss_Clip = torch.tensor(0.0, device=opt.device)
 
+            # [新增] 边缘一致性损失 L1(edge(student), edge(ir).detach())
+        if opt.w_loss_Edge > 0 and criterion[2] is not None:
+            try:
+                # 确保 edge_detector 在正确的设备上
+                edge_detector.to(opt.device)
+                # 计算学生输出的边缘
+                edge_student = edge_detector(student_image)
+                # 计算真实红外图像的边缘 (作为目标，不计算梯度)
+                with torch.no_grad():
+                     edge_ir_target = edge_detector(infrared)
+                # 计算 L1 损失
+                loss_Edge = criterion[2](edge_student, edge_ir_target)
+            except Exception as e:
+                print(f"\n错误: 在步骤 {step} 计算 Edge 损失失败: {e}。将 loss_Edge 设为 0。")
+                loss_Edge = torch.tensor(0.0, device=opt.device)
+        # [新增结束]
+
         # 总损失
-        loss = opt.w_loss_L1_r * loss_L1_r + opt.w_loss_Clip * loss_Clip
+        loss = opt.w_loss_L1_r * loss_L1_r + opt.w_loss_Clip * loss_Clip + opt.w_loss_Edge * loss_Edge
 
         # 数值健壮性检查
         if torch.isnan(loss) or torch.isinf(loss):
@@ -257,13 +275,16 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
         losses.append(loss.item())
         loss_log_tmp['L1_r'].append(loss_L1_r.item())
         loss_log_tmp['Clip'].append(loss_Clip.item())
+        loss_log_tmp['Edge'].append(loss_Edge.item())
         loss_log_tmp['total'].append(loss.item())
 
         l1r_val = (opt.w_loss_L1_r * loss_L1_r.item()) if opt.w_loss_L1_r > 0 else 0.0
         clip_val = (opt.w_loss_Clip * loss_Clip.item()) if opt.w_loss_Clip > 0 else 0.0
+        edge_val = (opt.w_loss_Edge * loss_Edge.item()) if opt.w_loss_Edge > 0 else 0.0  # 新增
         print(
-            f'\rloss:{loss.item():.5f} | L1_r:{l1r_val:.5f}  |Clip:{clip_val:.5f} | step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}',
-            end='', flush=True)
+            f'\rloss:{loss.item():.5f} | L1_r:{l1r_val:.5f} | Clip:{clip_val:.5f} | Edge:{edge_val:.5f} '
+    f'| step:{step}/{steps} | lr:{lr:.9f} | time_used:{(time.time() - start_time) / 60:.1f}',
+    end='', flush=True)
 
         # ======== 保存损失曲线 & Epoch 结束统计 ========
         steps_per_epoch = len(loader_train) if len(loader_train) > 0 else opt.iters_per_epoch
@@ -496,8 +517,8 @@ if __name__ == "__main__":
     set_seed_torch(2024)
 
     # ======== 训练数据：真实雾（无GT），二元组 (vis, ir) ========
-    vis_hazy_folder = "/root/autodl-tmp/FLIR_zongti_quwu_ceshi/dataset/REAL_FOGGY/hazy"
-    ir_hazy_folder = "/root/autodl-tmp/FLIR_zongti_quwu_ceshi/dataset/REAL_FOGGY/ir"
+    vis_hazy_folder = "/root/autodl-tmp/REAL_FOGGY/hazy"
+    ir_hazy_folder = "/root/autodl-tmp/REAL_FOGGY/ir"
     train_set = MultiModalCLIPLoader(
         hazy_visible_path=vis_hazy_folder,
         infrared_path=ir_hazy_folder,
@@ -507,7 +528,7 @@ if __name__ == "__main__":
     )
 
     # ======== 测试数据：三模态 (vis, ir, clear)，均为 .jpg ========
-    test_dir = '/root/autodl-tmp/FLIR_zongti_quwu_ceshi/dataset/FLIR/test'
+    test_dir = '/root/autodl-tmp/FLIR/test'
     test_hazy_vis_folder = os.path.join(test_dir, 'hazy')
     test_ir_folder = os.path.join(test_dir, 'ir')
     test_clear_vis_folder = os.path.join(test_dir, 'clear')
@@ -547,10 +568,18 @@ if __name__ == "__main__":
         )
 
     # ======== 模型初始化 ========
-    teacher_net = DualStreamTeacher().to(opt.device)
-    student_net = DualStreamTeacher().to(opt.device)
+    teacher_net = VIFNetInconsistencyTeacher().to(opt.device)
+    student_net = VIFNetInconsistencyTeacher().to(opt.device)
 
-    pretrained_teacher_path = "/root/CoA-main_daima_xiugai/saved_model/best.pth"
+    # --- [新增] 初始化边缘检测器 ---
+    edge_detector = SobelEdgeDetector().to(opt.device)
+    # 确保它不参与训练（如果它有参数的话，Sobel 没有可训练参数，但以防万一）
+    for param in edge_detector.parameters():
+        param.requires_grad = False
+    edge_detector.eval()
+    # --- [新增结束] ---
+
+    pretrained_teacher_path = "/root/autodl-tmp/CoA_daima_xiugai/Teacher_train/saved_model/best.pth"
     print(f"加载预训练教师模型: {pretrained_teacher_path}")
 
     try:
@@ -607,6 +636,9 @@ if __name__ == "__main__":
         opt.w_loss_Clip = 0
         print("警告: CLIP 损失已禁用。")
 
+
+    criterion.append(nn.L1Loss().to(opt.device))  # Edge Loss (criterion[2])
+
     # ======== 优化器（仅学生） ========
     optimizer = optim.Adam(
         params=filter(lambda x: x.requires_grad, student_net.parameters()),
@@ -623,4 +655,5 @@ if __name__ == "__main__":
         optimizer,
         criterion,
         text_features,
+        edge_detector  # <--- 传入边缘检测器
     )

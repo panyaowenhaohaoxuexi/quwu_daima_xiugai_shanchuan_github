@@ -92,7 +92,7 @@ from PIL import Image
 from tqdm import tqdm
 # --- 修改: 导入 DualStreamTeacher ---
 # 从 model 模块导入 Teacher, Student, Student_x 以及我们修改后的 DualStreamTeacher
-from model import Teacher, Student, Student_x, DualStreamTeacher
+from model import Teacher, Student, Student_x, VIFNetInconsistencyTeacher
 # --- 修改结束 ---
 # 从 torchvision.transforms 导入图像变换相关的类和函数
 from torchvision.transforms import Compose, ToTensor, Normalize, Resize, InterpolationMode
@@ -103,9 +103,9 @@ from torchvision.transforms import Compose, ToTensor, Normalize, Resize, Interpo
 # MODEL_PATH = './model/Student_model/Student.pth' # 如果是 Student
 # MODEL_PATH = './model/EMA_model/EMA_r.pth' # 如果是 EMA 适配后的 Student_x
 # 修改: 使用用户提供的硬编码路径
-MODEL_PATH = 'D:/liu_lan_qi_xia_zai/CoA-main_daima_xiugai/ceshishiyongde_model/student_20.pth' # <--- 这是你训练好的 DualStreamTeacher 最佳权重路径
+MODEL_PATH = 'D:/liu_lan_qi_xia_zai/CoA-main_daima_xiugai_jiehe_ir_edge/ceshi_shiyongde_model/Student_real_model/student_20.pth' # <--- 这是你训练好的 DualStreamTeacher 最佳权重路径
 # 修改: 使用用户提供的硬编码路径
-OUTPUT_FOLDER = 'E:/FLIR_zongti_quwu_ceshi/dataset/REAL_FOGGY_test' # <--- 修改输出文件夹名称以区分 (避免覆盖 test_data)
+OUTPUT_FOLDER = 'E:/FLIR_zongti_quwu_ceshi/dataset/REAL_FOGGY_test_v2' # <--- 修改输出文件夹名称以区分 (避免覆盖 test_data)
 # --- 修改结束 ---
 
 
@@ -196,7 +196,7 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- 修改: 实例化 DualStreamTeacher 模型 ---
-    model = DualStreamTeacher().to(device)
+    model = VIFNetInconsistencyTeacher().to(device)
     print(f"正在加载模型: DualStreamTeacher")
     # --- 修改结束 ---
 
