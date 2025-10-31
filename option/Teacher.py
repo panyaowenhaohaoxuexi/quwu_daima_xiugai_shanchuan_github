@@ -43,6 +43,12 @@ parser.add_argument('--w_loss_SSIM', default=0.2, type=float, help='weight of lo
 # 定义 Cr (对比度) 损失的权重
 parser.add_argument('--w_loss_Cr', default=0.05, type=float, help='weight of loss Cr')
 
+# --- [新增] ---
+# 添加一个新的损失权重，用于红外边缘一致性
+parser.add_argument('--w_loss_Edge', default=0.1, type=float, help='weight of IR Edge consistency loss')
+# --- [新增结束] ---
+
+
 # --- 3. 定义文件和目录相关的参数 ---
 
 # 定义实验结果的根目录

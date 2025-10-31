@@ -27,7 +27,7 @@ from loss import SSIM, ContrastLoss
 from data import MultiModalHazeDataset, TestDataset # TestDataset 现在也支持三模态
 from metric import psnr, ssim
 # from model import DualStreamTeacher # <--- 不再使用原始模型
-from model import VIFNetInconsistencyTeacher # <--- 使用新的融合模型
+from model import VIFNetInconsistencyTeacher, SobelEdgeDetector # <--- 使用新的融合模型
 # --- [修改结束] ---
 from option.Teacher import opt # 导入配置选项
 
@@ -65,13 +65,15 @@ def collate_fn_skip_none(batch):
     return torch.utils.data.dataloader.default_collate(batch)
 
 # 定义函数 train：执行模型训练的主要逻辑
-def train(teacher_net, loader_train, loader_test, optim, criterion):
+def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detector):
     """
     执行教师模型的训练和评估过程。
     """
     losses = []
-    loss_log = {'L1': [], 'SSIM': [], 'Cr': [], 'total': []}
-    loss_log_tmp = {'L1': [], 'SSIM': [], 'Cr': [], 'total': []}
+    # --- [修改] 增加 Edge 日志 ---
+    loss_log = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'total': []}
+    loss_log_tmp = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'total': []}
+    # --- [修改结束] ---
     psnr_log = []
 
     start_step = 0
@@ -142,7 +144,26 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
              loss_Cr = criterion[2](pred_image, clear_vis, hazy_vis) # ContrastLoss 可能需要原始 hazy 输入
         else:
              loss_Cr = torch.tensor(0.0).to(opt.device)
-        loss = opt.w_loss_L1 * loss_L1 + opt.w_loss_SSIM * loss_SSIM + opt.w_loss_Cr * loss_Cr
+
+        # --- [新增] 计算红外边缘损失 ---
+        loss_Edge = torch.tensor(0.0, device=opt.device)
+             # 确保 opt.w_loss_Edge > 0 并且 edge_detector 已经传入
+        if opt.w_loss_Edge > 0 and edge_detector is not None:
+            try:
+                # 提取预测图像的边缘
+                edge_pred = edge_detector(pred_image)
+                # 提取红外图像的边缘 (作为目标，不计算梯度)
+                with torch.no_grad():
+                    edge_ir_target = edge_detector(infrared)
+                # 使用 L1 损失 (criterion[0]) 计算边缘差距
+                loss_Edge = criterion[0](edge_pred, edge_ir_target.detach())
+            except Exception as e:
+                print(f"\n错误: 计算 Edge 损失失败: {e}")
+                loss_Edge = torch.tensor(0.0, device=opt.device)
+        # --- [新增结束] ---
+
+        # loss = opt.w_loss_L1 * loss_L1 + opt.w_loss_SSIM * loss_SSIM + opt.w_loss_Cr * loss_Cr
+        loss = opt.w_loss_L1 * loss_L1 + opt.w_loss_SSIM * loss_SSIM + opt.w_loss_Cr * loss_Cr + opt.w_loss_Edge * loss_Edge
         # --- [修改结束] ---
 
         # --- 反向传播和优化 ---
@@ -158,13 +179,27 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
         loss_log_tmp['L1'].append(loss_L1.item() if isinstance(loss_L1, torch.Tensor) else loss_L1)
         loss_log_tmp['SSIM'].append(loss_SSIM.item() if isinstance(loss_SSIM, torch.Tensor) else loss_SSIM)
         loss_log_tmp['Cr'].append(loss_Cr.item() if isinstance(loss_Cr, torch.Tensor) else loss_Cr)
+        # AAA
+        loss_log_tmp['Edge'].append(loss_Edge.item() if isinstance(loss_Edge, torch.Tensor) else loss_Edge)  # <-- [修改]
+        # AAA
         loss_log_tmp['total'].append(loss.item())
 
         l1_val = (opt.w_loss_L1 * loss_L1.item()) if isinstance(loss_L1, torch.Tensor) and opt.w_loss_L1 > 0 else 0.0
         ssim_val = (opt.w_loss_SSIM * loss_SSIM.item()) if isinstance(loss_SSIM, torch.Tensor) and opt.w_loss_SSIM > 0 else 0.0
         cr_val = (opt.w_loss_Cr * loss_Cr.item()) if isinstance(loss_Cr, torch.Tensor) and opt.w_loss_Cr > 0 else 0.0
-        print(f'\rloss:{loss.item():.5f} | L1:{l1_val:.5f} | SSIM:{ssim_val:.5f} | Cr:{cr_val:.5f}  | step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}', end='', flush=True)
+        # print(f'\rloss:{loss.item():.5f} | L1:{l1_val:.5f} | SSIM:{ssim_val:.5f} | Cr:{cr_val:.5f}  | step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}', end='', flush=True)
+        # AAA
+        edge_val = (opt.w_loss_Edge * loss_Edge.item()) if isinstance(loss_Edge,
+                                                                      torch.Tensor) and opt.w_loss_Edge > 0 else 0.0  # <-- [修改]
+        # AAA
 
+        # AAA
+        # --- [修改] 更新打印 ---
+        print(
+            f'\rloss:{loss.item():.5f} | L1:{l1_val:.5f} | SSIM:{ssim_val:.5f} | Cr:{cr_val:.5f} | Edge:{edge_val:.5f} | step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}',
+            end='', flush=True)
+        # --- [修改结束] ---
+        # AAA
 
         # --- 保存损失记录和执行评估的逻辑 ---
         steps_per_epoch = len(loader_train) if loader_train else 0 # 获取每个 epoch 的步数
@@ -477,6 +512,16 @@ if __name__ == "__main__":
     teacher_net = teacher_net.to(opt.device)
     # --- [修改结束] ---
 
+    # AAA
+    # --- [新增] 初始化边缘检测器 ---
+    edge_detector = SobelEdgeDetector().to(opt.device)
+    # 确保它不参与训练（Sobel 没有可训练参数，但这是个好习惯）
+    for param in edge_detector.parameters():
+        param.requires_grad = False
+    edge_detector.eval()
+    # --- [新增结束] ---
+    # AAA
+
     epoch_size = len(loader_train) if loader_train else 0
     if epoch_size == 0:
          print("错误：训练 DataLoader 为空或长度为 0。请检查数据集和批处理大小。")
@@ -524,5 +569,9 @@ if __name__ == "__main__":
 
     # 开始训练
     print("开始训练...")
-    train(teacher_net, loader_train, loader_test, optimizer, criterion)
+    # AAA
+    # --- [修改] 传入 edge_detector ---
+    train(teacher_net, loader_train, loader_test, optimizer, criterion, edge_detector)
+    # --- [修改结束] ---
+    # AAA
     print("训练完成。")
