@@ -1,34 +1,20 @@
 # -*- coding: utf-8 -*-
 # Teacher.py (Training Script)
 
-# 导入数学库，用于数学计算，例如余弦函数
 import math
-# 导入操作系统库，用于文件路径操作，例如创建目录
 import os
-# 导入时间库，用于记录时间
 import time
-# 导入 NumPy 库，用于数值计算，特别是数组操作
 import numpy as np
-# 导入 PyTorch 核心库
 import torch
-# 导入 PyTorch 神经网络函数库，例如 pad (填充)
 import torch.nn.functional as F
-# 导入 PyTorch 数据加载工具
 import torch.utils.data
-# 从 PyTorch 导入优化器 (optim) 和神经网络模块 (nn)
 from torch import optim, nn
-# 导入 PyTorch 的 cuDNN 库，用于加速 GPU 计算
 from torch.backends import cudnn
-# 从 PyTorch 数据加载工具中导入 DataLoader 类，用于批量加载数据
 from torch.utils.data import DataLoader
-# 从 loss 模块导入 SSIM 和 ContrastLoss 类，用于计算损失
-from loss import SSIM, ContrastLoss
-# --- [修改] 导入新的数据集类和模型类 ---
+from loss import ContrastLoss, MSSSIM, DiceLoss
 from data import MultiModalHazeDataset, TestDataset # TestDataset 现在也支持三模态
 from metric import psnr, ssim
-# from model import DualStreamTeacher # <--- 不再使用原始模型
 from model import VIFNetInconsistencyTeacher, SobelEdgeDetector # <--- 使用新的融合模型
-# --- [修改结束] ---
 from option.Teacher import opt # 导入配置选项
 
 # 训练轮次
@@ -55,11 +41,6 @@ def collate_fn_skip_none(batch):
     # 过滤掉 batch 中第一个元素为 None 的项
     batch = list(filter(lambda x: x is not None and x[0] is not None, batch))
     if not batch:
-        # 如果整个批次都无效，根据训练/测试返回不同数量的空值
-        # 假设通过 len(batch[0]) 判断是训练(3)还是测试(4)，但这不可靠
-        # 更稳妥的方式是让调用者处理可能的空 batch
-        # 这里返回适用于训练和测试的最小公倍数或根据需要调整
-        # 返回空元组，让调用者检查
          return () # 返回空元组
     # 使用 PyTorch 默认的 collate 函数将有效样本整理成批次张量/列表
     return torch.utils.data.dataloader.default_collate(batch)
@@ -70,10 +51,8 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
     执行教师模型的训练和评估过程。
     """
     losses = []
-    # --- [修改] 增加 Edge 日志 ---
-    loss_log = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'total': []}
-    loss_log_tmp = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'total': []}
-    # --- [修改结束] ---
+    loss_log = {'L1': [], 'MS-SSIM': [], 'Contrast': [], 'EdgeDice': [], 'Total': []}
+    loss_log_tmp = {'L1': [], 'MS-SSIM': [], 'Contrast': [], 'EdgeDice': [], 'Total': []}
     psnr_log = []
 
     start_step = 0
@@ -139,30 +118,31 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         pred_image = teacher_out[0] # 获取预测的去雾图像
 
         loss_L1 = criterion[0](pred_image, clear_vis) if opt.w_loss_L1 > 0 else torch.tensor(0.0).to(opt.device)
-        loss_SSIM = (1 - criterion[1](pred_image, clear_vis)) if opt.w_loss_SSIM > 0 else torch.tensor(0.0).to(opt.device)
+
+        loss_SSIM = (1 - criterion[1](pred_image, clear_vis)) if opt.w_loss_SSIM > 0 else torch.tensor(0.0).to(
+            opt.device)
+
         if opt.w_loss_Cr > 0 and criterion[2] is not None:
              loss_Cr = criterion[2](pred_image, clear_vis, hazy_vis) # ContrastLoss 可能需要原始 hazy 输入
         else:
              loss_Cr = torch.tensor(0.0).to(opt.device)
 
-        # --- [新增] 计算红外边缘损失 ---
         loss_Edge = torch.tensor(0.0, device=opt.device)
              # 确保 opt.w_loss_Edge > 0 并且 edge_detector 已经传入
-        if opt.w_loss_Edge > 0 and edge_detector is not None:
+        if opt.w_loss_Edge > 0 and edge_detector is not None and criterion[3] is not None:
             try:
-                # 提取预测图像的边缘
+                     # 提取预测图像的边缘
                 edge_pred = edge_detector(pred_image)
-                # 提取红外图像的边缘 (作为目标，不计算梯度)
+                     # 提取红外图像的边缘 (作为目标，不计算梯度)
                 with torch.no_grad():
-                    edge_ir_target = edge_detector(infrared)
-                # 使用 L1 损失 (criterion[0]) 计算边缘差距
-                loss_Edge = criterion[0](edge_pred, edge_ir_target.detach())
+                         edge_ir_target = edge_detector(infrared)
+
+                loss_Edge = criterion[3](edge_pred, edge_ir_target.detach())
+
             except Exception as e:
                 print(f"\n错误: 计算 Edge 损失失败: {e}")
                 loss_Edge = torch.tensor(0.0, device=opt.device)
-        # --- [新增结束] ---
 
-        # loss = opt.w_loss_L1 * loss_L1 + opt.w_loss_SSIM * loss_SSIM + opt.w_loss_Cr * loss_Cr
         loss = opt.w_loss_L1 * loss_L1 + opt.w_loss_SSIM * loss_SSIM + opt.w_loss_Cr * loss_Cr + opt.w_loss_Edge * loss_Edge
         # --- [修改结束] ---
 
@@ -177,31 +157,24 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         losses.append(loss.item())
         # 确保在记录 .item() 前检查是否为 Tensor
         loss_log_tmp['L1'].append(loss_L1.item() if isinstance(loss_L1, torch.Tensor) else loss_L1)
-        loss_log_tmp['SSIM'].append(loss_SSIM.item() if isinstance(loss_SSIM, torch.Tensor) else loss_SSIM)
-        loss_log_tmp['Cr'].append(loss_Cr.item() if isinstance(loss_Cr, torch.Tensor) else loss_Cr)
-        # AAA
-        loss_log_tmp['Edge'].append(loss_Edge.item() if isinstance(loss_Edge, torch.Tensor) else loss_Edge)  # <-- [修改]
-        # AAA
-        loss_log_tmp['total'].append(loss.item())
+        loss_log_tmp['MS-SSIM'].append(loss_SSIM.item() if isinstance(loss_SSIM, torch.Tensor) else loss_SSIM)
+        loss_log_tmp['Contrast'].append(loss_Cr.item() if isinstance(loss_Cr, torch.Tensor) else loss_Cr)
+        loss_log_tmp['EdgeDice'].append(loss_Edge.item() if isinstance(loss_Edge, torch.Tensor) else loss_Edge)
+        loss_log_tmp['Total'].append(loss.item())
 
         l1_val = (opt.w_loss_L1 * loss_L1.item()) if isinstance(loss_L1, torch.Tensor) and opt.w_loss_L1 > 0 else 0.0
         ssim_val = (opt.w_loss_SSIM * loss_SSIM.item()) if isinstance(loss_SSIM, torch.Tensor) and opt.w_loss_SSIM > 0 else 0.0
         cr_val = (opt.w_loss_Cr * loss_Cr.item()) if isinstance(loss_Cr, torch.Tensor) and opt.w_loss_Cr > 0 else 0.0
-        # print(f'\rloss:{loss.item():.5f} | L1:{l1_val:.5f} | SSIM:{ssim_val:.5f} | Cr:{cr_val:.5f}  | step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}', end='', flush=True)
-        # AAA
+
         edge_val = (opt.w_loss_Edge * loss_Edge.item()) if isinstance(loss_Edge,
-                                                                      torch.Tensor) and opt.w_loss_Edge > 0 else 0.0  # <-- [修改]
-        # AAA
-
-        # AAA
-        # --- [修改] 更新打印 ---
+                                                                      torch.Tensor) and opt.w_loss_Edge > 0 else 0.0
         print(
-            f'\rloss:{loss.item():.5f} | L1:{l1_val:.5f} | SSIM:{ssim_val:.5f} | Cr:{cr_val:.5f} | Edge:{edge_val:.5f} | step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}',
-            end='', flush=True)
-        # --- [修改结束] ---
-        # AAA
+            f'\rloss:{loss.item():.5f} | L1:{l1_val:.5f} | MS-SSIM:{ssim_val:.5f} | '
+            f'Contrast:{cr_val:.5f} | EdgeDice:{edge_val:.5f} | step:{step}/{steps} | '
+            f'lr:{lr :.9f} | time_used:{(time.time() - start_time) / 60 :.1f}',
+            end='', flush=True
+        )
 
-        # --- 保存损失记录和执行评估的逻辑 ---
         steps_per_epoch = len(loader_train) if loader_train else 0 # 获取每个 epoch 的步数
         # Epoch 结束统计
         if steps_per_epoch > 0 and step % steps_per_epoch == 0:
@@ -423,20 +396,13 @@ def set_seed_torch(seed=2024):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # 对于需要确定性的场景，取消下面两行的注释，但这可能会降低性能
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
-    # 通常 benchmark = True 可以加速训练
     torch.backends.cudnn.benchmark = True
-
 
 # Python 主程序入口点
 if __name__ == "__main__":
 
     set_seed_torch(2024)
 
-    # --- [修改] 数据集路径和实例化 ---
-    # !! 请将下面的路径修改为你实际的数据集路径 !!
     train_base_dir = 'E:/FLIR_zongti_quwu_ceshi/dataset/FLIR/train' # 训练集根目录
     test_base_dir = 'E:/FLIR_zongti_quwu_ceshi/dataset/FLIR/test'   # 测试集根目录
 
@@ -475,10 +441,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"错误: 初始化测试数据集 TestDataset 失败: {e}。测试将跳过。")
         test_set = None
-    # --- [修改结束] ---
 
-    # --- DataLoader ---
-    # 从配置中读取 batch_size 和 num_workers，提供默认值
     batch_size = getattr(opt, 'batch_size', 4) # 使用 opt 中的 batch_size，默认为 4
     num_workers = getattr(opt, 'num_workers', 4) # 使用 opt 中的 num_workers，默认为 4
 
@@ -509,18 +472,15 @@ if __name__ == "__main__":
 
     # --- [修改] 模型初始化 ---
     teacher_net = VIFNetInconsistencyTeacher() # 实例化新的模型
+    teacher_net = VIFNetInconsistencyTeacher() # 实例化新的模型
     teacher_net = teacher_net.to(opt.device)
     # --- [修改结束] ---
 
-    # AAA
-    # --- [新增] 初始化边缘检测器 ---
     edge_detector = SobelEdgeDetector().to(opt.device)
     # 确保它不参与训练（Sobel 没有可训练参数，但这是个好习惯）
     for param in edge_detector.parameters():
         param.requires_grad = False
     edge_detector.eval()
-    # --- [新增结束] ---
-    # AAA
 
     epoch_size = len(loader_train) if loader_train else 0
     if epoch_size == 0:
@@ -541,13 +501,10 @@ if __name__ == "__main__":
         print(f"计算总参数量时出错: {e}")
     print("------------------------------------------------------------------")
 
-    # --- 损失函数和优化器 ---
     criterion = []
-    # L1 Loss
     criterion.append(nn.L1Loss().to(opt.device))
-    # SSIM Loss
-    criterion.append(SSIM().to(opt.device))
-    # Contrast Loss
+    criterion.append(MSSSIM().to(opt.device))  #
+
     try:
         contrast_loss_instance = ContrastLoss(ablation=False).to(opt.device)
         criterion.append(contrast_loss_instance)
@@ -557,7 +514,13 @@ if __name__ == "__main__":
          criterion.append(None)
          opt.w_loss_Cr = 0 # 禁用对比度损失
 
-    # 确保 criterion 列表长度至少为 3，即使 Cr Loss 失败
+    try:
+        criterion.append(DiceLoss().to(opt.device))  #
+    except Exception as e:
+        print(f"错误: 初始化 DiceLoss 失败: {e}。将 Edge 损失权重设为 0。")
+        criterion.append(None)
+        opt.w_loss_Edge = 0
+
     while len(criterion) < 3:
         criterion.append(None)
 
@@ -567,11 +530,6 @@ if __name__ == "__main__":
                            eps=1e-08)
     optimizer.zero_grad() # 初始化梯度
 
-    # 开始训练
     print("开始训练...")
-    # AAA
-    # --- [修改] 传入 edge_detector ---
     train(teacher_net, loader_train, loader_test, optimizer, criterion, edge_detector)
-    # --- [修改结束] ---
-    # AAA
     print("训练完成。")
