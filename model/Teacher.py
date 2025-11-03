@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-*** 修改后的模型： VIFNetInconsistencyTeacher with Channel Attention Fusion ***
-- 保留 DualStreamTeacher 的双流结构和特征提取器。
-- 引入 VIFNet 的不一致性计算和加权融合思想（注入可见光流解码器）。
-- *** 修改了最终融合方式：使用通道注意力机制融合 vis_features 和 ir_features，替代简单的 torch.cat ***
-"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +5,11 @@ import math
 import os
 import torchvision.transforms.functional as TF
 from collections import OrderedDict
+
+# --- [修改] 使用绝对导入（因为我们添加了项目根目录到 sys.path） ---
+from model.vifnet_basic_modules import Encoder_B, Decoder_B, Conv_B, CPAB
+from model.dsfe import DSFE
+# --- [修改结束] ---
 
 # --- VIFNet 不一致性函数 f(x, y) (保持不变) ---
 def f(x, y):
@@ -337,16 +335,17 @@ class Bottle2neck(nn.Module):
 class Res2Net(nn.Module):
     """
         Res2Net: 去雾模型的编码器部分，基于 Res2Net 结构。
-        *** 确保输入为 3 通道 ***
+        *** [修改]：支持“串联注入”不一致性权重 ***
     """
-    def __init__(self, block, layers, baseWidth=26, scale=4, in_channels=3): # 添加 in_channels 参数
+
+    def __init__(self, block, layers, baseWidth=26, scale=4, in_channels=3):  # 添加 in_channels 参数
         self.inplanes = 64
         super(Res2Net, self).__init__()
         self.baseWidth = baseWidth
         self.scale = scale
         # 使用 in_channels 参数
         self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 3, 2, 1, bias=False), # *** 使用 in_channels ***
+            nn.Conv2d(in_channels, 32, 3, 2, 1, bias=False),  # *** 使用 in_channels ***
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 32, 3, 1, 1, bias=False),
@@ -361,25 +360,24 @@ class Res2Net(nn.Module):
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
 
+        # --- [新增] 注入权重适配器 (用于 Pass 2 注入) ---
+        # 匹配 DSFE(B) 输出 -> Res2Net(A) *输入* (layer 1/2/3 的输出通道)
+        # DSFE [64, 128, 256] -> Res2Net Layer [256, 512, 1024]
+        self.inject_conv1 = nn.Conv2d(64, 256, kernel_size=1, bias=False)  # H/4
+        self.inject_conv2 = nn.Conv2d(128, 512, kernel_size=1, bias=False)  # H/8
+        self.inject_conv3 = nn.Conv2d(256, 1024, kernel_size=1, bias=False)  # H/16
+        # --- [新增结束] ---
+
         # 初始化权重
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
     def _make_layer(self, block, planes, blocks, stride=1):
-        """
-                构建 Res2Net 的一个阶段。
-                参数：
-                - block: Bottle2neck 类。
-                - planes: 基础通道数。
-                - blocks: 该阶段的块数量。
-                - stride: 第一个块的步长。
-                返回：
-                - nn.Sequential: 包含所有 Bottle2neck 块的序列。
-        """
+        # ... (make_layer 定义保持不变) ...
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
@@ -398,20 +396,53 @@ class Res2Net(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x): # 输入 x 应该是 3 通道
+    def forward(self, x, inf_weights=None):  # [修改] 增加 inf_weights=None 参数
+        """
+        [修改后] 的 Res2Net forward，支持串联注入 (Sequential Injection)
 
-        x = self.conv1(x) # 第一层处理 3 通道输入
+        inf_weights: 一个列表 [Stru3(256), Stru2(128), Stru1(64)]
+                     对应 [H/16, H/8, H/4] 尺度
+        """
+
+        x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
 
-        x_layer0 = x  # 保存conv1后的特征 (64 通道)
-        x = self.maxpool(x)
+        x_layer0 = x  # (B, 64, H/2, W/2) - 用于 H4 蒸馏 和 H/2 解码
+        x_maxpool = self.maxpool(x)  # (B, 64, H/4, W/4)
 
-        x_layer1 = self.layer1(x)  # layer1 输出
-        x_layer2 = self.layer2(x_layer1)  # layer2 输出
-        x_layer3 = self.layer3(x_layer2)  # layer3 输出
+        # --- H/4 尺度 ---
+        x_layer1_orig = self.layer1(x_maxpool)  # (B, 256, H/4, W/4)
+        if inf_weights is not None:
+            inf_w_4 = self.inject_conv1(inf_weights[2])  # 64 -> 256
+            inf_w_4 = F.interpolate(inf_w_4, size=x_layer1_orig.shape[2:], mode='bilinear', align_corners=False)
+            x_layer1_fused = x_layer1_orig + inf_w_4
+        else:
+            x_layer1_fused = x_layer1_orig
 
-        return x_layer3, x_layer2, x_layer1, x_layer0
+        # --- H/8 尺度 ---
+        x_layer2_orig = self.layer2(x_layer1_fused)  # (B, 512, H/8, W/8)
+        if inf_weights is not None:
+            inf_w_8 = self.inject_conv2(inf_weights[1])  # 128 -> 512
+            inf_w_8 = F.interpolate(inf_w_8, size=x_layer2_orig.shape[2:], mode='bilinear', align_corners=False)
+            x_layer2_fused = x_layer2_orig + inf_w_8
+        else:
+            x_layer2_fused = x_layer2_orig
+
+        # --- H/16 尺度 ---
+        x_layer3_orig = self.layer3(x_layer2_fused)  # (B, 1024, H/16, W/16)
+        if inf_weights is not None:
+            inf_w_16 = self.inject_conv3(inf_weights[0])  # 256 -> 1024
+            inf_w_16 = F.interpolate(inf_w_16, size=x_layer3_orig.shape[2:], mode='bilinear', align_corners=False)
+            x_layer3_fused = x_layer3_orig + inf_w_16
+        else:
+            x_layer3_fused = x_layer3_orig
+
+        # [修改] 返回 注入后(fused)的特征（用于解码）和 注入前(orig)的特征（用于蒸馏）
+        fused_outputs = [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0]
+        original_outputs = [x_layer3_orig, x_layer2_orig, x_layer1_orig, x_layer0]
+
+        return fused_outputs, original_outputs
 
 class ConvBlock(torch.nn.Module):
     # ... (ConvBlock 代码保持不变) ...
@@ -864,23 +895,49 @@ class ChannelAttentionFusion(nn.Module):
 # --- 修改后的 VIFNetInconsistencyTeacher 模型 ---
 class VIFNetInconsistencyTeacher(nn.Module):
     """
-    双流教师模型，在可见光流中融入了基于 VIFNet 不一致性加权的红外特征。
-    *** 修改了最终融合方式：使用通道注意力 ***
+    [修改后] 双流教师模型，采用“两阶段精炼”架构。
+    阶段一：使用 VIFnet 轻量级模块提取结构特征。
+    阶段二：使用 Res2Net 重量级模块进行去雾精炼。
     """
+
     def __init__(self, res_blocks=18):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
-        # --- 可见光流 (保持不变) ---
+        # --- [新增] 阶段一 (Pass 1) 模块 (来自代码库 B) ---
+        # VIFnet (代码库 B) 默认 n_feat=64
+        b_n_feat = 64
+        b_kernel_size = 3
+        b_bias = False
+
+        # Pass 1 VIS 流 (轻量级)
+        self.vis_layer1_b = nn.Sequential(Conv_B(3, b_n_feat, b_kernel_size, bias=b_bias),
+                                          CPAB(b_n_feat, b_kernel_size, b_bias),
+                                          CPAB(b_n_feat, b_kernel_size, b_bias))
+        self.encoder_b_vis = Encoder_B(b_n_feat, b_kernel_size, b_bias, atten=False)
+        self.decoder_b_vis = Decoder_B(b_n_feat, b_kernel_size, b_bias, residual=True)
+        self.dsfe_vis = DSFE(b_n_feat, b_kernel_size, b_bias)
+
+        # Pass 1 IR 流 (轻量级)
+        self.ir_layer1_b = nn.Sequential(Conv_B(3, b_n_feat, b_kernel_size, bias=b_bias),
+                                         CPAB(b_n_feat, b_kernel_size, b_bias),
+                                         CPAB(b_n_feat, b_kernel_size, b_bias))
+        self.encoder_b_ir = Encoder_B(b_n_feat, b_kernel_size, b_bias, atten=False)
+        self.decoder_b_ir = Decoder_B(b_n_feat, b_kernel_size, b_bias, residual=True)
+        self.dsfe_ir = DSFE(b_n_feat, b_kernel_size, b_bias)
+        # --- [新增结束] ---
+
+        # --- 阶段二 (Pass 2) 模块 (来自代码库 A) ---
+
+        # --- 可见光流 (主网络) ---
+        # [修改]：Res2Net 现在内部包含了 inject_conv 模块
         self.encoder_vis = Res2Net(Bottle2neck, [3, 4, 23], baseWidth=26, scale=4, in_channels=3)
-        # 加载预训练权重 (省略代码)
+        # ... (加载权重代码保留) ...
         try:
             res2net101_full = Pre_Res2Net(Bottle2neck, [3, 4, 23, 3], baseWidth=26, scale=4)
-            # --- [修改] ---
-            # 修改预训练权重路径为你本地的路径
+            # [请注意]：请确保你本地 'D:/...' 路径下存在此文件
             pretrained_path = 'D:/liu_lan_qi_xia_zai/CoA-main_daima_xiugai_jiehe_ir_edge_xiugai_teacher_v5/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
-            # --- [修改结束] ---
             if not os.path.exists(pretrained_path):
-                 raise FileNotFoundError(f"预训练权重文件未找到: {pretrained_path}")
+                raise FileNotFoundError(f"预训练权重文件未找到: {pretrained_path}")
             res2net101_full.load_state_dict(torch.load(pretrained_path, map_location='cpu'), strict=False)
             pretrained_dict = res2net101_full.state_dict()
             model_dict = self.encoder_vis.state_dict()
@@ -891,6 +948,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
         except Exception as e:
             print(f"Warning: Could not load pretrained weights for visible stream encoder. {e}")
 
+        # ... (A 库的 CRA_vis, H_vis, dehaze_vis, decoder_vis 模块定义保持不变) ...
         self.CRA1_vis = nn.Conv2d(1024, 256, kernel_size=1)
         self.CRA2_vis = nn.Conv2d(512, 128, kernel_size=1)
         self.CRA3_vis = nn.Conv2d(256, 64, kernel_size=1)
@@ -917,22 +975,22 @@ class VIFNetInconsistencyTeacher(nn.Module):
         self.conv_1_vis = RDB(8, 4, 8)
         self.fusion_1_vis = Decoder_MDCBlock1(8, 5, mode='iter2')
 
-        # --- 红外流 (保持不变) ---
+        # --- 红外流 (用于 Pass 2 最终融合) ---
+        # (A 库的 IR 流模块定义保持不变)
         self.encoder_ir = Res2Net(Bottle2neck, [3, 4, 23], baseWidth=26, scale=4, in_channels=3)
-        # 加载预训练权重 (省略代码)
+        # ... (加载权重代码保留) ...
         try:
             # (与可见光流加载方式相同)
             res2net101_full_ir = Pre_Res2Net(Bottle2neck, [3, 4, 23, 3], baseWidth=26, scale=4)
-            # --- [修改] ---
-            # 修改预训练权重路径为你本地的路径
+            # [请注意]：请确保你本地 'D:/...' 路径下存在此文件
             pretrained_path_ir = 'D:/liu_lan_qi_xia_zai/CoA-main_daima_xiugai_jiehe_ir_edge_xiugai_teacher_v5/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
-            # --- [修改结束] ---
             if not os.path.exists(pretrained_path_ir):
-                 raise FileNotFoundError(f"预训练权重文件未找到: {pretrained_path_ir}")
+                raise FileNotFoundError(f"预训练权重文件未找到: {pretrained_path_ir}")
             res2net101_full_ir.load_state_dict(torch.load(pretrained_path_ir, map_location='cpu'), strict=False)
             pretrained_dict_ir = res2net101_full_ir.state_dict()
             model_dict_ir = self.encoder_ir.state_dict()
-            key_dict_ir = {k: v for k, v in pretrained_dict_ir.items() if k in model_dict_ir and model_dict_ir[k].shape == v.shape}
+            key_dict_ir = {k: v for k, v in pretrained_dict_ir.items() if
+                           k in model_dict_ir and model_dict_ir[k].shape == v.shape}
             model_dict_ir.update(key_dict_ir)
             self.encoder_ir.load_state_dict(model_dict_ir)
             print("Successfully loaded pretrained weights for infrared stream encoder.")
@@ -961,300 +1019,197 @@ class VIFNetInconsistencyTeacher(nn.Module):
         self.conv_1_ir = RDB(8, 4, 8)
         self.fusion_1_ir = Decoder_MDCBlock1(8, 5, mode='iter2')
 
-        # --- [修改] 最终融合与输出 ---
-        # 1. 通道注意力融合模块
-        # 输入是 vis_features (16) 和 ir_features (16)
-        self.final_fusion = ChannelAttentionFusion(in_channels=16, reduction=4, out_channels=32) # 输出保持32通道
-        # 2. 最终输出卷积层 (输入通道与 final_fusion 输出匹配)
-        self.conv_output = ConvLayer(16, 3, kernel_size=3, stride=1) # <--- 已修复
-        # --- [修改结束] ---
+        # --- [保留] 最终融合与输出 (代码库 A) ---
+        self.final_fusion = ChannelAttentionFusion(in_channels=16, reduction=4, out_channels=32)
+        self.conv_output = ConvLayer(32, 3, kernel_size=3, stride=1)
 
-        # (VIFNet 加权融合所需的 1x1 卷积层保持不变)
-        # self.proj16x = nn.Conv2d(256, 256, 1)
-        # self.proj8x = nn.Conv2d(128, 128, 1)
-        # self.proj4x = nn.Conv2d(64, 64, 1)
-        # self.proj2x = nn.Conv2d(32, 32, 1)
-        # --- [修改2：新增 编码器端的注意力融合模块实例] ---
-        # 对应 CRA 层的输出通道 (256, 128, 64, 32)
-        self.enc_fusion_16x = AttentionFusionBlock(channel=256)
-        self.enc_fusion_8x = AttentionFusionBlock(channel=128)
-        self.enc_fusion_4x = AttentionFusionBlock(channel=64)
-        self.enc_fusion_2x = AttentionFusionBlock(channel=32)
-        # --- [修改2：结束] ---
+        # --- [删除] 早期融合模块 (不再需要) ---
+        # self.enc_fusion_16x = ... (删除)
+        # ... (删除所有 enc_fusion)
 
-    # --- _process_vis_stream_with_fusion 和 _process_ir_stream 保持不变 ---
-    # ... (这两个函数的代码与上一个版本相同，这里省略) ...
-        # --- [修改4：重构可见光解码器] ---
-        # (此函数取代了 _process_vis_stream_with_fusion)
-    def _process_vis_decoder(self,
-                                 fused_vis_cra_list,  # [新] 接收融合后的CRA特征 [res16x_vis, res8x_vis, ...]
-                                 inf_weights,  # [新] 接收不一致性权重 [inf_weight_16x, ...]
-                                 dehaze,
-                                 convd16x, dense_4, conv_4, fusion_4,
-                                 convd8x, dense_3, conv_3, fusion_3,
-                                 convd4x, dense_2, conv_2, fusion_2,
-                                 convd2x, dense_1, conv_1, fusion_1,
-                                 target_size):  # [新] 接收最终输出的目标尺寸
-            """
-            [修改后的] 可见光解码器处理函数。
-            - 直接使用传入的融合特征 (fused_vis_cra_list)。
-            - 在跳跃连接前融合不一致性权重 (inf_weights)。
-            - 不再计算 H 特征（移至 forward 方法中）。
-            """
-            # --- 1. 解包早期融合的CRA特征 ---
-            res16x_vis, res8x_vis, res4x_vis, res2x_vis = fused_vis_cra_list
+        # --- [删除] 注入权重适配器 (已移入 Res2Net) ---
+        # self.inject_conv1 = ... (删除)
+        # self.inject_conv2 = ... (删除)
+        # self.inject_conv3 = ... (删除)
 
-            # --- 2. 解包不一致性权重 ---
-            inf_weight_16x, inf_weight_8x, inf_weight_4x, inf_weight_2x = inf_weights
+    # --- [删除] _process_vis_decoder 和 _process_ir_stream ---
+    # (这两个函数的功能将被内联并重构到新的 forward 方法中)
 
-            # --- 3. 融合不一致性特征 ---
-            # (确保尺寸一致)
-            inf_weight_16x = F.interpolate(inf_weight_16x, size=res16x_vis.shape[2:], mode='bilinear',
-                                           align_corners=False) if inf_weight_16x.shape[2:] != res16x_vis.shape[
-                                                                                               2:] else inf_weight_16x
-            inf_weight_8x = F.interpolate(inf_weight_8x, size=res8x_vis.shape[2:], mode='bilinear',
-                                          align_corners=False) if inf_weight_8x.shape[2:] != res8x_vis.shape[
-                                                                                             2:] else inf_weight_8x
-            inf_weight_4x = F.interpolate(inf_weight_4x, size=res4x_vis.shape[2:], mode='bilinear',
-                                          align_corners=False) if inf_weight_4x.shape[2:] != res4x_vis.shape[
-                                                                                             2:] else inf_weight_4x
-            inf_weight_2x = F.interpolate(inf_weight_2x, size=res2x_vis.shape[2:], mode='bilinear',
-                                          align_corners=False) if inf_weight_2x.shape[2:] != res2x_vis.shape[
-                                                                                             2:] else inf_weight_2x
+    # --- [重写] forward 方法 ---
+    def forward(self, x_vis, x_ir):
 
-            # (早期融合特征 + 不一致性权重)
-            res16x_vis_fused = res16x_vis + inf_weight_16x
-            res8x_vis_fused = res8x_vis + inf_weight_8x
-            res4x_vis_fused = res4x_vis + inf_weight_4x
-            res2x_vis_fused = res2x_vis + inf_weight_2x
-            # --- [修改4：结束] ---
+        # --- 阶段一 & 二：并行结构提取 (Pass 1 - B 模块) ---
 
-            # Dehaze (使用融合后的 res16x)
-            in_ft = res16x_vis_fused  # 使用融合后的特征
-            res16x_dehazed = dehaze(in_ft) + res16x_vis_fused  # 残差连接也用融合后的
+        # 1a. VIS 流 (Pass 1) -> DSFE_vis
+        vis_b_fea1 = self.vis_layer1_b(x_vis)
+        vis_b_enc_features = self.encoder_b_vis(vis_b_fea1)  # [64, 128, 256]
+        vis_b_dec_features = self.decoder_b_vis(vis_b_enc_features)  # [64, 128, 256]
+        vis_structure = self.dsfe_vis(vis_b_enc_features, vis_b_dec_features)  # [64, 128, 256]
 
-            res16x_1, res16x_2 = res16x_dehazed.split([(res16x_dehazed.size(1) // 2), (res16x_dehazed.size(1) // 2)],
-                                                      dim=1)
-            feature_mem_up = [res16x_1]
+        # 1b. IR 流 (Pass 1) -> DSFE_ir
+        ir_b_fea1 = self.ir_layer1_b(x_ir)
+        ir_b_enc_features = self.encoder_b_ir(ir_b_fea1)  # [64, 128, 256]
+        ir_b_dec_features = self.decoder_b_ir(ir_b_enc_features)  # [64, 128, 256]
+        ir_structure = self.dsfe_ir(ir_b_enc_features, ir_b_dec_features)  # [64, 128, 256]
 
-            # Decoder Stage 1 (使用融合后的 res8x_vis_fused)
-            res16x_up = convd16x(res16x_dehazed)
-            res16x_up = F.interpolate(res16x_up, size=res8x_vis_fused.size()[2:], mode='bilinear', align_corners=False)
-            res8x_fused = torch.add(res16x_up, res8x_vis_fused)  # <--- 使用融合后的 res8x
-            res8x_dense = dense_4(res8x_fused) + res8x_fused
-            res8x_1, res8x_2 = res8x_dense.split([(res8x_dense.size(1) // 2), (res8x_dense.size(1) // 2)], dim=1)
-            res8x_1 = fusion_4(res8x_1, feature_mem_up)
-            res8x_2 = conv_4(res8x_2)
-            feature_mem_up.append(res8x_1)
-            res8x_out = torch.cat((res8x_1, res8x_2), dim=1)
+        # --- 阶段三：计算不一致性权重 ---
 
-            # Decoder Stage 2 (使用融合后的 res4x_vis_fused)
-            res8x_up = convd8x(res8x_out)
-            res8x_up = F.interpolate(res8x_up, size=res4x_vis_fused.size()[2:], mode='bilinear', align_corners=False)
-            res4x_fused = torch.add(res8x_up, res4x_vis_fused)  # <--- 使用融合后的 res4x
-            res4x_dense = dense_3(res4x_fused) + res4x_fused
-            res4x_1, res4x_2 = res4x_dense.split([(res4x_dense.size(1) // 2), (res4x_dense.size(1) // 2)], dim=1)
-            res4x_1 = fusion_3(res4x_1, feature_mem_up)
-            res4x_2 = conv_3(res4x_2)
-            feature_mem_up.append(res4x_1)
-            res4x_out = torch.cat((res4x_1, res4x_2), dim=1)
+        # 列表顺序：[H/16(256), H/8(128), H/4(64)]
+        inf_weight_list = [None, None, None]
 
-            # Decoder Stage 3 (使用融合后的 res2x_vis_fused)
-            res4x_up = convd4x(res4x_out)
-            res4x_up = F.interpolate(res4x_up, size=res2x_vis_fused.size()[2:], mode='bilinear', align_corners=False)
-            res2x_fused = torch.add(res4x_up, res2x_vis_fused)  # <--- 使用融合后的 res2x
-            res2x_dense = dense_2(res2x_fused) + res2x_fused
-            res2x_1, res2x_2 = res2x_dense.split([(res2x_dense.size(1) // 2), (res2x_dense.size(1) // 2)], dim=1)
-            res2x_1 = fusion_2(res2x_1, feature_mem_up)
-            res2x_2 = conv_2(res2x_2)
-            feature_mem_up.append(res2x_1)
-            res2x_out = torch.cat((res2x_1, res2x_2), dim=1)
+        incons_feature_3 = f(vis_structure[2], ir_structure[2])
+        inf_weight_list[0] = incons_feature_3 * ir_structure[2]  # H/16 尺度 (256 通道)
 
-            # Decoder Stage 4
-            res2x_up = convd2x(res2x_out)
-            # [修改4] 使用传入的 target_size
-            res2x_up = F.interpolate(res2x_up, size=target_size, mode='bilinear', align_corners=False)
-            x_fused = res2x_up
-            x_dense = dense_1(x_fused) + x_fused
-            x_1, x_2 = x_dense.split([(x_dense.size(1) // 2), (x_dense.size(1) // 2)], dim=1)
-            x_1 = fusion_1(x_1, feature_mem_up)
-            x_2 = conv_1(x_2)
-            x_out_before_fusion = torch.cat((x_1, x_2), dim=1)  # 16 通道
+        incons_feature_2 = f(vis_structure[1], ir_structure[1])
+        inf_weight_list[1] = incons_feature_2 * ir_structure[1]  # H/8 尺度 (128 通道)
 
-            # --- [修改4：移除H特征计算] ---
-            # (H 特征已移至 forward 方法中)
-            # intermediate_features_h = [res2x_vis, res4x_vis, res8x_vis, res16x_vis]
-            # return x_out_before_fusion, intermediate_features_h
-            # --- [修改4：结束] ---
+        incons_feature_1 = f(vis_structure[0], ir_structure[0])
+        inf_weight_list[2] = incons_feature_1 * ir_structure[0]  # H/4 尺度 (64 通道)
 
-            return x_out_before_fusion  # 只返回最终的可见光流特征
+        # --- 阶段四：精炼编码与注入（Pass 2 - A 模块）---
 
-    def _process_ir_stream(self, x_ir, encoder, CRA1, CRA2, CRA3, CRA4, dehaze,
-                           convd16x, dense_4, conv_4, fusion_4,
-                           convd8x, dense_3, conv_3, fusion_3,
-                           convd4x, dense_2, conv_2, fusion_2,
-                           convd2x, dense_1, conv_1, fusion_1):
-        """
-        处理红外流（与原始 _process_stream 类似，但只返回最终特征和 CRA 特征）。
-        """
-        # --- 编码器和 CRA ---
-        x_layer3_encoder_out, x_layer2, x_layer1, x_layer0_prepool = encoder(x_ir)
-        res16x_ir = CRA1(x_layer3_encoder_out)
-        res8x_ir = CRA2(x_layer2)
-        res4x_ir = CRA3(x_layer1)
-        res2x_ir = CRA4(x_layer0_prepool)
+        # 4a. 运行 Pass 2 Encoder (代码库 A) 并进行串联注入
+        # [修改]：调用修改后的 Res2Net.forward
+        fused_outputs, original_outputs = self.encoder_vis(x_vis, inf_weight_list)
 
-        # Dehaze
-        in_ft = res16x_ir
-        res16x_dehazed = dehaze(in_ft) + res16x_ir
+        # (fused_outputs)  [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0]
+        # (original_outputs) [x_layer3_orig, x_layer2_orig, x_layer1_orig, x_layer0]
 
+        x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0 = fused_outputs
+        x_layer3_orig, x_layer2_orig, x_layer1_orig, _ = original_outputs  # (x_layer0 是一样的)
+
+        # [用于蒸馏的 H 特征]
+        # (在注入 *之前* 的原始 A 模块 Encoder 特征上计算)
+        vis_h_features = [
+            self.H4_vis(self.CRA4_vis(x_layer0)),  # 32 -> 16
+            self.H3_vis(self.CRA3_vis(x_layer1_orig)),  # 64 -> 32
+            self.H2_vis(self.CRA2_vis(x_layer2_orig)),  # 128 -> 64
+            self.H1_vis(self.CRA1_vis(x_layer3_orig))  # 256 -> 128
+        ]
+
+        # --- 阶段五：最终解码（Pass 2 - A 模块）---
+
+        # 5a. CRA 降维 (输入是已融合的特征)
+        res16x_vis = self.CRA1_vis(x_layer3_fused)  # (256)
+        res8x_vis = self.CRA2_vis(x_layer2_fused)  # (128)
+        res4x_vis = self.CRA3_vis(x_layer1_fused)  # (64)
+        res2x_vis = self.CRA4_vis(x_layer0)  # (32) (x_layer0 未被注入)
+
+        # 5b. 运行代码库 A 的 VIS 解码器
+        # (这部分逻辑来自 A 库的 _process_vis_decoder)
+
+        in_ft = res16x_vis
+        res16x_dehazed = self.dehaze_vis(in_ft) + res16x_vis
         res16x_1, res16x_2 = res16x_dehazed.split([(res16x_dehazed.size(1) // 2), (res16x_dehazed.size(1) // 2)], dim=1)
         feature_mem_up = [res16x_1]
 
-        # Decoder Stage 1
-        res16x_up = convd16x(res16x_dehazed)
-        res16x_up = F.interpolate(res16x_up, size=res8x_ir.size()[2:], mode='bilinear', align_corners=False)
-        res8x_fused = torch.add(res16x_up, res8x_ir)
-        res8x_dense = dense_4(res8x_fused) + res8x_fused
+        # Stage 1 (H/16 -> H/8)
+        res16x_up = self.convd16x_vis(res16x_dehazed)
+        res16x_up = F.interpolate(res16x_up, size=res8x_vis.size()[2:], mode='bilinear', align_corners=False)
+        res8x_fused = torch.add(res16x_up, res8x_vis)  # 跳跃连接 (使用已融合的 res8x_vis)
+        res8x_dense = self.dense_4_vis(res8x_fused) + res8x_fused
         res8x_1, res8x_2 = res8x_dense.split([(res8x_dense.size(1) // 2), (res8x_dense.size(1) // 2)], dim=1)
-        res8x_1 = fusion_4(res8x_1, feature_mem_up)
-        res8x_2 = conv_4(res8x_2)
+        res8x_1 = self.fusion_4_vis(res8x_1, feature_mem_up)
+        res8x_2 = self.conv_4_vis(res8x_2)
         feature_mem_up.append(res8x_1)
         res8x_out = torch.cat((res8x_1, res8x_2), dim=1)
 
-        # Decoder Stage 2
-        res8x_up = convd8x(res8x_out)
-        res8x_up = F.interpolate(res8x_up, size=res4x_ir.size()[2:], mode='bilinear', align_corners=False)
-        res4x_fused = torch.add(res8x_up, res4x_ir)
-        res4x_dense = dense_3(res4x_fused) + res4x_fused
+        # Stage 2 (H/8 -> H/4)
+        res8x_up = self.convd8x_vis(res8x_out)
+        res8x_up = F.interpolate(res8x_up, size=res4x_vis.size()[2:], mode='bilinear', align_corners=False)
+        res4x_fused = torch.add(res8x_up, res4x_vis)  # 跳跃连接 (使用已融合的 res4x_vis)
+        res4x_dense = self.dense_3_vis(res4x_fused) + res4x_fused
         res4x_1, res4x_2 = res4x_dense.split([(res4x_dense.size(1) // 2), (res4x_dense.size(1) // 2)], dim=1)
-        res4x_1 = fusion_3(res4x_1, feature_mem_up)
-        res4x_2 = conv_3(res4x_2)
+        res4x_1 = self.fusion_3_vis(res4x_1, feature_mem_up)
+        res4x_2 = self.conv_3_vis(res4x_2)
         feature_mem_up.append(res4x_1)
         res4x_out = torch.cat((res4x_1, res4x_2), dim=1)
 
-        # Decoder Stage 3
-        res4x_up = convd4x(res4x_out)
-        res4x_up = F.interpolate(res4x_up, size=res2x_ir.size()[2:], mode='bilinear', align_corners=False)
-        res2x_fused = torch.add(res4x_up, res2x_ir)
-        res2x_dense = dense_2(res2x_fused) + res2x_fused
+        # Stage 3 (H/4 -> H/2)
+        res4x_up = self.convd4x_vis(res4x_out)
+        res4x_up = F.interpolate(res4x_up, size=res2x_vis.size()[2:], mode='bilinear', align_corners=False)
+        res2x_fused = torch.add(res4x_up, res2x_vis)  # 跳跃连接 (使用已融合的 res2x_vis)
+        res2x_dense = self.dense_2_vis(res2x_fused) + res2x_fused
         res2x_1, res2x_2 = res2x_dense.split([(res2x_dense.size(1) // 2), (res2x_dense.size(1) // 2)], dim=1)
-        res2x_1 = fusion_2(res2x_1, feature_mem_up)
-        res2x_2 = conv_2(res2x_2)
+        res2x_1 = self.fusion_2_vis(res2x_1, feature_mem_up)
+        res2x_2 = self.conv_2_vis(res2x_2)
         feature_mem_up.append(res2x_1)
         res2x_out = torch.cat((res2x_1, res2x_2), dim=1)
 
-        # Decoder Stage 4
-        res2x_up = convd2x(res2x_out)
-        target_size = x_ir.size()[2:] # 使用原始红外输入尺寸
-        res2x_up = F.interpolate(res2x_up, size=target_size, mode='bilinear', align_corners=False)
+        # Stage 4 (H/2 -> H)
+        res2x_up = self.convd2x_vis(res2x_out)
+        res2x_up = F.interpolate(res2x_up, size=x_vis.size()[2:], mode='bilinear', align_corners=False)
         x_fused = res2x_up
-        x_dense = dense_1(x_fused) + x_fused
+        x_dense = self.dense_1_vis(x_fused) + x_fused
         x_1, x_2 = x_dense.split([(x_dense.size(1) // 2), (x_dense.size(1) // 2)], dim=1)
-        x_1 = fusion_1(x_1, feature_mem_up)
-        x_2 = conv_1(x_2)
-        x_out_before_fusion = torch.cat((x_1, x_2), dim=1)
+        x_1 = self.fusion_1_vis(x_1, feature_mem_up)
+        x_2 = self.conv_1_vis(x_2)
+        vis_features = torch.cat((x_1, x_2), dim=1)  # (16 通道)
 
-        # 返回最终解码特征和 CRA 特征 (用于计算不一致性)
-        cra_features = [res16x_ir, res8x_ir, res4x_ir, res2x_ir]
-        return x_out_before_fusion, cra_features
+        # 5c. [运行 IR 流 (Pass 2)]
+        # (这部分用于获取最终融合所需的 ir_features)
 
-    def forward(self, x_vis, x_ir):
-        """
-        [修改后的] 前向传播:
-        1. [修改3] 仅运行IR流编码器，获取CRA特征 (ir_cra_features)。
-        2. 运行VIS流编码器，获取CRA特征 (resX_vis_orig)。
-        3. 执行早期注意力融合：AttentionFusion(resX_vis_orig, resX_ir) -> 得到新的 resX_vis。
-        4. 使用新的 resX_vis 和 resX_ir 计算不一致性权重 inf_weights_list。
-        5. 将新的 resX_vis 和 inf_weights_list 传入可见光解码器。
-        6. [修改3] 将可见光解码器输出 (vis_features) 直接通过 conv_output 生成图像。
-        """
-        # --- [修改3：仅处理红外编码器] ---
-        # (不再调用 _process_ir_stream)
-        ir_layer3_encoder_out, ir_layer2, ir_layer1, ir_layer0_prepool = self.encoder_ir(x_ir)
-        res16x_ir = self.CRA1_ir(ir_layer3_encoder_out)
+        # [修改]：正确解包 Res2Net 的 (fused_outputs, original_outputs)
+        # 因为 inf_weights 为 None, fused_outputs 和 original_outputs 相同
+        ir_fused_outputs, _ = self.encoder_ir(x_ir)  # (IR 流不注入)
+        ir_layer3, ir_layer2, ir_layer1, ir_layer0 = ir_fused_outputs
+        # [修改结束]
+        res16x_ir = self.CRA1_ir(ir_layer3)
         res8x_ir = self.CRA2_ir(ir_layer2)
         res4x_ir = self.CRA3_ir(ir_layer1)
-        res2x_ir = self.CRA4_ir(ir_layer0_prepool)
-        # --- [修改3：结束] ---
+        res2x_ir = self.CRA4_ir(ir_layer0)
 
-        # --- 2. 计算原始可见光CRA特征 ---
-        vis_layer3_encoder_out, vis_layer2, vis_layer1, vis_layer0_prepool = self.encoder_vis(x_vis)
-        res16x_vis_orig = self.CRA1_vis(vis_layer3_encoder_out)
-        res8x_vis_orig = self.CRA2_vis(vis_layer2)
-        res4x_vis_orig = self.CRA3_vis(vis_layer1)
-        res2x_vis_orig = self.CRA4_vis(vis_layer0_prepool)
+        # (这部分逻辑来自 A 库的 _process_ir_stream)
+        in_ft_ir = res16x_ir
+        res16x_dehazed_ir = self.dehaze_ir(in_ft_ir) + res16x_ir
+        res16x_1_ir, res16x_2_ir = res16x_dehazed_ir.split(
+            [(res16x_dehazed_ir.size(1) // 2), (res16x_dehazed_ir.size(1) // 2)], dim=1)
+        feature_mem_up_ir = [res16x_1_ir]
 
-        # --- [修改3：执行早期注意力融合] ---
-        # (确保IR特征尺寸与VIS特征尺寸匹配)
-        if res16x_vis_orig.shape[2:] != res16x_ir.shape[2:]:
-            res16x_ir_aligned = F.interpolate(res16x_ir, size=res16x_vis_orig.shape[2:], mode='bilinear',
-                                              align_corners=False)
-        else:
-            res16x_ir_aligned = res16x_ir
-        res16x_vis = self.enc_fusion_16x(res16x_vis_orig, res16x_ir_aligned)  # 新的融合特征 (256)
+        res16x_up_ir = self.convd16x_ir(res16x_dehazed_ir)
+        res16x_up_ir = F.interpolate(res16x_up_ir, size=res8x_ir.size()[2:], mode='bilinear', align_corners=False)
+        res8x_fused_ir = torch.add(res16x_up_ir, res8x_ir)
+        res8x_dense_ir = self.dense_4_ir(res8x_fused_ir) + res8x_fused_ir
+        res8x_1_ir, res8x_2_ir = res8x_dense_ir.split([(res8x_dense_ir.size(1) // 2), (res8x_dense_ir.size(1) // 2)],
+                                                      dim=1)
+        res8x_1_ir = self.fusion_4_ir(res8x_1_ir, feature_mem_up_ir)
+        res8x_2_ir = self.conv_4_ir(res8x_2_ir)
+        feature_mem_up_ir.append(res8x_1_ir)
+        res8x_out_ir = torch.cat((res8x_1_ir, res8x_2_ir), dim=1)
 
-        if res8x_vis_orig.shape[2:] != res8x_ir.shape[2:]:
-            res8x_ir_aligned = F.interpolate(res8x_ir, size=res8x_vis_orig.shape[2:], mode='bilinear',
-                                             align_corners=False)
-        else:
-            res8x_ir_aligned = res8x_ir
-        res8x_vis = self.enc_fusion_8x(res8x_vis_orig, res8x_ir_aligned)  # (128)
+        res8x_up_ir = self.convd8x_ir(res8x_out_ir)
+        res8x_up_ir = F.interpolate(res8x_up_ir, size=res4x_ir.size()[2:], mode='bilinear', align_corners=False)
+        res4x_fused_ir = torch.add(res8x_up_ir, res4x_ir)
+        res4x_dense_ir = self.dense_3_ir(res4x_fused_ir) + res4x_fused_ir
+        res4x_1_ir, res4x_2_ir = res4x_dense_ir.split([(res4x_dense_ir.size(1) // 2), (res4x_dense_ir.size(1) // 2)],
+                                                      dim=1)
+        res4x_1_ir = self.fusion_3_ir(res4x_1_ir, feature_mem_up_ir)
+        res4x_2_ir = self.conv_3_ir(res4x_2_ir)
+        feature_mem_up_ir.append(res4x_1_ir)
+        res4x_out_ir = torch.cat((res4x_1_ir, res4x_2_ir), dim=1)
 
-        if res4x_vis_orig.shape[2:] != res4x_ir.shape[2:]:
-            res4x_ir_aligned = F.interpolate(res4x_ir, size=res4x_vis_orig.shape[2:], mode='bilinear',
-                                             align_corners=False)
-        else:
-            res4x_ir_aligned = res4x_ir
-        res4x_vis = self.enc_fusion_4x(res4x_vis_orig, res4x_ir_aligned)  # (64)
+        res4x_up_ir = self.convd4x_ir(res4x_out_ir)
+        res4x_up_ir = F.interpolate(res4x_up_ir, size=res2x_ir.size()[2:], mode='bilinear', align_corners=False)
+        res2x_fused_ir = torch.add(res4x_up_ir, res2x_ir)
+        res2x_dense_ir = self.dense_2_ir(res2x_fused_ir) + res2x_fused_ir
+        res2x_1_ir, res2x_2_ir = res2x_dense_ir.split([(res2x_dense_ir.size(1) // 2), (res2x_dense_ir.size(1) // 2)],
+                                                      dim=1)
+        res2x_1_ir = self.fusion_2_ir(res2x_1_ir, feature_mem_up_ir)
+        res2x_2_ir = self.conv_2_ir(res2x_2_ir)
+        res2x_out_ir = torch.cat((res2x_1_ir, res2x_2_ir), dim=1)
 
-        if res2x_vis_orig.shape[2:] != res2x_ir.shape[2:]:
-            res2x_ir_aligned = F.interpolate(res2x_ir, size=res2x_vis_orig.shape[2:], mode='bilinear',
-                                             align_corners=False)
-        else:
-            res2x_ir_aligned = res2x_ir
-        res2x_vis = self.enc_fusion_2x(res2x_vis_orig, res2x_ir_aligned)  # (32)
+        res2x_up_ir = self.convd2x_ir(res2x_out_ir)
+        res2x_up_ir = F.interpolate(res2x_up_ir, size=x_ir.size()[2:], mode='bilinear', align_corners=False)
+        x_fused_ir = res2x_up_ir
+        x_dense_ir = self.dense_1_ir(x_fused_ir) + x_fused_ir
+        x_1_ir, x_2_ir = x_dense_ir.split([(x_dense_ir.size(1) // 2), (x_dense_ir.size(1) // 2)], dim=1)
+        x_1_ir = self.fusion_1_ir(x_1_ir, feature_mem_up_ir)
+        x_2_ir = self.conv_1_ir(x_2_ir)
+        ir_features = torch.cat((x_1_ir, x_2_ir), dim=1)  # (16 通道)
 
-        # --- 4. 使用新的融合特征计算不一致性 ---
-        inf_weight_16x = f(res16x_vis, res16x_ir_aligned) * res16x_ir_aligned
-        inf_weight_8x = f(res8x_vis, res8x_ir_aligned) * res8x_ir_aligned
-        inf_weight_4x = f(res4x_vis, res4x_ir_aligned) * res4x_ir_aligned
-        inf_weight_2x = f(res2x_vis, res2x_ir_aligned) * res2x_ir_aligned
-
-        inf_weights_list = [inf_weight_16x, inf_weight_8x, inf_weight_4x, inf_weight_2x]
-
-        # 5. H 特征使用融合前的原始可见光特征 (用于蒸馏)
-        vis_intermediate_h_orig = [res2x_vis_orig, res4x_vis_orig, res8x_vis_orig, res16x_vis_orig]
-
-        # 6. 将新的早期融合特征传入解码器
-        fused_vis_cra_list = [res16x_vis, res8x_vis, res4x_vis, res2x_vis]
-
-        # --- 7. [修改3] 调用可见光解码器 ---
-        vis_features = self._process_vis_decoder(
-            fused_vis_cra_list, inf_weights_list,
-            self.dehaze_vis,
-            self.convd16x_vis, self.dense_4_vis, self.conv_4_vis, self.fusion_4_vis,
-            self.convd8x_vis, self.dense_3_vis, self.conv_3_vis, self.fusion_3_vis,
-            self.convd4x_vis, self.dense_2_vis, self.conv_2_vis, self.fusion_2_vis,
-            self.convd2x_vis, self.dense_1_vis, self.conv_1_vis, self.fusion_1_vis,
-            x_vis.size()[2:]  # 传入原始目标尺寸
-        )
-        # --- [修改3：结束] ---
-
-        # --- [修改3：修改最终融合] ---
-        # (删除 self.final_fusion)
-        # fused_attended_features = self.final_fusion(vis_features, ir_features)
-
-        # (直接使用 vis_features (16通道) 作为输出)
-        output = self.conv_output(vis_features)  # conv_output 现在是 16 -> 3
-        # --- [修改3：结束] ---
-
-        # --- 8. 使用原始H特征计算蒸馏输出 ---
-        vis_h_features = [self.H4_vis(vis_intermediate_h_orig[0]),
-                          self.H3_vis(vis_intermediate_h_orig[1]),
-                          self.H2_vis(vis_intermediate_h_orig[2]),
-                          self.H1_vis(vis_intermediate_h_orig[3])]
-        # --- [修改3：结束] ---
+        # 5d. 最终融合 (A 库逻辑)
+        fused_attended_features = self.final_fusion(vis_features, ir_features)
+        output = self.conv_output(fused_attended_features)  # (32 -> 3)
 
         return output, vis_h_features
 
