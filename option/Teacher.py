@@ -62,6 +62,13 @@ parser.add_argument('--saved_data_dir', type=str, default='saved_data')
 # 定义数据集名称（用于构建目录结构）
 parser.add_argument('--dataset', type=str, default='Teacher')
 
+# --- [新增] 训练期间的真实世界测试集路径 ---
+# (请在运行时指定这些路径，或在此处设置你的默认值)
+parser.add_argument('--real_test_hazy_path', type=str, default="E:/FLIR_zongti_quwu_ceshi/dataset/FLIR_zengqiang/xunlian_guocheng_ceshi/hazy",
+                    help='Path to real-world hazy images (e.g., ./real_test/hazy)')
+parser.add_argument('--real_test_ir_path', type=str, default="E:/FLIR_zongti_quwu_ceshi/dataset/FLIR_zengqiang/xunlian_guocheng_ceshi/ir",
+                    help='Path to real-world ir images (e.g., ./real_test/ir)')
+
 # --- 4. 解析参数并设置设备 ---
 
 opt = parser.parse_args()  # 解析命令行传入的参数

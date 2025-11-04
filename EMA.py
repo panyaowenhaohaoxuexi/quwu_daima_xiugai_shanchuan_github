@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import math
 import os
 import time
@@ -9,6 +10,14 @@ from torch import optim, nn
 from torch.backends import cudnn
 from torch.utils.data import DataLoader
 
+# --- [新增] 导入测试所需的模块 ---
+import glob
+import torchvision
+from PIL import Image
+from tqdm import tqdm
+from torchvision.transforms import Compose, ToTensor, Normalize, Resize, InterpolationMode
+# --- [新增结束] ---
+
 from metric import psnr, ssim
 from loss import SSIM  # 仅用于测试阶段时可用；训练不直接用
 # 使用你 data/ 下“已修改”的 TestDataset（三模态：hazy/ir/clear）
@@ -16,7 +25,16 @@ from data import MultiModalCLIPLoader, TestDataset
 from model import VIFNetInconsistencyTeacher, SobelEdgeDetector
 from CLIP import L_clip_from_feature
 from collections import OrderedDict
-from option.EMA import opt
+from option.EMA import opt  # [修改] 导入 EMA 的配置
+
+# --- [新增] 将 device 和 transform 移至全局 ---
+# (以便 dehaze 函数和 train 函数都能访问)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+transform = Compose([
+    ToTensor(),
+    Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
+])
+# --- [新增结束] ---
 
 start_time = time.time()
 steps = opt.iters_per_epoch * opt.epochs
@@ -32,6 +50,7 @@ def lr_schedule_cosdecay(t, T, init_lr=opt.start_lr, end_lr=opt.end_lr):
 # ---------- collate_fn（分开训练/测试两套，避免空批次时解包长度不匹配） ----------
 from torch.utils.data.dataloader import default_collate
 
+
 # 定义函数 collate_train：用于整理训练批次数据
 def collate_train(batch):
     """
@@ -41,6 +60,7 @@ def collate_train(batch):
     batch = [b for b in batch if b is not None and b[0] is not None]
     return default_collate(batch) if batch else (torch.tensor([]), torch.tensor([]))
 
+
 # 定义函数 collate_test：用于整理测试批次数据
 def collate_test(batch):
     """
@@ -49,6 +69,8 @@ def collate_test(batch):
     """
     batch = [b for b in batch if b is not None and b[0] is not None]
     return default_collate(batch) if batch else (torch.tensor([]), torch.tensor([]), torch.tensor([]), [''])
+
+
 # -----------------------------------------------------------------------------
 
 
@@ -59,6 +81,7 @@ class TextEncoder(nn.Module):
     作用：将 embedding_prompt 与 tokenized_prompts 输入到 CLIP 文本分支，
          输出与视觉空间对齐的文本特征 text_features。
     """
+
     def __init__(self, clip_model):
         super().__init__()
         self.transformer = clip_model.transformer  # transformer 模块
@@ -100,7 +123,8 @@ def _set_batchnorm_mode(module, train):
 
 # EMA 更新（兼容 DP）
 def update_ema_variables(student_model, teacher_model, alpha):
-    student_state_dict = student_model.module.state_dict() if isinstance(student_model, nn.DataParallel) else student_model.state_dict()
+    student_state_dict = student_model.module.state_dict() if isinstance(student_model,
+                                                                         nn.DataParallel) else student_model.state_dict()
     teacher_model_instance = teacher_model.module if isinstance(teacher_model, nn.DataParallel) else teacher_model
     with torch.no_grad():
         for name, teacher_param in teacher_model_instance.named_parameters():
@@ -134,6 +158,116 @@ def _align_text_features_to_batch(text_features: torch.Tensor, batch_size: int) 
     reps = (batch_size + b - 1) // b
     tf = tf.repeat(reps, 1)[:batch_size]
     return tf
+
+
+# --- [新增] 专门用于 VIFNetInconsistencyTeacher 模型的推理函数 ---
+def dehaze_teacher(model, vis_image_path, ir_image_path, folder):
+    """
+    使用加载的双流模型 (VIFNetInconsistencyTeacher) 对可见光和红外图像进行去雾。
+    """
+    try:
+        # 1. 加载并预处理可见光图像
+        haze_vis = transform(Image.open(vis_image_path).convert("RGB")).unsqueeze(0).to(device)
+        # 2. 加载并预处理红外图像
+        haze_ir = transform(Image.open(ir_image_path).convert("RGB")).unsqueeze(0).to(device)
+
+        # 3. 获取原始图像尺寸 (以可见光为准)
+        h, w = haze_vis.shape[2], haze_vis.shape[3]
+
+        # 4. 调整两个输入图像的尺寸以适应模型（16的倍数）
+        target_h = (h // 16) * 16
+        target_w = (w // 16) * 16
+        if target_h == 0: target_h = 16
+        if target_w == 0: target_w = 16
+        if h != target_h or w != target_w:
+            haze_vis_resized = Resize((target_h, target_w), interpolation=InterpolationMode.BICUBIC, antialias=True)(
+                haze_vis)
+            haze_ir_resized = Resize((target_h, target_w), interpolation=InterpolationMode.BICUBIC, antialias=True)(
+                haze_ir)
+        else:
+            haze_vis_resized = haze_vis
+            haze_ir_resized = haze_ir
+
+        # 5. 模型推理 (传入两个输入)
+        pred_output = model(haze_vis_resized, haze_ir_resized)
+
+        #   - VIFNetInconsistencyTeacher 返回 (img, features)
+        if isinstance(pred_output, tuple):
+            out_tensor = pred_output[0]
+        else:
+            out_tensor = pred_output
+
+        out = out_tensor.squeeze(0)  # 移除批次维度
+        out = out.clamp(0, 1)
+
+        # 6. 将输出图像尺寸恢复到原始尺寸
+        if h != target_h or w != target_w:
+            out = Resize((h, w), interpolation=InterpolationMode.BICUBIC, antialias=True)(out)
+
+        # 7. 保存去雾后的图像 (使用可见光图像的文件名)
+        output_filename = os.path.basename(vis_image_path)
+        torchvision.utils.save_image(out, os.path.join(folder, output_filename))
+
+    except FileNotFoundError as e:
+        print(f"\n错误: 找不到图像文件 {e}。跳过。")
+    except Exception as e:
+        base_name = os.path.basename(vis_image_path)
+        print(f"\n处理图像 {base_name} 时发生错误: {e}。跳过。")
+
+
+# --- [新增] 训练时运行真实测试集的函数 ---
+def run_real_world_test(model, epoch, hazy_dir, ir_dir, output_root_dir):
+    """
+    在指定的真实（无标签）数据集上运行推理。
+    """
+    if not hazy_dir or not ir_dir:
+        print(f"\n跳过真实世界测试：未指定 'real_test_hazy_path' 或 'real_test_ir_path'。")
+        return
+
+    if not os.path.isdir(hazy_dir):
+        print(f"\n警告: 真实测试 hazy 目录不存在: {hazy_dir}。跳过。")
+        return
+
+    if not os.path.isdir(ir_dir):
+        print(f"\n警告: 真实测试 ir 目录不存在: {ir_dir}。跳过。")
+        return
+
+    # 1. 设置输出目录
+    # [修改]：确保输出目录基于 opt.model_name
+    output_folder = os.path.join(output_root_dir, 'E:/FLIR_zongti_quwu_ceshi/dataset/FLIR_zengqiang/EMA_xunlian_guocheng_ceshi', f'epoch_{epoch}')
+    os.makedirs(output_folder, exist_ok=True)
+    print(f"\n正在对真实世界图像运行推理 (Epoch {epoch}) -> 保存至 {output_folder}")
+
+    # 2. 查找 Hazy 图像
+    vis_images = sorted(glob.glob(os.path.join(hazy_dir, '*.jpg')) + \
+                        glob.glob(os.path.join(hazy_dir, '*.png')) + \
+                        glob.glob(os.path.join(hazy_dir, '*.jpeg')))
+
+    if not vis_images:
+        print(f"警告: 在 {hazy_dir} 中未找到图像文件。")
+        return
+
+    # 3. 设置模型为评估模式
+    model.eval()
+
+    # 4. 禁用梯度并开始推理
+    with torch.no_grad():
+        bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} | {rate_fmt}"
+        for vis_path in tqdm(vis_images, bar_format=bar_format, desc=f"Epoch {epoch} 真实测试"):
+            base_filename = os.path.basename(vis_path)
+            ir_path = os.path.join(ir_dir, base_filename)
+
+            if os.path.exists(ir_path):
+                # [修改] 调用 dehaze_teacher (双输入版本)
+                dehaze_teacher(model, vis_path, ir_path, output_folder)
+            else:
+                print(f"\n警告: 找不到 {base_filename} 对应的红外图像: {ir_path}。跳过。")
+
+    # 5. 恢复训练模式（train() 循环开始时会再次设置）
+    # model.train() # (注释掉，因为 train 循环会处理)
+
+
+# --- [新增结束] ---
 
 
 # 定义函数 train：执行主要的训练逻辑
@@ -228,7 +362,8 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
         if opt.w_loss_Clip > 0 and criterion[1] is not None and text_features is not None:
             try:
                 tf_batch = _align_text_features_to_batch(text_features, student_image.shape[0]).to(opt.device)
-                loss_Clip = criterion[1](student_image, tf_batch)  # 与代码B保持一致：L_clip_from_feature(img_pred, text_features)
+                loss_Clip = criterion[1](student_image,
+                                         tf_batch)  # 与代码B保持一致：L_clip_from_feature(img_pred, text_features)
             except Exception as e:
                 print(f"\n错误: 在步骤 {step} 计算 CLIP 损失失败: {e}。将 loss_Clip 设为 0。")
                 loss_Clip = torch.tensor(0.0, device=opt.device)
@@ -244,7 +379,7 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
                 edge_student = edge_detector(student_image)
                 # 计算真实红外图像的边缘 (作为目标，不计算梯度)
                 with torch.no_grad():
-                     edge_ir_target = edge_detector(infrared)
+                    edge_ir_target = edge_detector(infrared)
                 # 计算 L1 损失
                 loss_Edge = criterion[2](edge_student, edge_ir_target)
             except Exception as e:
@@ -257,7 +392,8 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
 
         # 数值健壮性检查
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"\n警告: 在步骤 {step} 检测到无效损失 (L1_r: {loss_L1_r.item()}, Clip: {loss_Clip.item()})。跳过步骤。")
+            print(
+                f"\n警告: 在步骤 {step} 检测到无效损失 (L1_r: {loss_L1_r.item()}, Clip: {loss_Clip.item()})。跳过步骤。")
             optim.zero_grad()
             continue
 
@@ -283,8 +419,8 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
         edge_val = (opt.w_loss_Edge * loss_Edge.item()) if opt.w_loss_Edge > 0 else 0.0  # 新增
         print(
             f'\rloss:{loss.item():.5f} | L1_r:{l1r_val:.5f} | Clip:{clip_val:.5f} | Edge:{edge_val:.5f} '
-    f'| step:{step}/{steps} | lr:{lr:.9f} | time_used:{(time.time() - start_time) / 60:.1f}',
-    end='', flush=True)
+            f'| step:{step}/{steps} | lr:{lr:.9f} | time_used:{(time.time() - start_time) / 60:.1f}',
+            end='', flush=True)
 
         # ======== 保存损失曲线 & Epoch 结束统计 ========
         steps_per_epoch = len(loader_train) if len(loader_train) > 0 else opt.iters_per_epoch
@@ -315,6 +451,14 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
                 base_epochs = opt.finer_eval_step // eval_freq_coarse if eval_freq_coarse > 0 else 0
                 current_epoch = base_epochs + (step - opt.finer_eval_step) // eval_freq_fine
 
+        # [新增] 强制在最后一个 step 评估和保存
+        if step == steps:
+            perform_eval = True
+            if eval_freq_coarse > 0:
+                current_epoch = steps // eval_freq_coarse
+            else:
+                current_epoch = opt.epochs  # 设为总 epochs
+
         # ======== 执行评估 ========
         if perform_eval:
             try:
@@ -323,7 +467,8 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
                 print(f"\n错误: 评估前重新初始化训练迭代器失败: {e}")
 
             with torch.no_grad():
-                ssim_eval, psnr_eval = test(student_net, loader_test)
+                # [修改]：在评估时，我们评估 teacher_net (EMA 模型)
+                ssim_eval, psnr_eval = test(teacher_net, loader_test)
 
             log = f'\nstep :{step} | epoch: {current_epoch} | ssim:{ssim_eval:.4f}| psnr:{psnr_eval:.4f} | lr:{lr:.12f}'
             print(log)
@@ -340,25 +485,42 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
 
             os.makedirs(opt.saved_model_dir, exist_ok=True)
             try:
-                model_to_save = student_net.module if isinstance(student_net, nn.DataParallel) else student_net
-                state_dict = model_to_save.state_dict()
+                # [修改]：评估时，我们主要关心 teacher_net (EMA 模型)
+                teacher_model_to_save = teacher_net.module if isinstance(teacher_net, nn.DataParallel) else teacher_net
+                teacher_state_dict = teacher_model_to_save.state_dict()
+
                 if psnr_eval > max_psnr:
                     max_ssim = max(max_ssim, ssim_eval)
                     max_psnr = max(max_psnr, psnr_eval)
-                    print(f'模型在步骤 :{step}| epoch: {current_epoch} 保存 | 最高 psnr:{max_psnr:.4f}| 最高 ssim:{max_ssim:.4f}')
-                    torch.save(state_dict, os.path.join(opt.saved_model_dir, 'best_student.pth'))
-                torch.save(state_dict, os.path.join(opt.saved_model_dir, f'student_{current_epoch}.pth'))
-                save_count += 1
-            except Exception as e:
-                print(f"\n错误: 保存学生模型失败 (epoch {current_epoch}): {e}")
+                    print(
+                        f'模型在步骤 :{step}| epoch: {current_epoch} 保存 | 最高 psnr:{max_psnr:.4f}| 最高 ssim:{max_ssim:.4f}')
+                    # 保存最好的 EMA 教师
+                    torch.save(teacher_state_dict, os.path.join(opt.saved_model_dir, 'best_ema_teacher.pth'))
 
-            try:
-                teacher_model_to_save = teacher_net.module if isinstance(teacher_net, nn.DataParallel) else teacher_net
-                teacher_state_dict = teacher_model_to_save.state_dict()
+                # 保存当前的 EMA 教师
                 torch.save(teacher_state_dict, os.path.join(opt.saved_model_dir, f'teacher_ema_{current_epoch}.pth'))
-                print(f'EMA 教师模型在 epoch 保存: {current_epoch}')
+
+                # 同时保存学生模型，以便恢复训练
+                student_model_to_save = student_net.module if isinstance(student_net, nn.DataParallel) else student_net
+                torch.save(student_model_to_save.state_dict(),
+                           os.path.join(opt.saved_model_dir, f'student_{current_epoch}.pth'))
+
+                print(f'EMA 教师模型和学生模型在 epoch 保存: {current_epoch}')
+                save_count += 1
+
             except Exception as e:
-                print(f"\n错误: 保存 EMA 教师模型失败 (epoch {current_epoch}): {e}")
+                print(f"\n错误: 保存模型失败 (epoch {current_epoch}): {e}")
+
+            # --- [新增] 调用真实世界测试 ---
+            # (我们测试 teacher_net (EMA模型)，因为它通常更稳定)
+            run_real_world_test(
+                teacher_net,  # <-- [重要] 使用 teacher_net (EMA) 进行推理
+                current_epoch,
+                opt.real_test_hazy_path,
+                opt.real_test_ir_path,
+                opt.saved_data_dir  # 将输出保存在 saved_data_dir/real_world_outputs/
+            )
+            # --- [新增结束] ---
 
             os.makedirs(opt.saved_data_dir, exist_ok=True)
             try:
@@ -405,7 +567,8 @@ def test(net, loader_test):
 
         if len(batch_test) == 4:
             inputs_vis, inputs_ir, targets, hazy_name_list = batch_test
-            hazy_name = hazy_name_list[0] if isinstance(hazy_name_list, (list, tuple)) and len(hazy_name_list) > 0 else f"Unknown_Index_{i}"
+            hazy_name = hazy_name_list[0] if isinstance(hazy_name_list, (list, tuple)) and len(
+                hazy_name_list) > 0 else f"Unknown_Index_{i}"
         else:
             print(f"测试加载器返回了预期外的数据格式: {len(batch_test)} 项。跳过。")
             continue
@@ -469,7 +632,7 @@ def set_seed_torch(seed=2018):
 try:
     # 加载 CLIP ViT 模型
     clip_model, _ = clip.load("ViT-B/32", device=torch.device("cpu"),
-                              download_root="/root/CoA-main_daima_xiugai/clip_model/")
+                              download_root="D:/liu_lan_qi_xia_zai/CoA-main_daima_xiugai_teacher_v6/clip_model/")
     clip_model.to(opt.device)
     for param in clip_model.parameters():
         param.requires_grad = False
@@ -482,7 +645,7 @@ text_features = None
 if clip_model is not None:
     try:
         # 加载预计算的 prompt 嵌入
-        data = torch.load('/root/CoA-main_daima_xiugai/clip_model/haze_prompt.pth',
+        data = torch.load('D:/liu_lan_qi_xia_zai/CoA-main_daima_xiugai_teacher_v6/clip_model/haze_prompt.pth',
                           map_location=opt.device)
         new_state_dict = OrderedDict()
         for k, v in data.items():
@@ -498,7 +661,8 @@ if clip_model is not None:
         # [MOD] 让 tokenized_prompts 的 batch 维与 embedding_prompt 对齐（参考代码B）
         B_prompt = embedding_prompt.shape[0]
         token_str = " ".join(["X"] * 16)
-        tokenized_prompts = torch.cat([clip.tokenize(token_str) for _ in range(B_prompt)], dim=0).to(opt.device)  # [B_prompt, 77]
+        tokenized_prompts = torch.cat([clip.tokenize(token_str) for _ in range(B_prompt)], dim=0).to(
+            opt.device)  # [B_prompt, 77]
 
         # 计算整批文本特征（与代码B一致的做法）
         text_features = text_encoder(embedding_prompt, tokenized_prompts)  # [B_prompt, D]
@@ -517,8 +681,8 @@ if __name__ == "__main__":
     set_seed_torch(2024)
 
     # ======== 训练数据：真实雾（无GT），二元组 (vis, ir) ========
-    vis_hazy_folder = "/root/autodl-tmp/REAL_FOGGY/hazy"
-    ir_hazy_folder = "/root/autodl-tmp/REAL_FOGGY/ir"
+    vis_hazy_folder = "E:/FLIR_zongti_quwu_ceshi/dataset/REAL_FOGGY/hazy"
+    ir_hazy_folder = "E:/FLIR_zongti_quwu_ceshi/dataset/REAL_FOGGY/ir"
     train_set = MultiModalCLIPLoader(
         hazy_visible_path=vis_hazy_folder,
         infrared_path=ir_hazy_folder,
@@ -528,7 +692,7 @@ if __name__ == "__main__":
     )
 
     # ======== 测试数据：三模态 (vis, ir, clear)，均为 .jpg ========
-    test_dir = '/root/autodl-tmp/FLIR/test'
+    test_dir = 'E:/FLIR_zongti_quwu_ceshi/dataset/FLIR_zengqiang/test'
     test_hazy_vis_folder = os.path.join(test_dir, 'hazy')
     test_ir_folder = os.path.join(test_dir, 'ir')
     test_clear_vis_folder = os.path.join(test_dir, 'clear')
@@ -545,8 +709,8 @@ if __name__ == "__main__":
         test_set = None
 
     # ======== DataLoader ========
-    batch_size = opt.batch_size if hasattr(opt, 'batch_size') else 24
-    num_workers = opt.num_workers if hasattr(opt, 'num_workers') else 16
+    batch_size = opt.batch_size if hasattr(opt, 'batch_size') else 4
+    num_workers = opt.num_workers if hasattr(opt, 'num_workers') else 0
 
     loader_train = DataLoader(
         dataset=train_set,
@@ -568,8 +732,12 @@ if __name__ == "__main__":
         )
 
     # ======== 模型初始化 ========
+    # [修改]：EMA 脚本使用 VIFNetInconsistencyTeacher
+    from model import VIFNetInconsistencyTeacher, SobelEdgeDetector
+
     teacher_net = VIFNetInconsistencyTeacher().to(opt.device)
     student_net = VIFNetInconsistencyTeacher().to(opt.device)
+    # --- [修改结束] ---
 
     # --- [新增] 初始化边缘检测器 ---
     edge_detector = SobelEdgeDetector().to(opt.device)
@@ -579,7 +747,7 @@ if __name__ == "__main__":
     edge_detector.eval()
     # --- [新增结束] ---
 
-    pretrained_teacher_path = "/root/autodl-tmp/CoA_daima_xiugai/Teacher_train/saved_model/best.pth"
+    pretrained_teacher_path = "D:/liu_lan_qi_xia_zai/CoA-main_daima_xiugai_teacher_v6/ceshi_shiyongde_model/v6/Teacher_xunlian/best.pth"
     print(f"加载预训练教师模型: {pretrained_teacher_path}")
 
     try:
@@ -635,7 +803,6 @@ if __name__ == "__main__":
     if criterion[1] is None:
         opt.w_loss_Clip = 0
         print("警告: CLIP 损失已禁用。")
-
 
     criterion.append(nn.L1Loss().to(opt.device))  # Edge Loss (criterion[2])
 

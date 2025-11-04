@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .vifnet_basic_modules import CPAB, DownSample_B, Conv_B
+from model.vifnet_basic_modules import CPAB, DownSample_B, Conv_B
 
 # (来自 B: models/DSFE.py)
 class fusion1(nn.Module):

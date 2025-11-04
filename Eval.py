@@ -103,9 +103,9 @@ from torchvision.transforms import Compose, ToTensor, Normalize, Resize, Interpo
 # MODEL_PATH = './model/Student_model/Student.pth' # 如果是 Student
 # MODEL_PATH = './model/EMA_model/EMA_r.pth' # 如果是 EMA 适配后的 Student_x
 # 修改: 使用用户提供的硬编码路径
-MODEL_PATH = 'D:/liu_lan_qi_xia_zai/CoA-main_daima_xiugai_jiehe_ir_edge/ceshi_shiyongde_model/v3/Student_real_model/best_student.pth'  # <--- 这是你训练好的 DualStreamTeacher 最佳权重路径
+MODEL_PATH = 'D:/liu_lan_qi_xia_zai/CoA-main_daima_xiugai_jiehe_ir_edge_xiugai_teacher_v5/ceshi_shiyongde_model/v5/Teacher_xunlian/best.pth'  # <--- 这是你训练好的 DualStreamTeacher 最佳权重路径
 # 修改: 使用用户提供的硬编码路径
-OUTPUT_FOLDER = 'E:/FLIR_zongti_quwu_ceshi/dataset/REAL_FOGGY_test_v3/dehazed_best_student' # <--- 修改输出文件夹名称以区分 (避免覆盖 test_data)
+OUTPUT_FOLDER = 'E:/FLIR_zongti_quwu_ceshi/dataset/REAL_FOGGY_test_v5/dehazed_best_Teacher' # <--- 修改输出文件夹名称以区分 (避免覆盖 test_data)
 # --- 修改结束 ---
 
 

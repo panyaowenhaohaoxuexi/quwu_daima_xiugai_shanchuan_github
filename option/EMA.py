@@ -34,6 +34,14 @@ parser.add_argument('--saved_model_dir', type=str, default='saved_model_EMA')
 parser.add_argument('--saved_data_dir', type=str, default='saved_data_EMA')
 parser.add_argument('--dataset', type=str, default='EMA')
 
+# --- [新增] 训练期间的真实世界测试集路径 ---
+# (请在运行时指定这些路径，或在此处设置你的默认值)
+parser.add_argument('--real_test_hazy_path', type=str, default='E:/FLIR_zongti_quwu_ceshi/dataset/FLIR_zengqiang/xunlian_guocheng_ceshi/hazy',
+                    help='Path to real-world hazy images (e.g., ./real_test/hazy)')
+parser.add_argument('--real_test_ir_path', type=str, default='E:/FLIR_zongti_quwu_ceshi/dataset/FLIR_zengqiang/xunlian_guocheng_ceshi/ir',
+                    help='Path to real-world ir images (e.g., ./real_test/ir)')
+# --- [新增结束] ---
+
 opt = parser.parse_args()
 opt.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
