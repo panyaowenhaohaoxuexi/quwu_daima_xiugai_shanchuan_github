@@ -5,4 +5,3 @@ from .KL import *
 # 添加了下面两行
 from .mssim import *
 from .Dice import *
-from .perceptual import PerceptualLoss

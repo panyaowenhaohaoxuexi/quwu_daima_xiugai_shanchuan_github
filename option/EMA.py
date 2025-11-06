@@ -25,22 +25,23 @@ parser.add_argument('--w_loss_Clip', default=0.5, type=float, help='weight of lo
 
 # --- [新增] ---
 # 添加一个新的损失权重，用于红外边缘一致性
-parser.add_argument('--w_loss_Edge', default=0.1, type=float, help='weight of IR Edge consistency loss')
+parser.add_argument('--w_loss_Edge', default=0.3, type=float, help='weight of IR Edge consistency loss')
 # --- [新增结束] ---
 
 parser.add_argument('--exp_dir', type=str, default='./experiment')
 parser.add_argument('--model_name', type=str, default='THaze')
-parser.add_argument('--saved_model_dir', type=str, default='saved_model_EMA')
-parser.add_argument('--saved_data_dir', type=str, default='saved_data_EMA')
+parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v6/EMA_xunlian/saved_model')
+parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v6/EMA_xunlian/saved_data')
 parser.add_argument('--dataset', type=str, default='EMA')
 
 # --- [新增] 训练期间的真实世界测试集路径 ---
 # (请在运行时指定这些路径，或在此处设置你的默认值)
-parser.add_argument('--real_test_hazy_path', type=str, default='E:\FLIR_zongti_quwu_ceshi\dataset\FLIR_zengqiang\Teacher_xunlian_guocheng_ceshi\hazy',
+parser.add_argument('--real_test_hazy_path', type=str, default='/root/autodl-tmp/FLIR_zengqiang/xunlian_guocheng_ceshi/hazy',
                     help='Path to real-world hazy images (e.g., ./real_test/hazy)')
-parser.add_argument('--real_test_ir_path', type=str, default='E:/FLIR_zongti_quwu_ceshi/dataset/FLIR_zengqiang/xunlian_guocheng_ceshi/ir',
+parser.add_argument('--real_test_ir_path', type=str, default='/root/autodl-tmp/FLIR_zengqiang/xunlian_guocheng_ceshi/ir',
                     help='Path to real-world ir images (e.g., ./real_test/ir)')
 # --- [新增结束] ---
+
 
 opt = parser.parse_args()
 opt.device = 'cuda' if torch.cuda.is_available() else 'cpu'

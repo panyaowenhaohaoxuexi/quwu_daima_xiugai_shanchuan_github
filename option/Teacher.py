@@ -22,28 +22,32 @@ parser.add_argument('--device', type=str, default='Automatic detection')
 # 原始参数设置
 # parser.add_argument('--epochs', type=int, default=20)
 # 修改训练epoch
-parser.add_argument('--epochs', type=int, default=1)
+parser.add_argument('--epochs', type=int, default=20)
 # 定义每轮训练的迭代次数 (steps)
 # 原始参数设置
 # parser.add_argument('--iters_per_epoch', type=int, default=5000)
 # 修改参数设置
-parser.add_argument('--iters_per_epoch', type=int, default=100)
+parser.add_argument('--iters_per_epoch', type=int, default=5000)
 # 定义一个用于更精细评估的步数阈值
-parser.add_argument('--finer_eval_step', type=int, default=100)
+parser.add_argument('--finer_eval_step', type=int, default=100000)
 # 定义初始学习率
 parser.add_argument('--start_lr', default=0.0001, type=float, help='start learning rate')
 # 定义结束学习率（用于学习率调度）
 parser.add_argument('--end_lr', default=0.000001, type=float, help='end learning rate')
 # 定义一个动作参数，如果命令行中包含此参数，则不使用余弦学习率调度
-
-# 损失权重
 parser.add_argument('--no_lr_sche', action='store_true', help='no lr cos schedule')
+# 定义 L1 损失的权重
 parser.add_argument('--w_loss_L1', default=0.8, type=float, help='weight of loss L1')
+# 定义 SSIM 损失的权重
 parser.add_argument('--w_loss_SSIM', default=0.2, type=float, help='weight of loss SSIM')
+# 定义 Cr (对比度) 损失的权重
 parser.add_argument('--w_loss_Cr', default=0.05, type=float, help='weight of loss Cr')
+
+# --- [新增] ---
+# 添加一个新的损失权重，用于红外边缘一致性
 parser.add_argument('--w_loss_Edge', default=0.05, type=float, help='weight of IR Edge consistency loss')
-parser.add_argument('--w_loss_Content', default=0.05, type=float, help='weight of Perceptual Content loss (VGG)')
-parser.add_argument('--w_loss_Style', default=0.05, type=float, help='weight of Perceptual Style loss (VGG Gram)')
+# --- [新增结束] ---
+
 
 # --- 3. 定义文件和目录相关的参数 ---
 
@@ -52,20 +56,19 @@ parser.add_argument('--exp_dir', type=str, default='./experiment')
 # 定义当前模型的名称
 parser.add_argument('--model_name', type=str, default='THaze')
 # 定义保存模型的子目录名称
-parser.add_argument('--saved_model_dir', type=str, default='saved_model')
+parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v6/Teacher_xunlian/saved_model')
 # 定义保存数据（如日志、损失）的子目录名称
-parser.add_argument('--saved_data_dir', type=str, default='saved_data')
+parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v6/Teacher_xunlian/saved_data')
 # 定义数据集名称（用于构建目录结构）
 parser.add_argument('--dataset', type=str, default='Teacher')
 
 # --- [新增] 训练期间的真实世界测试集路径 ---
 # (请在运行时指定这些路径，或在此处设置你的默认值)
-parser.add_argument('--real_test_hazy_path', type=str, default="E:/FLIR_zongti_quwu_ceshi/dataset/FLIR_zengqiang/Teacher_xunlian_guocheng_ceshi/hazy",
+parser.add_argument('--real_test_hazy_path', type=str, default="/root/autodl-tmp/FLIR_zengqiang/xunlian_guocheng_ceshi/hazy",
                     help='Path to real-world hazy images (e.g., ./real_test/hazy)')
-parser.add_argument('--real_test_ir_path', type=str, default="E:/FLIR_zongti_quwu_ceshi/dataset/FLIR_zengqiang/Teacher_xunlian_guocheng_ceshi/ir",
+parser.add_argument('--real_test_ir_path', type=str, default="/root/autodl-tmp/FLIR_zengqiang/xunlian_guocheng_ceshi/ir",
                     help='Path to real-world ir images (e.g., ./real_test/ir)')
-parser.add_argument('--real_test_mask_path', type=str, default="E:/FLIR_zongti_quwu_ceshi/dataset/FLIR_zengqiang/Teacher_xunlian_guocheng_ceshi/test_mask",
-                    help='(Optional) Path to real-world mask images (e.g., ./real_test/mask)')
+
 # --- 4. 解析参数并设置设备 ---
 
 opt = parser.parse_args()  # 解析命令行传入的参数
