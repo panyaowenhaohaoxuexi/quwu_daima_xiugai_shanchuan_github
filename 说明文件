@@ -1,0 +1,3 @@
+model/Teacher.py ：并替换了原来的静态函数 f(x, y)，
+改为一个可学习的 Cross-Modal Attention Gate 模块，
+在 3 个尺度 (H/4, H/8, H/16) 上分别融合红外与可见光特征。
