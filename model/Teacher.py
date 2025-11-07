@@ -9,12 +9,15 @@ from collections import OrderedDict
 # --- [修改] 使用绝对导入（因为我们添加了项目根目录到 sys.path） ---
 from .vifnet_basic_modules import Encoder_B, Decoder_B, Conv_B, CPAB
 from .dsfe import DSFE
+
+
 # --- [修改结束] ---
 
 # --- VIFNet 不一致性函数 f(x, y) (保持不变) ---
 def f(x, y):
     """VIFNet inconsistency function (code version)"""
     return (1 - x) * (1 - y) + 1 / 2 * x * y
+
 
 # --- 基础模块 (SobelEdgeDetector, Pre_Res2Net, Bottle2neck, Res2Net(3通道输入), ConvBlock, DeconvBlock, Decoder_MDCBlock1, make_dense, RDB, ConvLayer, UpsampleConvLayer, ResidualBlock) ---
 # ... (这些基础模块的代码与上一个版本相同，确保 Res2Net 输入为 3 通道，这里省略以保持简洁) ...
@@ -33,10 +36,10 @@ class SobelEdgeDetector(nn.Module):
     def forward(self, x):
         if x.shape[1] != 1:
             if x.shape[1] == 3:
-                 x = TF.rgb_to_grayscale(x)
+                x = TF.rgb_to_grayscale(x)
             else:
-                 print("警告: Sobel 输入不是单通道或三通道，将只使用第一个通道。")
-                 x = x[:, 0:1, :, :]
+                print("警告: Sobel 输入不是单通道或三通道，将只使用第一个通道。")
+                x = x[:, 0:1, :, :]
         grad_x = self.conv_x(x)
         grad_y = self.conv_y(x)
         edge_magnitude = torch.abs(grad_x) + torch.abs(grad_y)
@@ -85,11 +88,13 @@ class SpatialAttentionModule(nn.Module):
         out = self.conv1(x_cat)
         return self.sigmoid(out)
 
+
 class AttentionFusionBlock(nn.Module):
     """
     [核心模块]：用于早期融合的注意力块
     通过 (Vis + IR) -> ChannelAttn -> SpatialAttn 来融合
     """
+
     def __init__(self, channel, reduction=16, kernel_size=7):
         super(AttentionFusionBlock, self).__init__()
         self.channel_attn = ChannelAttentionModule(channel, reduction)
@@ -105,6 +110,7 @@ class AttentionFusionBlock(nn.Module):
 
         # 3. 返回融合并增强后的特征 (并加上残差)
         return x_fused_csa + x_fused_base
+
 
 # --- [修改1：结束] ---
 
@@ -135,7 +141,7 @@ class Pre_Res2Net(nn.Module):
         self.scale = scale
         # 初始卷积层
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 32, 3, 2, 1, bias=False), # *** 注意这里的输入通道是 3 ***
+            nn.Conv2d(3, 32, 3, 2, 1, bias=False),  # *** 注意这里的输入通道是 3 ***
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 32, 3, 1, 1, bias=False),
@@ -396,12 +402,13 @@ class Res2Net(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x, inf_weights=None):  # [修改] 增加 inf_weights=None 参数
+    def forward(self, x, inf_weights=None, haze_mask=None):  # [修改] 增加 haze_mask=None 参数
         """
         [修改后] 的 Res2Net forward，支持串联注入 (Sequential Injection)
 
         inf_weights: 一个列表 [Stru3(256), Stru2(128), Stru1(64)]
                      对应 [H/16, H/8, H/4] 尺度
+        haze_mask:   一个 (B, 1, H, W) 的掩码 (如果提供了)
         """
 
         x = self.conv1(x)
@@ -413,36 +420,58 @@ class Res2Net(nn.Module):
 
         # --- H/4 尺度 ---
         x_layer1_orig = self.layer1(x_maxpool)  # (B, 256, H/4, W/4)
+        x_layer1_fused = x_layer1_orig  # 默认等于原始特征
         if inf_weights is not None:
             inf_w_4 = self.inject_conv1(inf_weights[2])  # 64 -> 256
             inf_w_4 = F.interpolate(inf_w_4, size=x_layer1_orig.shape[2:], mode='bilinear', align_corners=False)
-            x_layer1_fused = x_layer1_orig + inf_w_4
-        else:
-            x_layer1_fused = x_layer1_orig
+
+            # --- [核心修改] 条件注入 ---
+            if haze_mask is not None:
+                # 将掩码缩放到当前特征图 H/4 尺度
+                mask_l1 = F.interpolate(haze_mask, size=inf_w_4.shape[2:], mode='bilinear', align_corners=False)
+                # 只在掩码区域 (mask_l1 == 1) 才加上不一致性特征
+                x_layer1_fused = x_layer1_orig + (inf_w_4 * mask_l1)
+            else:
+                # 原始行为（无掩码时，全部注入）
+                x_layer1_fused = x_layer1_orig + inf_w_4
+            # --- [核心修改结束] ---
 
         # --- H/8 尺度 ---
         x_layer2_orig = self.layer2(x_layer1_fused)  # (B, 512, H/8, W/8)
+        x_layer2_fused = x_layer2_orig  # 默认
         if inf_weights is not None:
             inf_w_8 = self.inject_conv2(inf_weights[1])  # 128 -> 512
             inf_w_8 = F.interpolate(inf_w_8, size=x_layer2_orig.shape[2:], mode='bilinear', align_corners=False)
-            x_layer2_fused = x_layer2_orig + inf_w_8
-        else:
-            x_layer2_fused = x_layer2_orig
+
+            # --- [核心修改] 条件注入 ---
+            if haze_mask is not None:
+                mask_l2 = F.interpolate(haze_mask, size=inf_w_8.shape[2:], mode='bilinear', align_corners=False)
+                x_layer2_fused = x_layer2_orig + (inf_w_8 * mask_l2)
+            else:
+                x_layer2_fused = x_layer2_orig + inf_w_8
+            # --- [核心修改结束] ---
 
         # --- H/16 尺度 ---
         x_layer3_orig = self.layer3(x_layer2_fused)  # (B, 1024, H/16, W/16)
+        x_layer3_fused = x_layer3_orig  # 默认
         if inf_weights is not None:
             inf_w_16 = self.inject_conv3(inf_weights[0])  # 256 -> 1024
             inf_w_16 = F.interpolate(inf_w_16, size=x_layer3_orig.shape[2:], mode='bilinear', align_corners=False)
-            x_layer3_fused = x_layer3_orig + inf_w_16
-        else:
-            x_layer3_fused = x_layer3_orig
+
+            # --- [核心修改] 条件注入 ---
+            if haze_mask is not None:
+                mask_l3 = F.interpolate(haze_mask, size=inf_w_16.shape[2:], mode='bilinear', align_corners=False)
+                x_layer3_fused = x_layer3_orig + (inf_w_16 * mask_l3)
+            else:
+                x_layer3_fused = x_layer3_orig + inf_w_16
+            # --- [核心修改结束] ---
 
         # [修改] 返回 注入后(fused)的特征（用于解码）和 注入前(orig)的特征（用于蒸馏）
         fused_outputs = [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0]
         original_outputs = [x_layer3_orig, x_layer2_orig, x_layer1_orig, x_layer0]
 
         return fused_outputs, original_outputs
+
 
 class ConvBlock(torch.nn.Module):
     # ... (ConvBlock 代码保持不变) ...
@@ -506,6 +535,7 @@ class ConvBlock(torch.nn.Module):
         else:
             return out
 
+
 class DeconvBlock(torch.nn.Module):
     # ... (DeconvBlock 代码保持不变) ...
     """
@@ -567,6 +597,7 @@ class DeconvBlock(torch.nn.Module):
             return self.act(out)
         else:
             return out
+
 
 class Decoder_MDCBlock1(torch.nn.Module):
     # ... (Decoder_MDCBlock1 代码保持不变) ...
@@ -682,6 +713,7 @@ class make_dense(nn.Module):
         - 实现密集连接，通过卷积生成新特征并与输入特征拼接。
         - 用于残差密集块（RDB）中，增强特征的密集连接性。
         """
+
     def __init__(self, nChannels, growthRate, kernel_size=3):
         """
                 初始化 make_dense 层。
@@ -698,6 +730,7 @@ class make_dense(nn.Module):
         out = F.relu(self.conv(x))
         out = torch.cat((x, out), 1)  # 将输入和输出在通道上拼接
         return out
+
 
 class RDB(nn.Module):
     # ... (RDB 代码保持不变) ...
@@ -741,6 +774,7 @@ class RDB(nn.Module):
         out = out + x  # 添加残差连接
         return out
 
+
 class ConvLayer(nn.Module):
     # ... (ConvLayer 代码保持不变) ...
     """
@@ -775,6 +809,7 @@ class ConvLayer(nn.Module):
         out = self.reflection_pad(x)
         out = self.conv2d(out)
         return out
+
 
 class UpsampleConvLayer(torch.nn.Module):
     # ... (UpsampleConvLayer 代码保持不变) ...
@@ -812,6 +847,7 @@ class UpsampleConvLayer(torch.nn.Module):
         x = F.interpolate(x, size=(h, w), mode="nearest-exact")  # 最近邻插值
         out = self.conv2d(x)  # 1x1 卷积
         return out
+
 
 class ResidualBlock(torch.nn.Module):
     # ... (ResidualBlock 代码保持不变) ...
@@ -851,11 +887,11 @@ class ResidualBlock(torch.nn.Module):
 
 # --- [新增] 通道注意力融合模块 ---
 class ChannelAttentionFusion(nn.Module):
-
+    # ... (ChannelAttentionFusion 代码保持不变) ...
     def __init__(self, in_channels, reduction=16, out_channels=None):
         super(ChannelAttentionFusion, self).__init__()
         self.in_channels = in_channels
-        total_channels = 2 * in_channels # 拼接后的总通道数
+        total_channels = 2 * in_channels  # 拼接后的总通道数
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
             nn.Linear(total_channels, total_channels // reduction, bias=False),
@@ -868,27 +904,29 @@ class ChannelAttentionFusion(nn.Module):
         if out_channels is not None and out_channels != total_channels:
             self.output_conv = ConvLayer(total_channels, out_channels, kernel_size=1, stride=1)
         else:
-            self.output_conv = None # nn.Identity() PyTorch 1.6+
+            self.output_conv = None  # nn.Identity() PyTorch 1.6+
 
     def forward(self, x1, x2):
         # 1. 拼接特征
-        fused = torch.cat((x1, x2), dim=1) # (B, 2C, H, W)
+        fused = torch.cat((x1, x2), dim=1)  # (B, 2C, H, W)
         b, c, _, _ = fused.size()
 
         # 2. 计算通道注意力权重
-        y = self.avg_pool(fused).view(b, c) # (B, 2C)
-        y = self.fc(y).view(b, c, 1, 1) # (B, 2C, 1, 1)
+        y = self.avg_pool(fused).view(b, c)  # (B, 2C)
+        y = self.fc(y).view(b, c, 1, 1)  # (B, 2C, 1, 1)
 
         # 3. 应用注意力权重
-        attended_features = fused * y.expand_as(fused) # (B, 2C, H, W)
+        attended_features = fused * y.expand_as(fused)  # (B, 2C, H, W)
 
         # 4. (可选) 调整输出通道
         if self.output_conv is not None:
-             output = self.output_conv(attended_features)
+            output = self.output_conv(attended_features)
         else:
-             output = attended_features
+            output = attended_features
 
         return output
+
+
 # --- [新增结束] ---
 
 
@@ -975,8 +1013,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
         self.conv_1_vis = RDB(8, 4, 8)
         self.fusion_1_vis = Decoder_MDCBlock1(8, 5, mode='iter2')
 
-        # --- 红外流 (用于 Pass 2 最终融合) ---
-        # (A 库的 IR 流模块定义保持不变)
+        # --- [修改] 保留 IR 流解码器 (用于跨模态损失) ---
         self.encoder_ir = Res2Net(Bottle2neck, [3, 4, 23], baseWidth=26, scale=4, in_channels=3)
         # ... (加载权重代码保留) ...
         try:
@@ -1018,28 +1055,22 @@ class VIFNetInconsistencyTeacher(nn.Module):
         self.dense_1_ir = nn.Sequential(ResidualBlock(16), ResidualBlock(16), ResidualBlock(16))
         self.conv_1_ir = RDB(8, 4, 8)
         self.fusion_1_ir = Decoder_MDCBlock1(8, 5, mode='iter2')
+        # --- [保留 IR 流结束] ---
 
-        # --- [保留] 最终融合与输出 (代码库 A) ---
-        self.final_fusion = ChannelAttentionFusion(in_channels=16, reduction=4, out_channels=32)
-        self.conv_output = ConvLayer(32, 3, kernel_size=3, stride=1)
+        # --- [修改] 移除 final_fusion 并调整 conv_output ---
+        # self.final_fusion = ChannelAttentionFusion(in_channels=16, reduction=4, out_channels=32)
 
-        # --- [删除] 早期融合模块 (不再需要) ---
-        # self.enc_fusion_16x = ... (删除)
-        # ... (删除所有 enc_fusion)
-
-        # --- [删除] 注入权重适配器 (已移入 Res2Net) ---
-        # self.inject_conv1 = ... (删除)
-        # self.inject_conv2 = ... (删除)
-        # self.inject_conv3 = ... (删除)
+        # [修改] conv_output 现在直接接收来自 vis_features 的 16 个通道
+        self.conv_output = ConvLayer(16, 3, kernel_size=3, stride=1)
+        # --- [修改结束] ---
 
     # --- [删除] _process_vis_decoder 和 _process_ir_stream ---
     # (这两个函数的功能将被内联并重构到新的 forward 方法中)
 
     # --- [重写] forward 方法 ---
-    def forward(self, x_vis, x_ir):
-
+    def forward(self, x_vis, x_ir, haze_mask=None):
         # --- 阶段一 & 二：并行结构提取 (Pass 1 - B 模块) ---
-
+        # (这部分保留，用于计算不一致性)
         # 1a. VIS 流 (Pass 1) -> DSFE_vis
         vis_b_fea1 = self.vis_layer1_b(x_vis)
         vis_b_enc_features = self.encoder_b_vis(vis_b_fea1)  # [64, 128, 256]
@@ -1053,7 +1084,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
         ir_structure = self.dsfe_ir(ir_b_enc_features, ir_b_dec_features)  # [64, 128, 256]
 
         # --- 阶段三：计算不一致性权重 ---
-
+        # (这部分保留)
         # 列表顺序：[H/16(256), H/8(128), H/4(64)]
         inf_weight_list = [None, None, None]
 
@@ -1067,25 +1098,24 @@ class VIFNetInconsistencyTeacher(nn.Module):
         inf_weight_list[2] = incons_feature_1 * ir_structure[0]  # H/4 尺度 (64 通道)
 
         # --- 阶段四：精炼编码与注入（Pass 2 - A 模块）---
-
+        # (这部分保留，包含掩码逻辑)
         # 4a. 运行 Pass 2 Encoder (代码库 A) 并进行串联注入
-        # [修改]：调用修改后的 Res2Net.forward
-        fused_outputs, original_outputs = self.encoder_vis(x_vis, inf_weight_list)
+        fused_outputs, original_outputs = self.encoder_vis(x_vis, inf_weight_list, haze_mask)
 
         # (fused_outputs)  [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0]
         # (original_outputs) [x_layer3_orig, x_layer2_orig, x_layer1_orig, x_layer0]
 
-        x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0 = fused_outputs
-        x_layer3_orig, x_layer2_orig, x_layer1_orig, _ = original_outputs  # (x_layer0 是一样的)
-
         # [用于蒸馏的 H 特征]
         # (在注入 *之前* 的原始 A 模块 Encoder 特征上计算)
         vis_h_features = [
-            self.H4_vis(self.CRA4_vis(x_layer0)),  # 32 -> 16
-            self.H3_vis(self.CRA3_vis(x_layer1_orig)),  # 64 -> 32
-            self.H2_vis(self.CRA2_vis(x_layer2_orig)),  # 128 -> 64
-            self.H1_vis(self.CRA1_vis(x_layer3_orig))  # 256 -> 128
+            self.H4_vis(self.CRA4_vis(original_outputs[3])),  # x_layer0
+            self.H3_vis(self.CRA3_vis(original_outputs[2])),  # x_layer1_orig
+            self.H2_vis(self.CRA2_vis(original_outputs[1])),  # x_layer2_orig
+            self.H1_vis(self.CRA1_vis(original_outputs[0]))  # x_layer3_orig
         ]
+
+        # [用于解码的特征] (使用 fused_outputs)
+        x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0 = fused_outputs
 
         # --- 阶段五：最终解码（Pass 2 - A 模块）---
 
@@ -1146,14 +1176,12 @@ class VIFNetInconsistencyTeacher(nn.Module):
         x_2 = self.conv_1_vis(x_2)
         vis_features = torch.cat((x_1, x_2), dim=1)  # (16 通道)
 
+        # --- [修改] 保留 IR 流解码器 (用于跨模态损失) ---
         # 5c. [运行 IR 流 (Pass 2)]
         # (这部分用于获取最终融合所需的 ir_features)
-
-        # [修改]：正确解包 Res2Net 的 (fused_outputs, original_outputs)
-        # 因为 inf_weights 为 None, fused_outputs 和 original_outputs 相同
-        ir_fused_outputs, _ = self.encoder_ir(x_ir)  # (IR 流不注入)
+        ir_fused_outputs, _ = self.encoder_ir(x_ir, haze_mask=None)  # (IR 流不注入)
         ir_layer3, ir_layer2, ir_layer1, ir_layer0 = ir_fused_outputs
-        # [修改结束]
+
         res16x_ir = self.CRA1_ir(ir_layer3)
         res8x_ir = self.CRA2_ir(ir_layer2)
         res4x_ir = self.CRA3_ir(ir_layer1)
@@ -1206,12 +1234,19 @@ class VIFNetInconsistencyTeacher(nn.Module):
         x_1_ir = self.fusion_1_ir(x_1_ir, feature_mem_up_ir)
         x_2_ir = self.conv_1_ir(x_2_ir)
         ir_features = torch.cat((x_1_ir, x_2_ir), dim=1)  # (16 通道)
+        # --- [保留 IR 流解码器结束] ---
 
-        # 5d. 最终融合 (A 库逻辑)
-        fused_attended_features = self.final_fusion(vis_features, ir_features)
-        output = self.conv_output(fused_attended_features)  # (32 -> 3)
+        # 5d. [修改] 移除最终融合，直接从 vis_features 输出
 
-        return output, vis_h_features
+        # (fused_attended_features 和 final_fusion 调用已被移除)
+        # (ir_features_to_fuse 的掩码逻辑也被移除，因为不再需要融合)
+
+        output = self.conv_output(vis_features)  # [修改] (16 -> 3)
+        # --- [修改结束] ---
+
+        # [修改] 返回融合前的特征用于计算新损失
+        return output, vis_h_features, vis_features, ir_features
+
 
 # --- 主函数测试部分 (保持不变) ---
 if __name__ == "__main__":
@@ -1220,9 +1255,13 @@ if __name__ == "__main__":
     net = VIFNetInconsistencyTeacher().to(device)
     dummy_input_vis = torch.randn(1, 3, 256, 256).to(device)
     dummy_input_ir = torch.randn(1, 3, 256, 256).to(device)
-    output_tensor, intermediate_features = net(dummy_input_vis, dummy_input_ir)
+
+    # [修改] 接收 4 个输出
+    output_tensor, intermediate_features, vis_features_out, ir_features_out = net(dummy_input_vis, dummy_input_ir)
 
     print("Output shape:", output_tensor.shape)
+    print("Vis Features (Decoder Output) shape:", vis_features_out.shape)
+    print("IR Features (Decoder Output) shape:", ir_features_out.shape)
     print("Intermediate features shapes:")
     for feat in intermediate_features:
         print(feat.shape)
