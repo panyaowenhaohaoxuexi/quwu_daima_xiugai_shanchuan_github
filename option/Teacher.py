@@ -41,14 +41,14 @@ parser.add_argument('--w_loss_L1', default=0.8, type=float, help='weight of loss
 # 定义 SSIM 损失的权重
 parser.add_argument('--w_loss_SSIM', default=0.2, type=float, help='weight of loss SSIM')
 # 定义 Cr (对比度) 损失的权重
-parser.add_argument('--w_loss_Cr', default=0.05, type=float, help='weight of loss Cr')
+parser.add_argument('--w_loss_Cr', default=0, type=float, help='weight of loss Cr')
 
 # --- [新增] ---
 # 添加一个新的损失权重，用于红外边缘一致性
 parser.add_argument('--w_loss_Edge', default=0.05, type=float, help='weight of IR Edge consistency loss')
 # --- [新增结束] ---
 # --- [新增] 风格损失 和 跨模态一致性损失 ---
-parser.add_argument('--w_loss_Style', default=0.05, type=float, help='weight of Style loss (Perceptual)')
+parser.add_argument('--w_loss_Style', default=0, type=float, help='weight of Style loss (Perceptual)')
 parser.add_argument('--w_loss_CrossModal', default=0.05, type=float, help='weight of Cross-Modal Consistency loss (L1 between vis/ir features)')
 # --- [新增结束] ---
 
@@ -59,18 +59,22 @@ parser.add_argument('--exp_dir', type=str, default='./experiment')
 # 定义当前模型的名称
 parser.add_argument('--model_name', type=str, default='THaze')
 # 定义保存模型的子目录名称
-parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v6/Teacher_xunlian/saved_model')
+parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/xunlian_Teacher/saved_model')
 # 定义保存数据（如日志、损失）的子目录名称
-parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v6/Teacher_xunlian/saved_data')
+parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/xunlian_Teacher/saved_data')
 # 定义数据集名称（用于构建目录结构）
 parser.add_argument('--dataset', type=str, default='Teacher')
 
 # --- [新增] 训练期间的真实世界测试集路径 ---
 # (请在运行时指定这些路径，或在此处设置你的默认值)
-parser.add_argument('--real_test_hazy_path', type=str, default="/root/autodl-tmp/FLIR_zengqiang/xunlian_guocheng_ceshi/hazy",
+parser.add_argument('--real_test_hazy_path', type=str, default="/root/autodl-tmp/FLIR_zengqiang/train_test/Teacher_xunlian_guocheng_ceshi/hazy",
                     help='Path to real-world hazy images (e.g., ./real_test/hazy)')
-parser.add_argument('--real_test_ir_path', type=str, default="/root/autodl-tmp/FLIR_zengqiang/xunlian_guocheng_ceshi/ir",
+parser.add_argument('--real_test_ir_path', type=str, default="/root/autodl-tmp/FLIR_zengqiang/train_test/Teacher_xunlian_guocheng_ceshi/ir",
                     help='Path to real-world ir images (e.g., ./real_test/ir)')
+# --- [新增] 掩码图路径 (可选) ---
+parser.add_argument('--real_test_mask_path', type=str, default="/root/autodl-tmp/FLIR_zengqiang/train_test/Teacher_xunlian_guocheng_ceshi/test_mask",
+                    help='Path to real-world haze masks (optional)')
+# --- [新增结束] ---
 
 # --- 4. 解析参数并设置设备 ---
 

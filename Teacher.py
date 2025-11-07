@@ -51,6 +51,11 @@ transform = Compose([
 ])
 # --- [新增结束] ---
 
+# --- [新增] 定义掩码的预处理流程 (仅 ToTensor) ---
+transform_mask = Compose([
+    ToTensor()
+])
+# --- [新增结束] ---
 
 # 训练轮次
 start_time = time.time()
@@ -90,16 +95,12 @@ def collate_fn_skip_none(batch):
 
 # --- [新增] 从 Eval.py 复制的 dehaze 函数 ---
 # (它依赖于全局定义的 device 和 transform)
-def dehaze(model, vis_image_path, ir_image_path, folder):
+# --- [修改] dehaze 函数现在接受 mask_image_path=None ---
+def dehaze(model, vis_image_path, ir_image_path, mask_image_path, folder):
     """
-    使用加载的双流模型对指定路径的可见光和红外图像进行去雾处理，
+    使用加载的双流模型对指定路径的可见光、红外和可选的掩码进行去雾处理，
     并将结果保存到指定文件夹。
-
-    参数:
-        model (nn.Module): 预训练好的双流去雾模型 (VIFNetInconsistencyTeacher)。
-        vis_image_path (str): 输入含雾可见光图像的文件路径。
-        ir_image_path (str): 输入红外图像的文件路径。
-        folder (str): 保存去雾后图像的文件夹路径。
+    (此版本已更新，支持掩码加载)
     """
     try:
         # 1. 加载并预处理可见光图像
@@ -107,45 +108,64 @@ def dehaze(model, vis_image_path, ir_image_path, folder):
         # 2. 加载并预处理红外图像
         haze_ir = transform(Image.open(ir_image_path).convert("RGB")).unsqueeze(0).to(device)  # 假设红外也用相同 transform
 
+        haze_mask_tensor = None  # 默认掩码为 None
+
+        # --- [新增] 掩码加载逻辑 (参考 Eval_EMA.py) ---
+        if mask_image_path:  # 检查路径是否非空
+            if os.path.exists(mask_image_path):
+                # 掩码存在，加载它 (使用 "L" 模式加载单通道灰度图)
+                haze_mask_tensor = transform_mask(Image.open(mask_image_path).convert("L")).unsqueeze(0).to(device)
+                # 确保掩码是 0-1 范围 (ToTensor() 已经做到了)
+            else:
+                # 提供了掩码路径但文件丢失 (对应"无掩码"情况)
+                print(f"\n警告: 提供了掩码路径但文件未找到: {mask_image_path}。将回退到基础注入模式。")
+                # haze_mask_tensor 保持为 None
+        # --- [新增结束] ---
+
         # 3. 获取原始图像尺寸 (以可见光为准)
         h, w = haze_vis.shape[2], haze_vis.shape[3]
 
-        # 4. 调整两个输入图像的尺寸以适应模型（可选）
-        #    - 确保两个输入的尺寸调整方式一致
-        #    - 将高度和宽度调整为最接近的 16 的倍数，向下取整
+        # 4. 调整尺寸
         target_h = (h // 16) * 16
         target_w = (w // 16) * 16
-        # 如果原始尺寸已经是16的倍数，则无需调整
-        if target_h == 0: target_h = 16  # 防止尺寸为0
+        if target_h == 0: target_h = 16
         if target_w == 0: target_w = 16
+
         if h != target_h or w != target_w:
             haze_vis_resized = Resize((target_h, target_w), interpolation=InterpolationMode.BICUBIC, antialias=True)(
                 haze_vis)
             haze_ir_resized = Resize((target_h, target_w), interpolation=InterpolationMode.BICUBIC, antialias=True)(
-                haze_ir)  # 对红外也应用
+                haze_ir)
         else:
             haze_vis_resized = haze_vis
             haze_ir_resized = haze_ir
 
-        # 5. 模型推理 (传入两个输入)
-        #    - 调用 model 并传入可见光和红外两个张量
-        #    - [修改] 训练时不使用掩码 (haze_mask=None)
-        #    - [修改] 解包模型输出 (现在有4个)
-        pred_output, _, _, _ = model(haze_vis_resized, haze_ir_resized, haze_mask=None)  # 获取模型输出
-        #   - 检查输出是否为元组，并获取图像部分 (pred_output 已经是图像)
-        out_tensor = pred_output
+        # --- [新增] 仅当掩码张量存在时才调整其尺寸 ---
+        haze_mask_resized = None  # 默认 resized 掩码为 None
+        if haze_mask_tensor is not None:
+            # 掩码使用 BILINEAR (最近邻也行，但 BILINEAR 更平滑)
+            resize_mask_fn = Resize((target_h, target_w), interpolation=InterpolationMode.BILINEAR, antialias=False)
+            haze_mask_resized = resize_mask_fn(haze_mask_tensor) if (
+                    h != target_h or w != target_w) else haze_mask_tensor
+        # --- [新增结束] ---
+
+        # 5. 模型推理 (传入三个输入)
+        #    - [核心] 传入 haze_mask_resized (它要么是掩码张量，要么是 None)
+        pred_output = model(haze_vis_resized, haze_ir_resized, haze_mask=haze_mask_resized)
+
+        if isinstance(pred_output, tuple):
+            out_tensor = pred_output[0]
+        else:
+            out_tensor = pred_output
 
         out = out_tensor.squeeze(0)  # 移除批次维度
-
-        # [修改] 增加 clamp(0, 1) 确保值范围正确
         out = out.clamp(0, 1)
 
         # 6. 将输出图像尺寸恢复到原始尺寸
-        #    - 只有在输入时调整过尺寸才需要恢复
         if h != target_h or w != target_w:
             out = Resize((h, w), interpolation=InterpolationMode.BICUBIC, antialias=True)(out)
 
-        # 7. 保存去雾后的图像 (使用可见光图像的文件名)
+        # 7. 保存
         output_filename = os.path.basename(vis_image_path)
         torchvision.utils.save_image(out, os.path.join(folder, output_filename))
 
@@ -157,10 +177,11 @@ def dehaze(model, vis_image_path, ir_image_path, folder):
 
 
 # --- [新增结束] ---
-
+# --- [修改] run_real_world_test 函数，使其查找并传递掩码 ---
 def run_real_world_test(model, epoch, hazy_dir, ir_dir, output_root_dir):
     """
     在指定的真实（无标签）数据集上运行推理。
+    (此版本已更新，支持掩码加载)
     """
     if not hazy_dir or not ir_dir:
         print(f"\n跳过真实世界测试：未指定 'real_test_hazy_path' 或 'real_test_ir_path'。")
@@ -174,9 +195,21 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir, output_root_dir):
         print(f"\n警告: 真实测试 ir 目录不存在: {ir_dir}。跳过。")
         return
 
+    # --- [新增] 检查掩码文件夹是否有效 (参考 Eval_EMA.py) ---
+    use_mask_if_available = False
+    mask_folder = opt.real_test_mask_path  # 从 opt 读取新路径
+
+    if mask_folder and os.path.isdir(mask_folder):
+        print(f"掩码模式: ON。将从以下路径加载掩码 (如果存在): {mask_folder}")
+        use_mask_if_available = True
+    else:
+        print(f"掩码模式: OFF。未提供或未找到掩码文件夹: '{mask_folder}'。")
+        print("所有图像将使用模型的基础注入模式 (base_weight) 运行。")
+    # --- [新增结束] ---
+
     # 1. 设置输出目录
     output_folder = os.path.join(output_root_dir,
-                                 '/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v6/xunlian_guocheng_test',
+                                 '/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/train_test/Teacher_train_test',
                                  f'epoch_{epoch}')
     os.makedirs(output_folder, exist_ok=True)
     print(f"\n正在对真实世界图像运行推理 (Epoch {epoch}) -> 保存至 {output_folder}")
@@ -200,13 +233,23 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir, output_root_dir):
             base_filename = os.path.basename(vis_path)
             ir_path = os.path.join(ir_dir, base_filename)
 
+            # --- [修改] 动态构造掩码路径 ---
+            mask_path = None  # 默认为 None (无掩码模式)
+            if use_mask_if_available:
+                # 仅当掩码文件夹有效时，才构造路径
+                mask_path = os.path.join(mask_folder, base_filename)
+                # 注意: 我们不在这里检查 os.path.exists(mask_path)
+                # 我们把 mask_path (可能存在也可能不存在) 传递给 dehaze 函数
+                # dehaze 函数内部会处理 "文件不存在" 的情况 (即视为"无掩码")
+            # --- [修改结束] ---
+
             if os.path.exists(ir_path):
-                # 调用推理函数
-                dehaze(model, vis_path, ir_path, output_folder)
+                # [修改] 调用 dehaze，传入 mask_path (可能是路径字符串，也可能是 None)
+                dehaze(model, vis_path, ir_path, mask_path, output_folder)
             else:
                 print(f"\n警告: 找不到 {base_filename} 对应的红外图像: {ir_path}。跳过。")
 
-    # 5. （可选）完成后将模型恢复训练模式（尽管 train 函数会在循环开始时做这件事）
+    # 5. （可选）恢复训练模式
     model.train()
 
 
@@ -673,7 +716,7 @@ if __name__ == "__main__":
 
     # --- DataLoader ---
     # 从配置中读取 batch_size 和 num_workers，提供默认值
-    batch_size = getattr(opt, 'batch_size', 8)  # 使用 opt 中的 batch_size，默认为 4
+    batch_size = getattr(opt, 'batch_size', 16)  # 使用 opt 中的 batch_size，默认为 4
     num_workers = getattr(opt, 'num_workers', 16)  # 使用 opt 中的 num_workers，默认为 4
 
     loader_train = None

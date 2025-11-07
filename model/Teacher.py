@@ -374,6 +374,10 @@ class Res2Net(nn.Module):
         self.inject_conv3 = nn.Conv2d(256, 1024, kernel_size=1, bias=False)  # H/16
         # --- [新增结束] ---
 
+        # --- [新增] 定义基础注入权重 ---
+        self.base_inject_weight = 0.2  # 基础注入权重 (例如 20%)
+        # --- [新增结束] ---
+
         # 初始化权重
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -405,6 +409,7 @@ class Res2Net(nn.Module):
     def forward(self, x, inf_weights=None, haze_mask=None):  # [修改] 增加 haze_mask=None 参数
         """
         [修改后] 的 Res2Net forward，支持串联注入 (Sequential Injection)
+        [修改V2] 支持 (基础/增强) 注入逻辑
 
         inf_weights: 一个列表 [Stru3(256), Stru2(128), Stru1(64)]
                      对应 [H/16, H/8, H/4] 尺度
@@ -425,16 +430,17 @@ class Res2Net(nn.Module):
             inf_w_4 = self.inject_conv1(inf_weights[2])  # 64 -> 256
             inf_w_4 = F.interpolate(inf_w_4, size=x_layer1_orig.shape[2:], mode='bilinear', align_corners=False)
 
-            # --- [核心修改] 条件注入 ---
+            # --- [核心修改 V2] (基础/增强) 注入逻辑 ---
             if haze_mask is not None:
-                # 将掩码缩放到当前特征图 H/4 尺度
+                # 1. 提供了掩码：计算缩放掩码
                 mask_l1 = F.interpolate(haze_mask, size=inf_w_4.shape[2:], mode='bilinear', align_corners=False)
-                # 只在掩码区域 (mask_l1 == 1) 才加上不一致性特征
-                x_layer1_fused = x_layer1_orig + (inf_w_4 * mask_l1)
+                # (0.0 -> base_weight, 1.0 -> 1.0)
+                scaled_mask = self.base_inject_weight + (mask_l1 * (1.0 - self.base_inject_weight))
+                x_layer1_fused = x_layer1_orig + (inf_w_4 * scaled_mask)
             else:
-                # 原始行为（无掩码时，全部注入）
-                x_layer1_fused = x_layer1_orig + inf_w_4
-            # --- [核心修改结束] ---
+                # 2. 未提供掩码：仅使用基础注入
+                x_layer1_fused = x_layer1_orig + (inf_w_4 * self.base_inject_weight)
+            # --- [核心修改 V2 结束] ---
 
         # --- H/8 尺度 ---
         x_layer2_orig = self.layer2(x_layer1_fused)  # (B, 512, H/8, W/8)
@@ -443,13 +449,14 @@ class Res2Net(nn.Module):
             inf_w_8 = self.inject_conv2(inf_weights[1])  # 128 -> 512
             inf_w_8 = F.interpolate(inf_w_8, size=x_layer2_orig.shape[2:], mode='bilinear', align_corners=False)
 
-            # --- [核心修改] 条件注入 ---
+            # --- [核心修改 V2] (基础/增强) 注入逻辑 ---
             if haze_mask is not None:
                 mask_l2 = F.interpolate(haze_mask, size=inf_w_8.shape[2:], mode='bilinear', align_corners=False)
-                x_layer2_fused = x_layer2_orig + (inf_w_8 * mask_l2)
+                scaled_mask_l2 = self.base_inject_weight + (mask_l2 * (1.0 - self.base_inject_weight))
+                x_layer2_fused = x_layer2_orig + (inf_w_8 * scaled_mask_l2)
             else:
-                x_layer2_fused = x_layer2_orig + inf_w_8
-            # --- [核心修改结束] ---
+                x_layer2_fused = x_layer2_orig + (inf_w_8 * self.base_inject_weight)
+            # --- [核心修改 V2 结束] ---
 
         # --- H/16 尺度 ---
         x_layer3_orig = self.layer3(x_layer2_fused)  # (B, 1024, H/16, W/16)
@@ -458,13 +465,14 @@ class Res2Net(nn.Module):
             inf_w_16 = self.inject_conv3(inf_weights[0])  # 256 -> 1024
             inf_w_16 = F.interpolate(inf_w_16, size=x_layer3_orig.shape[2:], mode='bilinear', align_corners=False)
 
-            # --- [核心修改] 条件注入 ---
+            # --- [核心修改 V2] (基础/增强) 注入逻辑 ---
             if haze_mask is not None:
                 mask_l3 = F.interpolate(haze_mask, size=inf_w_16.shape[2:], mode='bilinear', align_corners=False)
-                x_layer3_fused = x_layer3_orig + (inf_w_16 * mask_l3)
+                scaled_mask_l3 = self.base_inject_weight + (mask_l3 * (1.0 - self.base_inject_weight))
+                x_layer3_fused = x_layer3_orig + (inf_w_16 * scaled_mask_l3)
             else:
-                x_layer3_fused = x_layer3_orig + inf_w_16
-            # --- [核心修改结束] ---
+                x_layer3_fused = x_layer3_orig + (inf_w_16 * self.base_inject_weight)
+            # --- [核心修改 V2 结束] ---
 
         # [修改] 返回 注入后(fused)的特征（用于解码）和 注入前(orig)的特征（用于蒸馏）
         fused_outputs = [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0]
@@ -973,7 +981,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
         try:
             res2net101_full = Pre_Res2Net(Bottle2neck, [3, 4, 23, 3], baseWidth=26, scale=4)
             # [请注意]：请确保你本地 'D:/...' 路径下存在此文件
-            pretrained_path = '/root/CoA-main_daima_xiugai_teacher_v6/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
+            pretrained_path = '/root/CoA-main_v10_yuanyu_v6/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
             if not os.path.exists(pretrained_path):
                 raise FileNotFoundError(f"预训练权重文件未找到: {pretrained_path}")
             res2net101_full.load_state_dict(torch.load(pretrained_path, map_location='cpu'), strict=False)
@@ -1020,7 +1028,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
             # (与可见光流加载方式相同)
             res2net101_full_ir = Pre_Res2Net(Bottle2neck, [3, 4, 23, 3], baseWidth=26, scale=4)
             # [请注意]：请确保你本地 'D:/...' 路径下存在此文件
-            pretrained_path_ir = '/root/CoA-main_daima_xiugai_teacher_v6/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
+            pretrained_path_ir = '/root/CoA-main_v10_yuanyu_v6/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
             if not os.path.exists(pretrained_path_ir):
                 raise FileNotFoundError(f"预训练权重文件未找到: {pretrained_path_ir}")
             res2net101_full_ir.load_state_dict(torch.load(pretrained_path_ir, map_location='cpu'), strict=False)

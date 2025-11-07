@@ -13,14 +13,16 @@ class PerceptualLoss(nn.Module):
 
     def __init__(self, content_weight=1.0, style_weight=1.0):
         super(PerceptualLoss, self).__init__()
-        self.vgg = Vgg19().cuda()  # 使用cr.py中定义的VGG19
+        # [修改] 自动将 VGG 加载到正确的设备
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.vgg = Vgg19().to(self.device)
         self.criterion = nn.L1Loss()
         self.content_weight = content_weight
         self.style_weight = style_weight
 
         # VGG 归一化参数 (与 ContrastLoss 一致)
-        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1).cuda()
-        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1).cuda()
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1).to(self.device)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1).to(self.device)
 
         # 定义使用 VGG 的哪些层
         # 我们使用 relu1_1, relu2_1, relu3_1, relu4_1, relu5_1
