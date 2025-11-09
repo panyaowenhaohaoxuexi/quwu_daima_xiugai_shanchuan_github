@@ -41,14 +41,14 @@ parser.add_argument('--w_loss_L1', default=0.8, type=float, help='weight of loss
 # 定义 SSIM 损失的权重
 parser.add_argument('--w_loss_SSIM', default=0.2, type=float, help='weight of loss SSIM')
 # 定义 Cr (对比度) 损失的权重
-parser.add_argument('--w_loss_Cr', default=0, type=float, help='weight of loss Cr')
+parser.add_argument('--w_loss_Cr', default=0.05, type=float, help='weight of loss Cr')
 
 # --- [新增] ---
 # 添加一个新的损失权重，用于红外边缘一致性
 parser.add_argument('--w_loss_Edge', default=0.05, type=float, help='weight of IR Edge consistency loss')
 # --- [新增结束] ---
 # --- [新增] 风格损失 和 跨模态一致性损失 ---
-parser.add_argument('--w_loss_Style', default=0, type=float, help='weight of Style loss (Perceptual)')
+parser.add_argument('--w_loss_Style', default=0.05, type=float, help='weight of Style loss (Perceptual)')
 parser.add_argument('--w_loss_CrossModal', default=0.05, type=float, help='weight of Cross-Modal Consistency loss (L1 between vis/ir features)')
 # --- [新增结束] ---
 
