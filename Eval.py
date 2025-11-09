@@ -103,9 +103,9 @@ from torchvision.transforms import Compose, ToTensor, Normalize, Resize, Interpo
 # MODEL_PATH = './model/Student_model/Student.pth' # 如果是 Student
 # MODEL_PATH = './model/EMA_model/EMA_r.pth' # 如果是 EMA 适配后的 Student_x
 # 修改: 使用用户提供的硬编码路径
-MODEL_PATH = 'D:/liu_lan_qi_xia_zai/CoA-main_daima_xiugai_jiehe_ir_edge_xiugai_teacher_v5/ceshi_shiyongde_model/v5/Teacher_xunlian/best.pth'  # <--- 这是你训练好的 DualStreamTeacher 最佳权重路径
+MODEL_PATH = '/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/xunlian_Teacher/saved_model/best.pth'  # <--- 这是你训练好的 DualStreamTeacher 最佳权重路径
 # 修改: 使用用户提供的硬编码路径
-OUTPUT_FOLDER = 'E:/FLIR_zongti_quwu_ceshi/dataset/REAL_FOGGY_test_v5/dehazed_best_Teacher' # <--- 修改输出文件夹名称以区分 (避免覆盖 test_data)
+OUTPUT_FOLDER = '/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/train_model_test_real' # <--- 修改输出文件夹名称以区分 (避免覆盖 test_data)
 # --- 修改结束 ---
 
 
@@ -238,8 +238,8 @@ if __name__ == '__main__':
 
     # --- 修改: 指定可见光和红外输入图像文件夹 ---
     # 修改: 使用用户提供的文件夹路径
-    INPUT_FOLDER_VIS = 'E:/FLIR_zongti_quwu_ceshi/dataset/REAL_FOGGY/hazy' # <--- 指定含雾可见光图像文件夹路径
-    INPUT_FOLDER_IR = 'E:/FLIR_zongti_quwu_ceshi/dataset/REAL_FOGGY/ir'    # <--- 指定对应的红外图像文件夹路径
+    INPUT_FOLDER_VIS = '/root/autodl-tmp/REAL_FOGGY_autodl/hazy' # <--- 指定含雾可见光图像文件夹路径
+    INPUT_FOLDER_IR = '/root/autodl-tmp/REAL_FOGGY_autodl/ir'    # <--- 指定对应的红外图像文件夹路径
     # 检查输入文件夹是否存在
     if not os.path.isdir(INPUT_FOLDER_VIS):
         print(f"错误: 可见光输入文件夹不存在: {INPUT_FOLDER_VIS}")

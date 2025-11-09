@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-# Teacher.py (Training Script)
-
 # 导入数学库，用于数学计算，例如余弦函数
 import math
 # 导入操作系统库，用于文件路径操作，例如创建目录
