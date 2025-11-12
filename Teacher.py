@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+# Teacher.py (Training Script)
+
 # 导入数学库，用于数学计算，例如余弦函数
 import math
 # 导入操作系统库，用于文件路径操作，例如创建目录
@@ -206,7 +209,7 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir, output_root_dir):
 
     # 1. 设置输出目录
     output_folder = os.path.join(output_root_dir,
-                                 '/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v11/train_test/Teacher_xunlian_model_guocheng_test',
+                                 '/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/train_test/Teacher_train_test',
                                  f'epoch_{epoch}')
     os.makedirs(output_folder, exist_ok=True)
     print(f"\n正在对真实世界图像运行推理 (Epoch {epoch}) -> 保存至 {output_folder}")
@@ -664,6 +667,7 @@ def set_seed_torch(seed=2024):
     torch.backends.cudnn.benchmark = True
 
 
+# Python 主程序入口点
 if __name__ == "__main__":
 
     set_seed_torch(2024)
@@ -712,7 +716,7 @@ if __name__ == "__main__":
 
     # --- DataLoader ---
     # 从配置中读取 batch_size 和 num_workers，提供默认值
-    batch_size = getattr(opt, 'batch_size', 8)  # 使用 opt 中的 batch_size，默认为 4
+    batch_size = getattr(opt, 'batch_size', 16)  # 使用 opt 中的 batch_size，默认为 4
     num_workers = getattr(opt, 'num_workers', 16)  # 使用 opt 中的 num_workers，默认为 4
 
     loader_train = None
@@ -780,24 +784,15 @@ if __name__ == "__main__":
     criterion.append(nn.L1Loss().to(opt.device))
     # criterion[1]: SSIM Loss
     criterion.append(SSIM().to(opt.device))
-
-    # --- [代码修改：按需加载 ContrastLoss] ---
     # criterion[2]: Contrast Loss
-    contrast_loss_instance = None
-    if opt.w_loss_Cr > 0:  # 检查权重是否大于0
-        try:
-            contrast_loss_instance = ContrastLoss(ablation=False).to(opt.device)
-            criterion.append(contrast_loss_instance)
-            print(f"已加载 ContrastLoss (权重: {opt.w_loss_Cr})。")
-        except Exception as e:
-            # 如果 ContrastLoss 初始化失败（例如缺少 VGG 权重），则禁用它
-            print(f"错误: 初始化 ContrastLoss 失败: {e}。将 Cr 损失权重设为 0。")
-            criterion.append(None)
-            opt.w_loss_Cr = 0  # 禁用对比度损失
-    else:
-        print("ContrastLoss (Cr) 已禁用 (权重为 0)，不加载 VGG。")
+    try:
+        contrast_loss_instance = ContrastLoss(ablation=False).to(opt.device)
+        criterion.append(contrast_loss_instance)
+    except Exception as e:
+        # 如果 ContrastLoss 初始化失败（例如缺少 VGG 权重），则禁用它
+        print(f"错误: 初始化 ContrastLoss 失败: {e}。将 Cr 损失权重设为 0。")
         criterion.append(None)
-    # --- [修改结束] ---
+        opt.w_loss_Cr = 0  # 禁用对比度损失
 
     # 确保 criterion 列表长度至少为 3
     while len(criterion) < 3:
@@ -807,23 +802,16 @@ if __name__ == "__main__":
     # criterion[3]: L1 Loss (用于 Edge Loss)
     criterion.append(nn.L1Loss().to(opt.device))
 
-    # --- [代码修改：按需加载 Style Loss] ---
     # criterion[4]: Style Loss (PerceptualLoss)
-    style_loss_instance = None
-    if opt.w_loss_Style > 0:  # 检查权重是否大于0
-        # 我们只关心风格，所以 content_weight=0.0, style_weight=1.0
-        try:
-            style_loss_instance = PerceptualLoss(content_weight=0.0, style_weight=1.0).to(opt.device)
-            criterion.append(style_loss_instance)
-            print(f"已加载 Style Loss (权重: {opt.w_loss_Style})。")
-        except Exception as e:
-            print(f"警告: 初始化 PerceptualLoss (Style Loss) 失败: {e}。将 w_loss_Style 设为 0。")
-            criterion.append(None)
-            opt.w_loss_Style = 0
-    else:
-        print("Style Loss (Style) 已禁用 (权重为 0)，不加载 VGG。")
+    # 我们只关心风格，所以 content_weight=0.0, style_weight=1.0
+    try:
+        style_loss_instance = PerceptualLoss(content_weight=0.0, style_weight=1.0).to(opt.device)
+        criterion.append(style_loss_instance)
+        print("已加载 Style Loss (PerceptualLoss)。")
+    except Exception as e:
+        print(f"警告: 初始化 PerceptualLoss (Style Loss) 失败: {e}。将 w_loss_Style 设为 0。")
         criterion.append(None)
-    # --- [修改结束] ---
+        opt.w_loss_Style = 0
 
     # criterion[5]: Cross-Modal Consistency Loss (L1)
     criterion.append(nn.L1Loss().to(opt.device))

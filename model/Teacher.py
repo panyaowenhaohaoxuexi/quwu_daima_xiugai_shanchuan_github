@@ -981,7 +981,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
         try:
             res2net101_full = Pre_Res2Net(Bottle2neck, [3, 4, 23, 3], baseWidth=26, scale=4)
             # [请注意]：请确保你本地 'D:/...' 路径下存在此文件
-            pretrained_path = '/root/CoA-main_v11/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
+            pretrained_path = '/root/CoA-main_v10_yuanyu_v6/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
             if not os.path.exists(pretrained_path):
                 raise FileNotFoundError(f"预训练权重文件未找到: {pretrained_path}")
             res2net101_full.load_state_dict(torch.load(pretrained_path, map_location='cpu'), strict=False)
@@ -1028,7 +1028,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
             # (与可见光流加载方式相同)
             res2net101_full_ir = Pre_Res2Net(Bottle2neck, [3, 4, 23, 3], baseWidth=26, scale=4)
             # [请注意]：请确保你本地 'D:/...' 路径下存在此文件
-            pretrained_path_ir = '/root/CoA-main_v11/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
+            pretrained_path_ir = '/root/CoA-main_v10_yuanyu_v6/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
             if not os.path.exists(pretrained_path_ir):
                 raise FileNotFoundError(f"预训练权重文件未找到: {pretrained_path_ir}")
             res2net101_full_ir.load_state_dict(torch.load(pretrained_path_ir, map_location='cpu'), strict=False)
