@@ -339,15 +339,17 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         else:
             loss_Cr = torch.tensor(0.0).to(opt.device)
 
-        # --- 计算红外边缘损失 ---
+        # --- 计算边缘损失 (与 GT) ---
         loss_Edge = torch.tensor(0.0, device=opt.device)
         # [修改] 确保 criterion[3] (L1损失) 存在
         if opt.w_loss_Edge > 0 and edge_detector is not None and criterion[3] is not None:
             try:
                 edge_pred = edge_detector(pred_image)
                 with torch.no_grad():
-                    edge_ir_target = edge_detector(infrared)
-                loss_Edge = criterion[3](edge_pred, edge_ir_target.detach())  # 使用 criterion[3]
+                    # --- [修改] 将目标改为 clear_vis (Ground Truth) ---
+                    edge_gt_target = edge_detector(clear_vis)
+                    # 计算预测边缘和 GT 边缘之间的 L1 损失
+                loss_Edge = criterion[3](edge_pred, edge_gt_target.detach())
             except Exception as e:
                 print(f"\n错误: 计算 Edge 损失失败: {e}")
                 loss_Edge = torch.tensor(0.0, device=opt.device)
