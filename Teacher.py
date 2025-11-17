@@ -23,14 +23,14 @@ from torch.backends import cudnn
 from torch.utils.data import DataLoader
 
 # --- [修改] 导入 SSIM, ContrastLoss 和 PerceptualLoss ---
-from loss import SSIM, ContrastLoss, PerceptualLoss
+from loss import SSIM, ContrastLoss, PerceptualLoss, DiceLoss
 # --- [修改结束] ---
 
 # --- [修改] 导入新的数据集类和模型类 ---
 from data import MultiModalHazeDataset, TestDataset  # TestDataset 现在也支持三模态
 from metric import psnr, ssim
 # from model import DualStreamTeacher # <--- 不再使用原始模型
-from model import VIFNetInconsistencyTeacher, SobelEdgeDetector  # <--- 使用新的融合模型
+from model import VIFNetInconsistencyTeacher, CannyEdgeDetector  # <--- 使用新的融合模型
 # --- [修改结束] ---
 from option.Teacher import opt  # 导入配置选项
 
@@ -209,7 +209,7 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir, output_root_dir):
 
     # 1. 设置输出目录
     output_folder = os.path.join(output_root_dir,
-                                 '/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/train_test/Teacher_train_test',
+                                 '/root/autodl-tmp/Sup3_canny/train_test/Teacher_guocheng_test',
                                  f'epoch_{epoch}')
     os.makedirs(output_folder, exist_ok=True)
     print(f"\n正在对真实世界图像运行推理 (Epoch {epoch}) -> 保存至 {output_folder}")
@@ -752,7 +752,7 @@ if __name__ == "__main__":
 
     # AAA
     # --- [新增] 初始化边缘检测器 ---
-    edge_detector = SobelEdgeDetector().to(opt.device)
+    edge_detector = CannyEdgeDetector().to(opt.device)
     # 确保它不参与训练（Sobel 没有可训练参数，但这是个好习惯）
     for param in edge_detector.parameters():
         param.requires_grad = False
@@ -808,9 +808,9 @@ if __name__ == "__main__":
     while len(criterion) < 3:
         criterion.append(None)
 
-    # --- [新增] ---
-    # criterion[3]: L1 Loss (用于 Edge Loss)
-    criterion.append(nn.L1Loss().to(opt.device))
+    # --- [修改] criterion[3]: 使用 Dice Loss (用于 Edge Loss) ---
+    criterion.append(DiceLoss().to(opt.device))
+    # --- [修改结束] ---
 
     # --- [代码修改：按需加载 Style Loss] ---
     # criterion[4]: Style Loss (PerceptualLoss)

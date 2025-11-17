@@ -19,10 +19,10 @@ from torchvision.transforms import Compose, ToTensor, Normalize, Resize, Interpo
 # --- [新增结束] ---
 
 from metric import psnr, ssim
-from loss import SSIM  # 仅用于测试阶段时可用；训练不直接用
+from loss import SSIM, DiceLoss  # 仅用于测试阶段时可用；训练不直接用
 # 使用你 data/ 下“已修改”的 TestDataset（三模态：hazy/ir/clear）
 from data import MultiModalCLIPLoader, TestDataset
-from model import VIFNetInconsistencyTeacher, SobelEdgeDetector
+from model import VIFNetInconsistencyTeacher, CannyEdgeDetector
 from CLIP import L_clip_from_feature
 from collections import OrderedDict
 from option.EMA import opt  # [修改] 导入 EMA 的配置
@@ -234,7 +234,9 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir, output_root_dir):
 
     # 1. 设置输出目录
     # [修改]：确保输出目录基于 opt.model_name
-    output_folder = os.path.join(output_root_dir, '/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/train_guocheng_test/EMA_train_test', f'epoch_{epoch}')
+    output_folder = os.path.join(output_root_dir,
+                                 '/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/train_guocheng_test/EMA_train_test',
+                                 f'epoch_{epoch}')
     os.makedirs(output_folder, exist_ok=True)
     print(f"\n正在对真实世界图像运行推理 (Epoch {epoch}) -> 保存至 {output_folder}")
 
@@ -733,14 +735,14 @@ if __name__ == "__main__":
 
     # ======== 模型初始化 ========
     # [修改]：EMA 脚本使用 VIFNetInconsistencyTeacher
-    from model import VIFNetInconsistencyTeacher, SobelEdgeDetector
+    from model import VIFNetInconsistencyTeacher, CannyEdgeDetector
 
     teacher_net = VIFNetInconsistencyTeacher().to(opt.device)
     student_net = VIFNetInconsistencyTeacher().to(opt.device)
     # --- [修改结束] ---
 
     # --- [新增] 初始化边缘检测器 ---
-    edge_detector = SobelEdgeDetector().to(opt.device)
+    edge_detector = CannyEdgeDetector().to(opt.device)
     # 确保它不参与训练（如果它有参数的话，Sobel 没有可训练参数，但以防万一）
     for param in edge_detector.parameters():
         param.requires_grad = False
@@ -804,7 +806,9 @@ if __name__ == "__main__":
         opt.w_loss_Clip = 0
         print("警告: CLIP 损失已禁用。")
 
-    criterion.append(nn.L1Loss().to(opt.device))  # Edge Loss (criterion[2])
+    # [修改] criterion[2]: 使用 Dice Loss (用于 Edge Loss)
+    criterion.append(DiceLoss().to(opt.device))
+    # [修改结束]
 
     # ======== 优化器（仅学生） ========
     optimizer = optim.Adam(

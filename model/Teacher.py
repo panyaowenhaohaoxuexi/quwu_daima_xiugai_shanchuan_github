@@ -21,30 +21,72 @@ def f(x, y):
 
 # --- 基础模块 (SobelEdgeDetector, Pre_Res2Net, Bottle2neck, Res2Net(3通道输入), ConvBlock, DeconvBlock, Decoder_MDCBlock1, make_dense, RDB, ConvLayer, UpsampleConvLayer, ResidualBlock) ---
 # ... (这些基础模块的代码与上一个版本相同，确保 Res2Net 输入为 3 通道，这里省略以保持简洁) ...
-class SobelEdgeDetector(nn.Module):
-    def __init__(self):
-        super(SobelEdgeDetector, self).__init__()
-        sobel_kernel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]])
-        sobel_kernel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]])
-        self.kernel_x = sobel_kernel_x.view(1, 1, 3, 3).repeat(1, 1, 1, 1)
-        self.kernel_y = sobel_kernel_y.view(1, 1, 3, 3).repeat(1, 1, 1, 1)
-        self.conv_x = nn.Conv2d(1, 1, kernel_size=3, stride=1, padding=1, bias=False)
-        self.conv_y = nn.Conv2d(1, 1, kernel_size=3, stride=1, padding=1, bias=False)
-        self.conv_x.weight = nn.Parameter(self.kernel_x, requires_grad=False)
-        self.conv_y.weight = nn.Parameter(self.kernel_y, requires_grad=False)
+# --- [修改] 替换 SobelEdgeDetector 为 CannyEdgeDetector ---
+class CannyEdgeDetector(nn.Module):
+    """
+    可微的 Canny 边缘检测器 (Soft Canny / Gradient Magnitude)。
+    包含：高斯模糊 -> Sobel 梯度计算 -> 梯度幅值。
+    为了保持训练时的可微性，这里省略了非极大值抑制(NMS)和双阈值硬截断。
+    这种“软边缘”非常适合作为 Dice Loss 或 L1 Loss 的输入。
+    """
+
+    def __init__(self, kernel_size=5, sigma=1.0):
+        super(CannyEdgeDetector, self).__init__()
+
+        # 1. 生成高斯核 (用于降噪)
+        x_coord = torch.arange(kernel_size)
+        x_grid = x_coord.repeat(kernel_size).view(kernel_size, kernel_size)
+        y_grid = x_grid.t()
+        xy_grid = torch.stack([x_grid, y_grid], dim=-1).float()
+
+        mean = (kernel_size - 1) / 2.
+        variance = sigma ** 2.
+
+        # 计算高斯分布
+        gaussian_kernel = (1. / (2. * math.pi * variance)) * \
+                          torch.exp(-torch.sum((xy_grid - mean) ** 2., dim=-1) / (2 * variance))
+
+        # 归一化
+        gaussian_kernel = gaussian_kernel / torch.sum(gaussian_kernel)
+        self.gaussian_filter = gaussian_kernel.view(1, 1, kernel_size, kernel_size)
+
+        # 2. 定义 Sobel 梯度算子
+        self.sobel_filter_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.sobel_filter_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+
+        # 将核注册为参数但不计算梯度 (固定权重)
+        self.gaussian_filter = nn.Parameter(self.gaussian_filter, requires_grad=False)
+        self.sobel_filter_x = nn.Parameter(self.sobel_filter_x, requires_grad=False)
+        self.sobel_filter_y = nn.Parameter(self.sobel_filter_y, requires_grad=False)
 
     def forward(self, x):
-        if x.shape[1] != 1:
-            if x.shape[1] == 3:
-                x = TF.rgb_to_grayscale(x)
-            else:
-                print("警告: Sobel 输入不是单通道或三通道，将只使用第一个通道。")
-                x = x[:, 0:1, :, :]
-        grad_x = self.conv_x(x)
-        grad_y = self.conv_y(x)
-        edge_magnitude = torch.abs(grad_x) + torch.abs(grad_y)
-        return edge_magnitude
+        # 确保输入是单通道灰度图
+        if x.shape[1] == 3:
+            # RGB 转灰度: 0.299*R + 0.587*G + 0.114*B
+            x = x[:, 0:1, :, :] * 0.299 + x[:, 1:2, :, :] * 0.587 + x[:, 2:3, :, :] * 0.114
+        elif x.shape[1] != 1:
+            # 如果不是1或3通道，默认取第一个通道处理
+            x = x[:, 0:1, :, :]
 
+        # 1. 高斯模糊 (降噪)
+        # padding = kernel_size // 2
+        padding = self.gaussian_filter.shape[2] // 2
+        x_blurred = F.conv2d(x, self.gaussian_filter, padding=padding, groups=1)
+
+        # 2. 计算梯度
+        grad_x = F.conv2d(x_blurred, self.sobel_filter_x, padding=1)
+        grad_y = F.conv2d(x_blurred, self.sobel_filter_y, padding=1)
+
+        # 3. 计算梯度幅值 (Soft Edge Map)
+        # 加上一个极小值防止 sqrt(0) 梯度为 NaN
+        magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+
+        # 可选：归一化到 [0, 1] 以更好地配合 Dice Loss，但梯度幅值本身也有意义
+        # 这里保持原始幅值，如果 DiceLoss 需要 0-1，可以在外部做 sigmoid 或归一化
+        return magnitude
+
+
+# --- [修改结束] ---
 
 # --- [修改1：新增 CBAM 及融合模块] ---
 class ChannelAttentionModule(nn.Module):
@@ -981,7 +1023,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
         try:
             res2net101_full = Pre_Res2Net(Bottle2neck, [3, 4, 23, 3], baseWidth=26, scale=4)
             # [请注意]：请确保你本地 'D:/...' 路径下存在此文件
-            pretrained_path = '/root/CoA-main_v10_yuanyu_v6/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
+            pretrained_path = '/root/CoA-main_v10_Sup3_canny/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
             if not os.path.exists(pretrained_path):
                 raise FileNotFoundError(f"预训练权重文件未找到: {pretrained_path}")
             res2net101_full.load_state_dict(torch.load(pretrained_path, map_location='cpu'), strict=False)
@@ -1028,7 +1070,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
             # (与可见光流加载方式相同)
             res2net101_full_ir = Pre_Res2Net(Bottle2neck, [3, 4, 23, 3], baseWidth=26, scale=4)
             # [请注意]：请确保你本地 'D:/...' 路径下存在此文件
-            pretrained_path_ir = '/root/CoA-main_v10_yuanyu_v6/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
+            pretrained_path_ir = '/root/CoA-main_v10_Sup3_canny/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
             if not os.path.exists(pretrained_path_ir):
                 raise FileNotFoundError(f"预训练权重文件未找到: {pretrained_path_ir}")
             res2net101_full_ir.load_state_dict(torch.load(pretrained_path_ir, map_location='cpu'), strict=False)
