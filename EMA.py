@@ -23,7 +23,8 @@ from loss import SSIM  # 仅用于测试阶段时可用；训练不直接用
 # 使用你 data/ 下“已修改”的 TestDataset（三模态：hazy/ir/clear）
 from data import MultiModalCLIPLoader, TestDataset
 from model import VIFNetInconsistencyTeacher, SobelEdgeDetector
-from CLIP import L_clip_from_feature
+# from CLIP import L_clip_from_feature
+from CLIP.clip_score import L_clip_from_feature, L_clip_MSE
 from collections import OrderedDict
 from option.EMA import opt  # [修改] 导入 EMA 的配置
 
@@ -271,7 +272,9 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir, output_root_dir):
 
 
 # 定义函数 train：执行主要的训练逻辑
-def train(teacher_net, student_net, loader_train, loader_test, optim, criterion, text_features, edge_detector):
+# def train(teacher_net, student_net, loader_train, loader_test, optim, criterion, text_features, edge_detector):
+def train(teacher_net, student_net, loader_train, loader_test, optim, criterion, text_features, edge_detector,
+              res_model):
     """
     训练主循环：Student 学习，Teacher 以 EMA 跟随。
     - 前向：双输入 (hazy_vis, infrared)
@@ -279,8 +282,10 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
     - 评估：周期性在 test(loader_test) 上评估（真双路）
     """
     losses = []
-    loss_log = {'L1_r': [], 'Clip': [], 'Edge': [], 'total': []}
-    loss_log_tmp = {'L1_r': [], 'Clip': [], 'Edge': [], 'total': []}
+    # loss_log = {'L1_r': [], 'Clip': [], 'Edge': [], 'total': []}
+    # loss_log_tmp = {'L1_r': [], 'Clip': [], 'Edge': [], 'total': []}
+    loss_log = {'L1_r': [], 'Clip': [], 'Edge': [], 'Clip_IR': [], 'total': []}
+    loss_log_tmp = {'L1_r': [], 'Clip': [], 'Edge': [], 'Clip_IR': [], 'total': []}
     psnr_log = []
 
     start_step = 0
@@ -387,8 +392,28 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
                 loss_Edge = torch.tensor(0.0, device=opt.device)
         # [新增结束]
 
-        # 总损失
-        loss = opt.w_loss_L1_r * loss_L1_r + opt.w_loss_Clip * loss_Clip + opt.w_loss_Edge * loss_Edge
+        # # 总损失
+        # loss = opt.w_loss_L1_r * loss_L1_r + opt.w_loss_Clip * loss_Clip + opt.w_loss_Edge * loss_Edge
+        #
+        # # 数值健壮性检查
+
+        # [新增结束]
+
+        # --- [新增] 红外视觉提示约束 (Clip_IR) ---
+        loss_Clip_IR = torch.tensor(0.0, device=opt.device)
+        w_loss_Clip_IR = 0.5  # 这是红外约束的权重，你可以根据实验效果自行调大或调小
+
+        if len(criterion) > 3 and criterion[3] is not None and res_model is not None:
+            try:
+                # 使用 RN101 计算去雾结果与红外图在多层级特征上的 MSE
+                loss_Clip_IR = criterion[3](res_model, student_image, infrared)
+            except Exception as e:
+                print(f"\n错误: 计算红外 Clip_IR 损失失败: {e}")
+                loss_Clip_IR = torch.tensor(0.0, device=opt.device)
+        # --- [新增结束] ---
+
+        # 总损失 (加入红外约束)
+        loss = opt.w_loss_L1_r * loss_L1_r + opt.w_loss_Clip * loss_Clip + opt.w_loss_Edge * loss_Edge + w_loss_Clip_IR * loss_Clip_IR
 
         # 数值健壮性检查
         if torch.isnan(loss) or torch.isinf(loss):
@@ -412,13 +437,16 @@ def train(teacher_net, student_net, loader_train, loader_test, optim, criterion,
         loss_log_tmp['L1_r'].append(loss_L1_r.item())
         loss_log_tmp['Clip'].append(loss_Clip.item())
         loss_log_tmp['Edge'].append(loss_Edge.item())
+        loss_log_tmp['Clip_IR'].append(loss_Clip_IR.item())  # 新增红外日志
         loss_log_tmp['total'].append(loss.item())
 
         l1r_val = (opt.w_loss_L1_r * loss_L1_r.item()) if opt.w_loss_L1_r > 0 else 0.0
         clip_val = (opt.w_loss_Clip * loss_Clip.item()) if opt.w_loss_Clip > 0 else 0.0
-        edge_val = (opt.w_loss_Edge * loss_Edge.item()) if opt.w_loss_Edge > 0 else 0.0  # 新增
+        edge_val = (opt.w_loss_Edge * loss_Edge.item()) if opt.w_loss_Edge > 0 else 0.0
+        clip_ir_val = (w_loss_Clip_IR * loss_Clip_IR.item())  # 新增红外显示值
+
         print(
-            f'\rloss:{loss.item():.5f} | L1_r:{l1r_val:.5f} | Clip:{clip_val:.5f} | Edge:{edge_val:.5f} '
+            f'\rloss:{loss.item():.5f} | L1_r:{l1r_val:.5f} | Clip:{clip_val:.5f} | Edge:{edge_val:.5f} | IR:{clip_ir_val:.5f} '
             f'| step:{step}/{steps} | lr:{lr:.9f} | time_used:{(time.time() - start_time) / 60:.1f}',
             end='', flush=True)
 
@@ -642,6 +670,21 @@ except Exception as e:
     clip_model = None
 
 text_features = None
+
+# --- [新增] 全局加载 RN101 用于红外图像的 MSE 结构约束 ---
+try:
+    res_model, _ = clip.load("RN101", device=torch.device("cpu"),
+                              download_root="/root/CoA-main_daima_xiugai_teacher_v6/clip_model/")
+    res_model.to(opt.device)
+    for param in res_model.parameters():
+        param.requires_grad = False
+    res_model.eval()
+except Exception as e:
+    print(f"错误: 加载 RN101 模型失败: {e}。红外 CLIP 损失将被禁用。")
+    res_model = None
+# --- [新增结束] ---
+
+
 if clip_model is not None:
     try:
         # 加载预计算的 prompt 嵌入
@@ -806,6 +849,9 @@ if __name__ == "__main__":
 
     criterion.append(nn.L1Loss().to(opt.device))  # Edge Loss (criterion[2])
 
+    # [新增] L_clip_MSE 用于红外约束 (criterion[3])
+    criterion.append(L_clip_MSE().to(opt.device) if res_model is not None else None)
+
     # ======== 优化器（仅学生） ========
     optimizer = optim.Adam(
         params=filter(lambda x: x.requires_grad, student_net.parameters()),
@@ -822,5 +868,6 @@ if __name__ == "__main__":
         optimizer,
         criterion,
         text_features,
-        edge_detector  # <--- 传入边缘检测器
+        edge_detector,  # <--- 传入边缘检测器
+        res_model  # <--- [新增] 传入 RN101 裁判模型
     )
