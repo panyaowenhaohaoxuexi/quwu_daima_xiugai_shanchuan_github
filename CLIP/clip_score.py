@@ -37,12 +37,13 @@ class L_clip_from_feature(nn.Module):
 
 def get_clip_score_MSE(res_model, pred, inp, weight):
     stack = img_resize(torch.cat([pred, inp], dim=1))
+
+    # 提取特征，输出形状为 [batch_size, 512]
     pred_image_features = res_model.encode_image(stack[:, :3, :, :])
     inp_image_features = res_model.encode_image(stack[:, 3:, :, :])
 
-    MSE_loss = 0
-    for feature_index in range(len(weight)):
-        MSE_loss = MSE_loss + weight[feature_index] * F.mse_loss(pred_image_features[1][feature_index], inp_image_features[1][feature_index])
+    # [核心修改]：抛弃错误的列表索引，直接计算整张图语义特征的 MSE 损失
+    MSE_loss = F.mse_loss(pred_image_features, inp_image_features)
 
     return MSE_loss
 

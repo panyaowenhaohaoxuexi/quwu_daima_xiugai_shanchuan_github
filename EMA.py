@@ -24,7 +24,8 @@ from loss import SSIM  # 仅用于测试阶段时可用；训练不直接用
 from data import MultiModalCLIPLoader, TestDataset
 from model import VIFNetInconsistencyTeacher, SobelEdgeDetector
 # from CLIP import L_clip_from_feature
-from CLIP.clip_score import L_clip_from_feature, L_clip_MSE
+from CLIP.clip_score_ import L_clip_from_feature  # 恢复原版负责色彩的文本 Loss (注意这里有个下划线)
+from CLIP.clip_score import L_clip_MSE            # 仅从这里引入负责红外结构的 MSE Loss
 from collections import OrderedDict
 from option.EMA import opt  # [修改] 导入 EMA 的配置
 
