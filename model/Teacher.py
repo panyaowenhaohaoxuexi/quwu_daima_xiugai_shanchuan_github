@@ -21,30 +21,72 @@ def f(x, y):
 
 # --- 基础模块 (SobelEdgeDetector, Pre_Res2Net, Bottle2neck, Res2Net(3通道输入), ConvBlock, DeconvBlock, Decoder_MDCBlock1, make_dense, RDB, ConvLayer, UpsampleConvLayer, ResidualBlock) ---
 # ... (这些基础模块的代码与上一个版本相同，确保 Res2Net 输入为 3 通道，这里省略以保持简洁) ...
-class SobelEdgeDetector(nn.Module):
-    def __init__(self):
-        super(SobelEdgeDetector, self).__init__()
-        sobel_kernel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]])
-        sobel_kernel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]])
-        self.kernel_x = sobel_kernel_x.view(1, 1, 3, 3).repeat(1, 1, 1, 1)
-        self.kernel_y = sobel_kernel_y.view(1, 1, 3, 3).repeat(1, 1, 1, 1)
-        self.conv_x = nn.Conv2d(1, 1, kernel_size=3, stride=1, padding=1, bias=False)
-        self.conv_y = nn.Conv2d(1, 1, kernel_size=3, stride=1, padding=1, bias=False)
-        self.conv_x.weight = nn.Parameter(self.kernel_x, requires_grad=False)
-        self.conv_y.weight = nn.Parameter(self.kernel_y, requires_grad=False)
+# --- [修改] 替换 SobelEdgeDetector 为 CannyEdgeDetector ---
+class CannyEdgeDetector(nn.Module):
+    """
+    可微的 Canny 边缘检测器 (Soft Canny / Gradient Magnitude)。
+    包含：高斯模糊 -> Sobel 梯度计算 -> 梯度幅值。
+    为了保持训练时的可微性，这里省略了非极大值抑制(NMS)和双阈值硬截断。
+    这种“软边缘”非常适合作为 Dice Loss 或 L1 Loss 的输入。
+    """
+
+    def __init__(self, kernel_size=5, sigma=1.0):
+        super(CannyEdgeDetector, self).__init__()
+
+        # 1. 生成高斯核 (用于降噪)
+        x_coord = torch.arange(kernel_size)
+        x_grid = x_coord.repeat(kernel_size).view(kernel_size, kernel_size)
+        y_grid = x_grid.t()
+        xy_grid = torch.stack([x_grid, y_grid], dim=-1).float()
+
+        mean = (kernel_size - 1) / 2.
+        variance = sigma ** 2.
+
+        # 计算高斯分布
+        gaussian_kernel = (1. / (2. * math.pi * variance)) * \
+                          torch.exp(-torch.sum((xy_grid - mean) ** 2., dim=-1) / (2 * variance))
+
+        # 归一化
+        gaussian_kernel = gaussian_kernel / torch.sum(gaussian_kernel)
+        self.gaussian_filter = gaussian_kernel.view(1, 1, kernel_size, kernel_size)
+
+        # 2. 定义 Sobel 梯度算子
+        self.sobel_filter_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.sobel_filter_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+
+        # 将核注册为参数但不计算梯度 (固定权重)
+        self.gaussian_filter = nn.Parameter(self.gaussian_filter, requires_grad=False)
+        self.sobel_filter_x = nn.Parameter(self.sobel_filter_x, requires_grad=False)
+        self.sobel_filter_y = nn.Parameter(self.sobel_filter_y, requires_grad=False)
 
     def forward(self, x):
-        if x.shape[1] != 1:
-            if x.shape[1] == 3:
-                x = TF.rgb_to_grayscale(x)
-            else:
-                print("警告: Sobel 输入不是单通道或三通道，将只使用第一个通道。")
-                x = x[:, 0:1, :, :]
-        grad_x = self.conv_x(x)
-        grad_y = self.conv_y(x)
-        edge_magnitude = torch.abs(grad_x) + torch.abs(grad_y)
-        return edge_magnitude
+        # 确保输入是单通道灰度图
+        if x.shape[1] == 3:
+            # RGB 转灰度: 0.299*R + 0.587*G + 0.114*B
+            x = x[:, 0:1, :, :] * 0.299 + x[:, 1:2, :, :] * 0.587 + x[:, 2:3, :, :] * 0.114
+        elif x.shape[1] != 1:
+            # 如果不是1或3通道，默认取第一个通道处理
+            x = x[:, 0:1, :, :]
 
+        # 1. 高斯模糊 (降噪)
+        # padding = kernel_size // 2
+        padding = self.gaussian_filter.shape[2] // 2
+        x_blurred = F.conv2d(x, self.gaussian_filter, padding=padding, groups=1)
+
+        # 2. 计算梯度
+        grad_x = F.conv2d(x_blurred, self.sobel_filter_x, padding=1)
+        grad_y = F.conv2d(x_blurred, self.sobel_filter_y, padding=1)
+
+        # 3. 计算梯度幅值 (Soft Edge Map)
+        # 加上一个极小值防止 sqrt(0) 梯度为 NaN
+        magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+
+        # 可选：归一化到 [0, 1] 以更好地配合 Dice Loss，但梯度幅值本身也有意义
+        # 这里保持原始幅值，如果 DiceLoss 需要 0-1，可以在外部做 sigmoid 或归一化
+        return magnitude
+
+
+# --- [修改结束] ---
 
 # --- [修改1：新增 CBAM 及融合模块] ---
 class ChannelAttentionModule(nn.Module):
@@ -341,7 +383,7 @@ class Bottle2neck(nn.Module):
 class Res2Net(nn.Module):
     """
         Res2Net: 去雾模型的编码器部分，基于 Res2Net 结构。
-        *** [修改V3]：支持“随机注入”训练和“灵活测试” ***
+        *** [修改]：支持“串联注入”不一致性权重 ***
     """
 
     def __init__(self, block, layers, baseWidth=26, scale=4, in_channels=3):  # 添加 in_channels 参数
@@ -374,9 +416,9 @@ class Res2Net(nn.Module):
         self.inject_conv3 = nn.Conv2d(256, 1024, kernel_size=1, bias=False)  # H/16
         # --- [新增结束] ---
 
-        # --- [修改] 移除硬编码的 base_inject_weight ---
-        # self.base_inject_weight = 0.2  <-- (已删除)
-        # --- [修改结束] ---
+        # --- [新增] 定义基础注入权重 ---
+        self.base_inject_weight = 0.2  # 基础注入权重 (例如 20%)
+        # --- [新增结束] ---
 
         # 初始化权重
         for m in self.modules():
@@ -386,19 +428,9 @@ class Res2Net(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    # --- [新增] Setter 方法 ---
-    def set_base_inject_weight(self, weight):
-        """在评估(inference)时设置基础注入权重"""
-        self.base_inject_weight = weight
-    # --- [新增结束] ---
-
     def _make_layer(self, block, planes, blocks, stride=1):
-        """
-        构建 Res2Net 的一个阶段（layer），包含多个 Bottle2neck 块。
-        (此函数保持不变)
-        """
+        # ... (make_layer 定义保持不变) ...
         downsample = None
-        # 处理下采样（当步长不为1或输入输出通道数变化时）
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
                 nn.AvgPool2d(kernel_size=stride, stride=stride,
@@ -407,33 +439,24 @@ class Res2Net(nn.Module):
                           kernel_size=1, stride=1, bias=False),
                 nn.BatchNorm2d(planes * block.expansion),
             )
-
         layers = []
-        # 添加第一个block（可能包含下采样）
         layers.append(block(self.inplanes, planes, stride, downsample=downsample,
                             stype='stage', baseWidth=self.baseWidth, scale=self.scale))
         self.inplanes = planes * block.expansion
-        # 添加剩余的blocks
         for i in range(1, blocks):
             layers.append(block(self.inplanes, planes, baseWidth=self.baseWidth, scale=self.scale))
 
         return nn.Sequential(*layers)
 
-    def forward(self, x, inf_weights=None, haze_mask=None):
+    def forward(self, x, inf_weights=None, haze_mask=None):  # [修改] 增加 haze_mask=None 参数
         """
-        [修改V3] 支持 (随机) 注入逻辑
-        """
+        [修改后] 的 Res2Net forward，支持串联注入 (Sequential Injection)
+        [修改V2] 支持 (基础/增强) 注入逻辑
 
-        # --- [修改V3：动态注入权重] ---
-        if self.training:
-            # 训练模式：在 [0.1, 0.6] 范围内随机选择权重 (你也可以修改这个范围)
-            # (0.5 * 随机数[0,1]) + 0.1
-            base_weight = (torch.rand(1).item() * 0.5) + 0.1
-        else:
-            # 评估模式：使用可设置的 self.base_inject_weight
-            # (如果从未设置过，则默认为 0.2)
-            base_weight = getattr(self, 'base_inject_weight', 0.2)
-        # --- [修改V3 结束] ---
+        inf_weights: 一个列表 [Stru3(256), Stru2(128), Stru1(64)]
+                     对应 [H/16, H/8, H/4] 尺度
+        haze_mask:   一个 (B, 1, H, W) 的掩码 (如果提供了)
+        """
 
         x = self.conv1(x)
         x = self.bn1(x)
@@ -449,17 +472,17 @@ class Res2Net(nn.Module):
             inf_w_4 = self.inject_conv1(inf_weights[2])  # 64 -> 256
             inf_w_4 = F.interpolate(inf_w_4, size=x_layer1_orig.shape[2:], mode='bilinear', align_corners=False)
 
-            # --- [核心修改 V3] (基础/增强) 注入逻辑 ---
+            # --- [核心修改 V2] (基础/增强) 注入逻辑 ---
             if haze_mask is not None:
                 # 1. 提供了掩码：计算缩放掩码
                 mask_l1 = F.interpolate(haze_mask, size=inf_w_4.shape[2:], mode='bilinear', align_corners=False)
                 # (0.0 -> base_weight, 1.0 -> 1.0)
-                scaled_mask = base_weight + (mask_l1 * (1.0 - base_weight))
+                scaled_mask = self.base_inject_weight + (mask_l1 * (1.0 - self.base_inject_weight))
                 x_layer1_fused = x_layer1_orig + (inf_w_4 * scaled_mask)
             else:
                 # 2. 未提供掩码：仅使用基础注入
-                x_layer1_fused = x_layer1_orig + (inf_w_4 * base_weight)
-            # --- [核心修改 V3 结束] ---
+                x_layer1_fused = x_layer1_orig + (inf_w_4 * self.base_inject_weight)
+            # --- [核心修改 V2 结束] ---
 
         # --- H/8 尺度 ---
         x_layer2_orig = self.layer2(x_layer1_fused)  # (B, 512, H/8, W/8)
@@ -468,14 +491,14 @@ class Res2Net(nn.Module):
             inf_w_8 = self.inject_conv2(inf_weights[1])  # 128 -> 512
             inf_w_8 = F.interpolate(inf_w_8, size=x_layer2_orig.shape[2:], mode='bilinear', align_corners=False)
 
-            # --- [核心修改 V3] (基础/增强) 注入逻辑 ---
+            # --- [核心修改 V2] (基础/增强) 注入逻辑 ---
             if haze_mask is not None:
                 mask_l2 = F.interpolate(haze_mask, size=inf_w_8.shape[2:], mode='bilinear', align_corners=False)
-                scaled_mask_l2 = base_weight + (mask_l2 * (1.0 - base_weight))
+                scaled_mask_l2 = self.base_inject_weight + (mask_l2 * (1.0 - self.base_inject_weight))
                 x_layer2_fused = x_layer2_orig + (inf_w_8 * scaled_mask_l2)
             else:
-                x_layer2_fused = x_layer2_orig + (inf_w_8 * base_weight)
-            # --- [核心修改 V3 结束] ---
+                x_layer2_fused = x_layer2_orig + (inf_w_8 * self.base_inject_weight)
+            # --- [核心修改 V2 结束] ---
 
         # --- H/16 尺度 ---
         x_layer3_orig = self.layer3(x_layer2_fused)  # (B, 1024, H/16, W/16)
@@ -484,14 +507,14 @@ class Res2Net(nn.Module):
             inf_w_16 = self.inject_conv3(inf_weights[0])  # 256 -> 1024
             inf_w_16 = F.interpolate(inf_w_16, size=x_layer3_orig.shape[2:], mode='bilinear', align_corners=False)
 
-            # --- [核心修改 V3] (基础/增强) 注入逻辑 ---
+            # --- [核心修改 V2] (基础/增强) 注入逻辑 ---
             if haze_mask is not None:
                 mask_l3 = F.interpolate(haze_mask, size=inf_w_16.shape[2:], mode='bilinear', align_corners=False)
-                scaled_mask_l3 = base_weight + (mask_l3 * (1.0 - base_weight))
+                scaled_mask_l3 = self.base_inject_weight + (mask_l3 * (1.0 - self.base_inject_weight))
                 x_layer3_fused = x_layer3_orig + (inf_w_16 * scaled_mask_l3)
             else:
-                x_layer3_fused = x_layer3_orig + (inf_w_16 * base_weight)
-            # --- [核心修改 V3 结束] ---
+                x_layer3_fused = x_layer3_orig + (inf_w_16 * self.base_inject_weight)
+            # --- [核心修改 V2 结束] ---
 
         # [修改] 返回 注入后(fused)的特征（用于解码）和 注入前(orig)的特征（用于蒸馏）
         fused_outputs = [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0]
@@ -957,12 +980,12 @@ class ChannelAttentionFusion(nn.Module):
 # --- [新增结束] ---
 
 
+# --- 修改后的 VIFNetInconsistencyTeacher 模型 ---
 class VIFNetInconsistencyTeacher(nn.Module):
     """
     [修改后] 双流教师模型，采用“两阶段精炼”架构。
     阶段一：使用 VIFnet 轻量级模块提取结构特征。
     阶段二：使用 Res2Net 重量级模块进行去雾精炼。
-    *** [修改V3]：新增 setter 方法以支持灵活测试 ***
     """
 
     def __init__(self, res_blocks=18):
@@ -1000,7 +1023,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
         try:
             res2net101_full = Pre_Res2Net(Bottle2neck, [3, 4, 23, 3], baseWidth=26, scale=4)
             # [请注意]：请确保你本地 'D:/...' 路径下存在此文件
-            pretrained_path = '/root/CoA-main_v10_yuanyu_v6/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
+            pretrained_path = '/root/CoA-main_v10_Sup3_canny/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
             if not os.path.exists(pretrained_path):
                 raise FileNotFoundError(f"预训练权重文件未找到: {pretrained_path}")
             res2net101_full.load_state_dict(torch.load(pretrained_path, map_location='cpu'), strict=False)
@@ -1047,7 +1070,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
             # (与可见光流加载方式相同)
             res2net101_full_ir = Pre_Res2Net(Bottle2neck, [3, 4, 23, 3], baseWidth=26, scale=4)
             # [请注意]：请确保你本地 'D:/...' 路径下存在此文件
-            pretrained_path_ir = '/root/CoA-main_v10_yuanyu_v6/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
+            pretrained_path_ir = '/root/CoA-main_v10_Sup3_canny/model/imagenet_model/res2net101_v1b_26w_4s-0812c246.pth'
             if not os.path.exists(pretrained_path_ir):
                 raise FileNotFoundError(f"预训练权重文件未找到: {pretrained_path_ir}")
             res2net101_full_ir.load_state_dict(torch.load(pretrained_path_ir, map_location='cpu'), strict=False)
@@ -1084,10 +1107,15 @@ class VIFNetInconsistencyTeacher(nn.Module):
         self.fusion_1_ir = Decoder_MDCBlock1(8, 5, mode='iter2')
         # --- [保留 IR 流结束] ---
 
-        # --- [修改] 使用 CBAM (AttentionFusionBlock) 进行最终融合 ---
-        self.final_fusion = AttentionFusionBlock(channel=16)
+        # --- [修改] 移除 final_fusion 并调整 conv_output ---
+        # self.final_fusion = ChannelAttentionFusion(in_channels=16, reduction=4, out_channels=32)
+
+        # [修改] conv_output 现在直接接收来自 vis_features 的 16 个通道
         self.conv_output = ConvLayer(16, 3, kernel_size=3, stride=1)
         # --- [修改结束] ---
+
+    # --- [删除] _process_vis_decoder 和 _process_ir_stream ---
+    # (这两个函数的功能将被内联并重构到新的 forward 方法中)
 
     # --- [重写] forward 方法 ---
     def forward(self, x_vis, x_ir, haze_mask=None):
@@ -1122,7 +1150,6 @@ class VIFNetInconsistencyTeacher(nn.Module):
         # --- 阶段四：精炼编码与注入（Pass 2 - A 模块）---
         # (这部分保留，包含掩码逻辑)
         # 4a. 运行 Pass 2 Encoder (代码库 A) 并进行串联注入
-        # [修改]：encoder_vis 现在内部处理(随机/可变)注入权重
         fused_outputs, original_outputs = self.encoder_vis(x_vis, inf_weight_list, haze_mask)
 
         # (fused_outputs)  [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0]
@@ -1259,31 +1286,16 @@ class VIFNetInconsistencyTeacher(nn.Module):
         ir_features = torch.cat((x_1_ir, x_2_ir), dim=1)  # (16 通道)
         # --- [保留 IR 流解码器结束] ---
 
-        # 5d. [修改] 执行最终的 CBAM 特征融合 (使用 AttentionFusionBlock)
-        fused_features = self.final_fusion(vis_features, ir_features)  # (B, 16, H, W)
+        # 5d. [修改] 移除最终融合，直接从 vis_features 输出
 
-        # 5e. 使用融合后的特征生成最终图像
-        output = self.conv_output(fused_features)  # (16 -> 3)
+        # (fused_attended_features 和 final_fusion 调用已被移除)
+        # (ir_features_to_fuse 的掩码逻辑也被移除，因为不再需要融合)
+
+        output = self.conv_output(vis_features)  # [修改] (16 -> 3)
         # --- [修改结束] ---
 
         # [修改] 返回融合前的特征用于计算新损失
         return output, vis_h_features, vis_features, ir_features
-
-    # --- [新增] Setter 方法 (用于外部调用) ---
-    def set_base_inject_weight(self, weight):
-        """
-        在评估(inference)时设置基础注入权重 (用于薄雾区域)。
-        这个权重会传递给内部的 Res2Net 编码器。
-        """
-        print(f"[模型信息] VIFNetInconsistencyTeacher: 基础注入权重被设置为 {weight}")
-        # 设置可见光流的权重
-        if hasattr(self, 'encoder_vis') and hasattr(self.encoder_vis, 'set_base_inject_weight'):
-            self.encoder_vis.set_base_inject_weight(weight)
-
-        # (保持一致性，也设置红外流的)
-        if hasattr(self, 'encoder_ir') and hasattr(self.encoder_ir, 'set_base_inject_weight'):
-            self.encoder_ir.set_base_inject_weight(weight)
-    # --- [新增结束] ---
 
 
 # --- 主函数测试部分 (保持不变) ---

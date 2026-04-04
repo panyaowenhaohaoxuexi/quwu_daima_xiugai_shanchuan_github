@@ -30,8 +30,8 @@ parser.add_argument('--w_loss_Edge', default=0.3, type=float, help='weight of IR
 
 parser.add_argument('--exp_dir', type=str, default='./experiment')
 parser.add_argument('--model_name', type=str, default='THaze')
-parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v6/EMA_xunlian/saved_model')
-parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v6/EMA_xunlian/saved_data')
+parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/xunlian_EMA/saved_model')
+parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/xunlian_EMA/saved_data')
 parser.add_argument('--dataset', type=str, default='EMA')
 
 # --- [新增] 训练期间的真实世界测试集路径 ---
