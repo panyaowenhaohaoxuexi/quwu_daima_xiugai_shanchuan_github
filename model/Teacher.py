@@ -19,53 +19,140 @@ def f(x, y):
     return (1 - x) * (1 - y) + 1 / 2 * x * y
 
 
-def compute_raw_structure_energy(x):
-    """Compute raw (unnormalized) local structure energy with channel-wise Sobel filters."""
-    C = x.shape[1]
+def compute_haze_density(x_vis_01):
+    """Estimate per-pixel haze density from VIS physical cues.
+
+    Three signals that correlate with haze:
+      1. Brightness — haze scatters light, making hazy regions brighter
+      2. Saturation — haze desaturates colors
+      3. Local contrast — haze flattens local texture variance
+
+    H = brightness * (1 - saturation) * (1 - local_contrast)
+    Higher H -> denser haze.
+    """
+    # 1. Luminance (BT.601)
+    L = 0.299 * x_vis_01[:, 0:1, :, :] + \
+        0.587 * x_vis_01[:, 1:2, :, :] + \
+        0.114 * x_vis_01[:, 2:3, :, :]
+
+    # 2. Saturation (1 - min(R,G,B) / max(R,G,B))
+    max_rgb = x_vis_01.max(dim=1, keepdim=True)[0]
+    min_rgb = x_vis_01.min(dim=1, keepdim=True)[0]
+    S = 1.0 - min_rgb / (max_rgb + 1e-6)
+
+    # 3. Local contrast (local std of luminance, kernel=15)
+    kernel_size = 15
+    padding = kernel_size // 2
+    kernel = torch.ones(1, 1, kernel_size, kernel_size,
+                        device=x_vis_01.device,
+                        dtype=x_vis_01.dtype) / (kernel_size ** 2)
+    L_mean = F.conv2d(L, kernel, padding=padding)
+    L_sq_mean = F.conv2d(L ** 2, kernel, padding=padding)
+    C = torch.sqrt((L_sq_mean - L_mean ** 2).clamp(min=0) + 1e-6)
+
+    # 4. Joint haze density
+    H = L * (1.0 - S) * (1.0 - C)
+
+    # 5. Per-image min-max normalize to [0, 1]
+    B = H.shape[0]
+    flat = H.view(B, -1)
+    min_val = flat.min(dim=1)[0].view(B, 1, 1, 1)
+    max_val = flat.max(dim=1)[0].view(B, 1, 1, 1)
+    H = (H - min_val) / (max_val - min_val + 1e-6)
+
+    return H  # (B, 1, H, W), higher = denser haze
+
+
+def compute_ir_structure(x_ir):
+    """Compute per-pixel IR local structure energy, normalized to [0, 1].
+
+    Same Sobel-gradient pipeline as the old compute_raw_structure_energy,
+    but with per-image min-max normalization appended so the output is
+    directly usable as a spatial calibration map.
+    """
+    C = x_ir.shape[1]
     sobel_x = torch.tensor(
         [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-        dtype=x.dtype, device=x.device
+        dtype=x_ir.dtype, device=x_ir.device
     ).view(1, 1, 3, 3)
     sobel_y = torch.tensor(
         [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-        dtype=x.dtype, device=x.device
+        dtype=x_ir.dtype, device=x_ir.device
     ).view(1, 1, 3, 3)
     sobel_x_mc = sobel_x.repeat(C, 1, 1, 1)
     sobel_y_mc = sobel_y.repeat(C, 1, 1, 1)
-    Ix = F.conv2d(x, sobel_x_mc, padding=1, groups=C)
-    Iy = F.conv2d(x, sobel_y_mc, padding=1, groups=C)
+    Ix = F.conv2d(x_ir, sobel_x_mc, padding=1, groups=C)
+    Iy = F.conv2d(x_ir, sobel_y_mc, padding=1, groups=C)
     grad_energy = (Ix ** 2 + Iy ** 2).mean(dim=1, keepdim=True)
 
     radius = 3
     kernel_size = 7
-    coords = torch.arange(kernel_size, device=x.device, dtype=x.dtype) - radius
+    coords = torch.arange(kernel_size, device=x_ir.device,
+                          dtype=x_ir.dtype) - radius
     sigma = 1.5
     kernel = torch.exp(-(coords.view(kernel_size, 1) ** 2 +
                          coords.view(1, kernel_size) ** 2) / (2 * sigma ** 2))
     kernel = kernel / (kernel.sum() + 1e-6)
     kernel = kernel.view(1, 1, kernel_size, kernel_size)
-    return F.conv2d(grad_energy, kernel, padding=radius)  # raw energy, no normalization
+    E_ir = F.conv2d(grad_energy, kernel, padding=radius)
+
+    # Per-image min-max normalize
+    B = E_ir.shape[0]
+    flat = E_ir.view(B, -1)
+    min_val = flat.min(dim=1)[0].view(B, 1, 1, 1)
+    max_val = flat.max(dim=1)[0].view(B, 1, 1, 1)
+    return (E_ir - min_val) / (max_val - min_val + 1e-6)
 
 
-def compute_structure_energy_pair(x_ir, x_vis_01):
-    """Compute jointly-normalized IR and VIS structure energies and their difference.
+def compute_sky_mask(x_ir, percentile=10.0):
+    """Detect flat regions (sky / open ground) from IR gradient energy.
 
-    Joint normalization uses max(raw_ir, raw_vis) as denominator so that
-    E_ir and E_vis share the same scale — making E_diff physically meaningful.
+    Low IR structure energy -> flat, featureless surface -> likely sky.
+    Uses a percentile-based threshold.
+
+    Args:
+        x_ir: (B,3,H,W) CLIP-normalized IR image
+        percentile: float in [3, 20], lower % = stricter sky detection
+
+    Returns:
+        sky_mask: (B,1,H,W), 1 = flat region to exclude, 0 = keep
     """
-    E_ir_raw = compute_raw_structure_energy(x_ir)
-    E_vis_raw = compute_raw_structure_energy(x_vis_01)
+    C = x_ir.shape[1]
+    sobel_x = torch.tensor(
+        [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+        dtype=x_ir.dtype, device=x_ir.device
+    ).view(1, 1, 3, 3)
+    sobel_y = torch.tensor(
+        [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+        dtype=x_ir.dtype, device=x_ir.device
+    ).view(1, 1, 3, 3)
+    sobel_x_mc = sobel_x.repeat(C, 1, 1, 1)
+    sobel_y_mc = sobel_y.repeat(C, 1, 1, 1)
+    Ix = F.conv2d(x_ir, sobel_x_mc, padding=1, groups=C)
+    Iy = F.conv2d(x_ir, sobel_y_mc, padding=1, groups=C)
+    grad_energy = (Ix ** 2 + Iy ** 2).mean(dim=1, keepdim=True)
 
+    # Gaussian smooth
+    radius = 3
+    kernel_size = 7
+    coords = torch.arange(kernel_size, device=x_ir.device,
+                          dtype=x_ir.dtype) - radius
+    sigma = 1.5
+    kernel = torch.exp(-(coords.view(kernel_size, 1) ** 2 +
+                         coords.view(1, kernel_size) ** 2) / (2 * sigma ** 2))
+    kernel = kernel / (kernel.sum() + 1e-6)
+    kernel = kernel.view(1, 1, kernel_size, kernel_size)
+    E_ir_raw = F.conv2d(grad_energy, kernel, padding=radius)
+
+    # Percentile threshold
     B = E_ir_raw.shape[0]
-    ir_max = E_ir_raw.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1)
-    vis_max = E_vis_raw.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1)
-    joint_max = torch.max(ir_max, vis_max) + 1e-6
+    flat = E_ir_raw.view(B, -1)
+    k = max(1, int(flat.shape[1] * percentile / 100.0))
+    threshold = flat.kthvalue(k, dim=1)[0].view(B, 1, 1, 1).detach()
 
-    E_ir = E_ir_raw / joint_max   # [0, 1], same scale as E_vis
-    E_vis = E_vis_raw / joint_max  # [0, 1], same scale as E_ir
-    E_diff = (E_ir - E_vis).clamp(-1, 1)
+    sky_mask = (E_ir_raw < threshold).float()
 
-    return E_ir, E_vis, E_diff
+    return sky_mask  # (B,1,H,W), 1=flat sky to exclude
 
 
 def differentiable_otsu(q_complete, num_bins=256, delta=0.02, temperature=0.01):
@@ -1064,7 +1151,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
         self.q_vis_refine = nn.Sequential(
-            nn.Conv2d(7, 16, kernel_size=3, padding=1),
+            nn.Conv2d(5, 16, kernel_size=3, padding=1),
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 16, kernel_size=3, padding=1),
@@ -1073,6 +1160,8 @@ class VIFNetInconsistencyTeacher(nn.Module):
             nn.Conv2d(16, 1, kernel_size=1),
             nn.Sigmoid()
         )
+
+        self.sky_percentile = nn.Parameter(torch.tensor(10.0))
 
         # --- [新增] 阶段一 (Pass 1) 模块 (来自代码库 B) ---
         # VIFnet (代码库 B) 默认 n_feat=64
@@ -1215,9 +1304,15 @@ class VIFNetInconsistencyTeacher(nn.Module):
             ).view(1, 3, 1, 1)
             x_vis_01 = (x_vis * clip_std + clip_mean).clamp(0, 1)
 
-            e_ir, e_vis, e_diff = compute_structure_energy_pair(x_ir, x_vis_01)
+            H = compute_haze_density(x_vis_01)
+            E_ir = compute_ir_structure(x_ir)
 
-            vis_input = torch.cat([e_diff, x_vis_01, x_ir], dim=1)
+            # Sky exclusion: suppress haze density in flat IR regions
+            percentile = self.sky_percentile.clamp(3.0, 20.0).item()
+            sky_mask = compute_sky_mask(x_ir, percentile=percentile)
+            H_calibrated = H * (1.0 - sky_mask)
+
+            vis_input = torch.cat([H_calibrated, E_ir, x_vis_01], dim=1)
             q_vis = self.q_vis_refine(vis_input)
             q_complete = 1.0 - q_vis
             tau = differentiable_otsu(q_complete)
