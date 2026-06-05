@@ -6,9 +6,9 @@ Verification targets:
   Is the newly added haze-aware module actually useful?
 
 Strategy (3 progressive levels):
-  Level 1: Does the physics prior t_hat already distinguish haze regions?  (no training)
-  Level 2: Full pipeline behavior under random weights                       (baseline)
-  Level 3: Can gradients flow back to q_vis_refine / q_ir_estimator?       (trainability)
+  Level 1: Does IR-VIS structure energy contrast distinguish haze regions?  (no training)
+  Level 2: Full pipeline behavior under random weights                      (baseline)
+  Level 3: Can gradients flow back to q_vis_refine?                         (trainability)
 
 Usage:
   python verify_haze_mask.py --vis <hazy_vis.jpg> --ir <infrared.jpg> [--output ./verify_output]
@@ -18,7 +18,6 @@ If no images provided, only Level 3 (gradient flow) runs on synthetic data.
 """
 
 import argparse
-import math
 import os
 import sys
 import io
@@ -43,17 +42,42 @@ from torchvision.transforms import Compose, ToTensor, Normalize
 # 0. Pure functions copied from Teacher.py (fully standalone, no model weights)
 # ============================================================================
 
-def compute_gaussian_blur(x, sigma):
-    """Channel-wise Gaussian blur with a kernel derived from sigma."""
-    radius = int(math.ceil(3 * sigma))
-    kernel_size = 2 * radius + 1
+def compute_structure_energy(x):
+    """Compute normalized local structure energy with channel-wise Sobel filters."""
+    sobel_x = torch.tensor(
+        [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+        dtype=x.dtype,
+        device=x.device
+    ).view(1, 1, 3, 3)
+    sobel_y = torch.tensor(
+        [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+        dtype=x.dtype,
+        device=x.device
+    ).view(1, 1, 3, 3)
+
+    channels = x.shape[1]
+    sobel_x_mc = sobel_x.repeat(channels, 1, 1, 1)
+    sobel_y_mc = sobel_y.repeat(channels, 1, 1, 1)
+    ix = F.conv2d(x, sobel_x_mc, padding=1, groups=channels)
+    iy = F.conv2d(x, sobel_y_mc, padding=1, groups=channels)
+    grad_energy = (ix ** 2 + iy ** 2).mean(dim=1, keepdim=True)
+
+    radius = 3
+    kernel_size = 7
     coords = torch.arange(kernel_size, device=x.device, dtype=x.dtype) - radius
     yy = coords.view(kernel_size, 1)
     xx = coords.view(1, kernel_size)
+    sigma = 1.5
     kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
     kernel = kernel / (kernel.sum() + 1e-6)
-    kernel = kernel.view(1, 1, kernel_size, kernel_size).repeat(x.shape[1], 1, 1, 1)
-    return F.conv2d(x, kernel, padding=radius, groups=x.shape[1])
+    kernel = kernel.view(1, 1, kernel_size, kernel_size)
+    structure_energy = F.conv2d(grad_energy, kernel, padding=radius)
+
+    batch = structure_energy.shape[0]
+    flat = structure_energy.view(batch, -1)
+    min_val = flat.min(dim=1)[0].view(batch, 1, 1, 1)
+    max_val = flat.max(dim=1)[0].view(batch, 1, 1, 1)
+    return (structure_energy - min_val) / (max_val - min_val + 1e-6)
 
 
 def differentiable_otsu(q_complete, num_bins=256, delta=0.02, temperature=0.01):
@@ -89,36 +113,14 @@ def f_inconsistency(x, y):
 # ============================================================================
 
 class QVisRefine(nn.Module):
-    """VIS quality estimator: 10ch -> 1ch."""
+    """VIS quality estimator: 7ch -> 1ch."""
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(10, 16, kernel_size=3, padding=1),
+            nn.Conv2d(7, 16, kernel_size=3, padding=1),
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, kernel_size=1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class QIrEstimator(nn.Module):
-    """IR quality estimator: 3ch -> 1ch, with dilated convolutions for larger receptive field."""
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=2, dilation=2),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=4, dilation=4),
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 1, kernel_size=1),
@@ -135,14 +137,12 @@ class HazeMaskEstimator(nn.Module):
 
     Components:
       - q_vis_refine: VIS pixel quality (learnable CNN)
-      - q_ir_estimator: IR pixel quality (learnable CNN)
-      - t_hat: physics-based transmittance (non-learnable, pure math)
+      - E_ir/E_vis/E_diff: structure-energy contrast (non-learnable, pure math)
       - Differentiable Otsu + STE binarization (non-learnable)
     """
     def __init__(self):
         super().__init__()
         self.q_vis_refine = QVisRefine()
-        self.q_ir_estimator = QIrEstimator()
 
         # CLIP normalization params (from CLIP training)
         self.register_buffer(
@@ -168,25 +168,19 @@ class HazeMaskEstimator(nn.Module):
         # Step 1: Inverse CLIP normalization -> [0,1]
         x_vis_01 = (x_vis * self.clip_std + self.clip_mean).clamp(0, 1)
 
-        # Step 2: Physics-based transmittance estimation
-        i_low = compute_gaussian_blur(x_vis_01, sigma=3.0)               # low-freq
-        i_high = x_vis_01 - i_low                                         # high-freq
-        a_hat = i_low.mean(dim=[2, 3], keepdim=True)                     # ambient light
-        high_norm = torch.norm(i_high, dim=1, keepdim=True)              # ||high||
-        low_air_norm = torch.norm(i_low - a_hat, dim=1, keepdim=True)    # ||low - ambient||
-        t_hat = high_norm / (high_norm + low_air_norm + 1e-6)            # transmittance
+        # Step 2: IR-VIS local structure energy contrast
+        e_ir = compute_structure_energy(x_ir)
+        e_vis = compute_structure_energy(x_vis_01)
+        e_diff = (e_ir - e_vis).clamp(-1, 1)
 
         # Step 3: Concatenated input -> q_vis_refine
-        vis_input = torch.cat([x_vis_01, i_high, i_low, t_hat], dim=1)  # 10ch
+        vis_input = torch.cat([e_diff, x_vis_01, x_ir], dim=1)             # 7ch
         q_vis = self.q_vis_refine(vis_input)                              # (B,1,H,W)
 
-        # Step 4: q_ir_estimator
-        q_ir = self.q_ir_estimator(x_ir)                                  # (B,1,H,W)
+        # Step 4: VIS failure score with IR structure implicitly encoded
+        q_complete = 1.0 - q_vis
 
-        # Step 5: Combine: VIS is bad AND IR is good
-        q_complete = (1.0 - q_vis) * q_ir
-
-        # Step 6: Differentiable Otsu + STE binarization
+        # Step 5: Differentiable Otsu + STE binarization
         tau = differentiable_otsu(q_complete)
         m_hard = (q_complete >= tau).float()
         m_soft = torch.sigmoid((q_complete - tau) / 0.1)
@@ -195,11 +189,10 @@ class HazeMaskEstimator(nn.Module):
         if return_all:
             return {
                 'x_vis_01': x_vis_01,
-                'i_low': i_low,
-                'i_high': i_high,
-                't_hat': t_hat,
+                'E_ir': e_ir,
+                'E_vis': e_vis,
+                'E_diff': e_diff,
                 'q_vis': q_vis,
-                'q_ir': q_ir,
                 'q_complete': q_complete,
                 'tau': tau,
                 'm_hard': m_hard,
@@ -229,8 +222,8 @@ def build_figure(vis_img, ir_img, intermediates):
     """
     Build master overview figure: 3 rows x 5 columns.
 
-    Row 1: [Input VIS] [Input IR]  [t_hat]   [i_low]     [i_high]
-    Row 2: [q_vis]      [q_ir]     [q_compl] [Otsu Hist]  [m_soft]
+    Row 1: [Input VIS] [Input IR]  [E_ir]    [E_vis]     [E_diff]
+    Row 2: [q_vis]     [q_compl]   [Otsu]    [m_soft]    [blank]
     Row 3: [m_hard]     [haze_mask] [Overlay VIS] [Overlay IR] [Legend]
     """
     fig, axes = plt.subplots(3, 5, figsize=(20, 12))
@@ -239,23 +232,23 @@ def build_figure(vis_img, ir_img, intermediates):
 
     d = intermediates
 
-    # Row 1: Inputs + physics layer
+    # Row 1: Inputs + structure-energy prior
     _imshow(axes[0, 0], vis_img, '1) Input VIS (hazy)')
     _imshow(axes[0, 1], ir_img, '2) Input IR')
-    _imshow(axes[0, 2], d['t_hat'],
-            '3) t_hat Transmittance\n(dark = dense haze, physics-only)', cmap='inferno')
-    _imshow(axes[0, 3], d['i_low'],
-            '4) i_low Low-freq\n(haze base layer)', cmap='gray')
-    _imshow(axes[0, 4], d['i_high'],
-            '5) i_high High-freq\n(texture / edges)', cmap='gray')
+    _imshow(axes[0, 2], d['E_ir'],
+            '3) E_ir Structure Energy\n(bright = rich IR structure)', cmap='inferno')
+    _imshow(axes[0, 3], d['E_vis'],
+            '4) E_vis Structure Energy\n(bright = rich VIS structure)', cmap='inferno')
+    _imshow(axes[0, 4], d['E_diff'],
+            '5) E_diff = E_ir - E_vis\n(bright = IR structure advantage)', cmap='coolwarm')
 
     # Row 2: Quality estimation + combination
     _imshow(axes[1, 0], d['q_vis'], '6) q_vis VIS Quality\n(bright = clear, learnable)', cmap='viridis')
-    _imshow(axes[1, 1], d['q_ir'], '7) q_ir IR Quality\n(bright = strong IR signal, learnable)', cmap='viridis')
-    _imshow(axes[1, 2], d['q_complete'], '8) q_complete\n= (1-q_vis) * q_ir', cmap='hot')
-    _plot_otsu_histogram(axes[1, 3], d['q_complete'], d['tau'],
-                         '9) Otsu Threshold tau\n(soft histogram selection)')
-    _imshow(axes[1, 4], d['m_soft'], '10) m_soft\nSigmoid soft mask', cmap='coolwarm')
+    _imshow(axes[1, 1], d['q_complete'], '7) q_complete\n= 1 - q_vis', cmap='hot')
+    _plot_otsu_histogram(axes[1, 2], d['q_complete'], d['tau'],
+                         '8) Otsu Threshold tau\n(soft histogram selection)')
+    _imshow(axes[1, 3], d['m_soft'], '9) m_soft\nSigmoid soft mask', cmap='coolwarm')
+    axes[1, 4].axis('off')
 
     # Row 3: Final outputs + overlays
     _imshow(axes[2, 0], d['m_hard'], '11) m_hard Binary Mask\n(q >= tau ? 1 : 0)', cmap='gray')
@@ -335,20 +328,20 @@ def _legend(ax, tau):
     text = (
         "LEGEND\n"
         "===================================\n"
-        "t_hat:     Physics transmittance est.\n"
-        "           No training, plug-and-play\n"
+        "E_ir:      IR local structure energy\n"
+        "E_vis:     VIS local structure energy\n"
+        "E_diff:    E_ir - E_vis structure gap\n"
         "q_vis:     VIS pixel quality (learnable)\n"
-        "q_ir:      IR pixel quality (learnable)\n"
-        "q_complete: VIS_bad AND IR_good\n"
+        "q_complete: 1 - q_vis\n"
         "           -> needs IR intervention\n"
         f"Otsu tau:  {tau_val:.4f}\n"
         "haze_mask: STE diff. binary mask\n"
         "===================================\n"
         "VERIFICATION CHECKLIST\n"
-        "1) t_hat: dark in haze, bright in clear?\n"
+        "1) E_diff: bright where IR has more structure?\n"
         "2) haze_mask: marks actual haze regions?\n"
         "3) Random weights: any effect?\n"
-        "   (If yes -> strong physics prior)\n"
+        "   (If yes -> strong structure prior)\n"
         "   (If no  -> training is needed)\n"
         "===================================\n"
         "NEXT STEP\n"
@@ -368,7 +361,7 @@ def verify_gradient_flow(model, x_vis, x_ir):
     Verify that gradients can flow from haze_mask back to learnable params.
 
     Uses the mean of haze_mask as a pseudo-loss, then checks whether
-    q_vis_refine and q_ir_estimator params receive non-zero gradients.
+    q_vis_refine params receive non-zero gradients.
     """
     print("\n" + "=" * 60)
     print("Level 3 — Gradient Flow Verification (Trainability Check)")
@@ -422,12 +415,10 @@ def verify_gradient_flow(model, x_vis, x_ir):
             print(f"\n  {name} mean |grad|: {grad_norm:.6e}")
             break
 
-    # t_hat should NOT have grad_fn (pure math, no parameters)
-    t_hat = intermediates['t_hat']
-    if t_hat.grad_fn is None:
-        print("  t_hat grad_fn: None -> physics branch excluded from backward [OK]")
-    else:
-        print("  t_hat has grad_fn -> physics branch unexpectedly in computation graph")
+    # E_diff is a non-parametric structure prior. It may have a grad_fn because
+    # inputs are tensors, but no learnable parameters live in this branch.
+    e_diff = intermediates['E_diff']
+    print(f"  E_diff.grad_fn: {e_diff.grad_fn}")
 
     # STE working?
     h_grad_fn = haze_mask.grad_fn
@@ -491,42 +482,38 @@ def main():
         vis_np = np.array(vis_pil)
         ir_np = np.array(ir_pil)
 
-        # --- Level 1: Pure physics prior t_hat (no learnable params) ---
+        # --- Level 1: Pure structure-energy prior (no learnable params) ---
         print("\n" + "=" * 60)
-        print("Level 1 — Physics Prior Verification (no training)")
+        print("Level 1 — Structure Energy Prior Verification (no training)")
         print("=" * 60)
-        print("  Computing t_hat (transmittance)... (no neural network involved)")
+        print("  Computing E_ir, E_vis, and E_diff... (no neural network involved)")
 
         with torch.no_grad():
             x_vis_01 = (x_vis * torch.tensor([0.26862954, 0.26130258, 0.27577711],
                                               device=device).view(1, 3, 1, 1) +
                         torch.tensor([0.48145466, 0.4578275, 0.40821073],
                                      device=device).view(1, 3, 1, 1)).clamp(0, 1)
-            i_low = compute_gaussian_blur(x_vis_01, sigma=3.0)
-            i_high = x_vis_01 - i_low
-            a_hat = i_low.mean(dim=[2, 3], keepdim=True)
-            high_norm = torch.norm(i_high, dim=1, keepdim=True)
-            low_air_norm = torch.norm(i_low - a_hat, dim=1, keepdim=True)
-            t_hat = high_norm / (high_norm + low_air_norm + 1e-6)
+            e_ir = compute_structure_energy(x_ir)
+            e_vis = compute_structure_energy(x_vis_01)
+            e_diff = (e_ir - e_vis).clamp(-1, 1)
 
-        t_hat_mean = t_hat.mean().item()
-        t_hat_std = t_hat.std().item()
-        print(f"  t_hat stats:     mean={t_hat_mean:.4f}, std={t_hat_std:.4f}")
-        print(f"  t_hat < 0.2 (dense haze):  {(t_hat < 0.2).float().mean().item() * 100:.1f}%")
-        print(f"  t_hat > 0.8 (clear area):  {(t_hat > 0.8).float().mean().item() * 100:.1f}%")
+        print(f"  E_ir stats:      mean={e_ir.mean().item():.4f}, std={e_ir.std().item():.4f}")
+        print(f"  E_vis stats:     mean={e_vis.mean().item():.4f}, std={e_vis.std().item():.4f}")
+        print(f"  E_diff stats:    mean={e_diff.mean().item():.4f}, std={e_diff.std().item():.4f}")
+        print(f"  E_diff > 0.2 (IR structure advantage): {(e_diff > 0.2).float().mean().item() * 100:.1f}%")
 
-        # Save physics prior result
+        # Save structure prior result
         fig1, axes1 = plt.subplots(1, 4, figsize=(16, 4))
         _imshow(axes1[0], vis_np, 'VIS Hazy Input')
         _imshow(axes1[1], ir_np, 'IR Input')
-        _imshow(axes1[2], t_hat,
-                't_hat Transmittance\n(dark = dense haze, bright = clear)', cmap='inferno')
-        _imshow(axes1[3], i_high.mean(dim=1, keepdim=True),
-                'High-freq Texture Strength\n(dark = hazy, physics quantity)', cmap='gray')
-        fig1.suptitle('Level 1: Physics Prior — t_hat Transmittance (No Training Needed)',
+        _imshow(axes1[2], e_vis,
+                'E_vis Structure Energy\n(bright = rich VIS structure)', cmap='inferno')
+        _imshow(axes1[3], e_diff,
+                'E_diff = E_ir - E_vis\n(bright = IR structure advantage)', cmap='coolwarm')
+        fig1.suptitle('Level 1: Structure Energy Prior (No Training Needed)',
                       fontsize=14, fontweight='bold')
         plt.tight_layout()
-        level1_path = os.path.join(args.output, 'level1_physics_prior.png')
+        level1_path = os.path.join(args.output, 'level1_structure_prior.png')
         fig1.savefig(level1_path, dpi=150, bbox_inches='tight')
         plt.close(fig1)
         print(f"  -> Saved to: {level1_path}")
@@ -535,7 +522,7 @@ def main():
         print("\n" + "=" * 60)
         print("Level 2 — Full Pipeline Verification (Random Weights)")
         print("=" * 60)
-        print("  NOTE: q_vis_refine and q_ir_estimator weights are RANDOM!")
+        print("  NOTE: q_vis_refine weights are RANDOM!")
         print("  This establishes a pre-training baseline.")
         print("  Re-run after training to compare the improvement.")
 
@@ -547,8 +534,6 @@ def main():
 
         print(f"  q_vis stats:       mean={intermediates['q_vis'].mean().item():.4f}, "
               f"std={intermediates['q_vis'].std().item():.4f}")
-        print(f"  q_ir stats:        mean={intermediates['q_ir'].mean().item():.4f}, "
-              f"std={intermediates['q_ir'].std().item():.4f}")
         print(f"  q_complete mean:   {intermediates['q_complete'].mean().item():.4f}")
         print(f"  Otsu tau:          {intermediates['tau'].item():.4f}")
         haze_coverage = intermediates['haze_mask'].mean().item()
@@ -561,7 +546,7 @@ def main():
         print(f"  -> Saved to: {level2_path}")
 
         # Save individual intermediate maps for detailed inspection
-        for key in ['t_hat', 'q_vis', 'q_ir', 'q_complete', 'haze_mask']:
+        for key in ['E_ir', 'E_vis', 'E_diff', 'q_vis', 'q_complete', 'haze_mask']:
             val = intermediates[key]
             np_img = tensor_to_numpy(val)
             save_path = os.path.join(args.output, f'intermediate_{key}.png')
@@ -610,14 +595,14 @@ def main():
 
         left_mask = intermediates['haze_mask'][:, :, :, :W // 2].mean().item()
         right_mask = intermediates['haze_mask'][:, :, :, W // 2:].mean().item()
-        left_t_hat = intermediates['t_hat'][:, :, :, :W // 2].mean().item()
-        right_t_hat = intermediates['t_hat'][:, :, :, W // 2:].mean().item()
-        print(f"  t_hat:       left (clear) = {left_t_hat:.4f}   right (hazy) = {right_t_hat:.4f}")
+        left_e_diff = intermediates['E_diff'][:, :, :, :W // 2].mean().item()
+        right_e_diff = intermediates['E_diff'][:, :, :, W // 2:].mean().item()
+        print(f"  E_diff:     left (clear) = {left_e_diff:.4f}   right (hazy) = {right_e_diff:.4f}")
         print(f"  haze_mask:   left (clear) = {left_mask:.4f}   right (hazy) = {right_mask:.4f}")
-        if right_t_hat < left_t_hat:
-            print("  [OK] t_hat correctly identifies right half as hazier (lower transmittance)")
+        if right_e_diff > left_e_diff:
+            print("  [OK] E_diff marks the right half as having stronger IR structure advantage")
         else:
-            print("  [WARN] t_hat failed to distinguish haze — check synthetic data construction")
+            print("  [WARN] E_diff failed to distinguish the synthetic halves — check synthetic data construction")
 
     # =====================================================================
     # Final summary
@@ -628,16 +613,14 @@ def main():
     print("""
 How to interpret the results:
 
-  Level 1 (t_hat physics prior):
-    - Look at the t_hat map: haze areas should be DARK (low transmittance),
-      clear areas should be BRIGHT.
-    - If this fails -> physics assumptions don't match your data
-      (e.g., haze is uniform or image has no texture variation).
-    - If this succeeds -> physics prior is effective, you have a reliable signal.
+  Level 1 (structure energy prior):
+    - Look at E_ir, E_vis, and E_diff maps.
+    - E_diff should be brighter where IR retains structure that VIS loses.
+    - If this succeeds -> structure contrast is an effective mask prior.
 
   Level 2 (full pipeline, random weights):
-    - q_vis / q_ir with random weights likely output near-uniform noise.
-    - Therefore q_complete and haze_mask are also meaningless random values.
+    - q_vis with random weights likely outputs near-uniform noise.
+    - Therefore q_complete and haze_mask may still be meaningless random values.
     - This does NOT mean the module is useless! It means training is necessary.
     - The key is to re-run this script AFTER training and compare.
 
@@ -648,10 +631,10 @@ How to interpret the results:
 Suggested workflow:
   1. Prepare a few representative hazy+IR image pairs
   2. Run: python verify_haze_mask.py --vis hazy.jpg --ir ir.jpg
-  3. Check level1_physics_prior.png -> confirm t_hat physics prior works
+  3. Check level1_structure_prior.png -> confirm structure prior works
   4. Record level2 random-weight baseline
   5. Train the model (even just a few hundred steps)
-  6. Load trained q_vis_refine / q_ir_estimator weights
+  6. Load trained q_vis_refine weights
   7. Re-run this script -> compare and confirm learning effect
 """)
 

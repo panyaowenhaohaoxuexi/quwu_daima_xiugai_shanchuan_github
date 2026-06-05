@@ -19,17 +19,42 @@ def f(x, y):
     return (1 - x) * (1 - y) + 1 / 2 * x * y
 
 
-def compute_gaussian_blur(x, sigma):
-    """Apply channel-wise Gaussian blur with a kernel derived from sigma."""
-    radius = int(math.ceil(3 * sigma))
-    kernel_size = 2 * radius + 1
+def compute_structure_energy(x):
+    """Compute normalized local structure energy with channel-wise Sobel filters."""
+    sobel_x = torch.tensor(
+        [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+        dtype=x.dtype,
+        device=x.device
+    ).view(1, 1, 3, 3)
+    sobel_y = torch.tensor(
+        [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+        dtype=x.dtype,
+        device=x.device
+    ).view(1, 1, 3, 3)
+
+    channels = x.shape[1]
+    sobel_x_mc = sobel_x.repeat(channels, 1, 1, 1)
+    sobel_y_mc = sobel_y.repeat(channels, 1, 1, 1)
+    ix = F.conv2d(x, sobel_x_mc, padding=1, groups=channels)
+    iy = F.conv2d(x, sobel_y_mc, padding=1, groups=channels)
+    grad_energy = (ix ** 2 + iy ** 2).mean(dim=1, keepdim=True)
+
+    radius = 3
+    kernel_size = 7
     coords = torch.arange(kernel_size, device=x.device, dtype=x.dtype) - radius
     yy = coords.view(kernel_size, 1)
     xx = coords.view(1, kernel_size)
+    sigma = 1.5
     kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
     kernel = kernel / (kernel.sum() + 1e-6)
-    kernel = kernel.view(1, 1, kernel_size, kernel_size).repeat(x.shape[1], 1, 1, 1)
-    return F.conv2d(x, kernel, padding=radius, groups=x.shape[1])
+    kernel = kernel.view(1, 1, kernel_size, kernel_size)
+    structure_energy = F.conv2d(grad_energy, kernel, padding=radius)
+
+    batch = structure_energy.shape[0]
+    flat = structure_energy.view(batch, -1)
+    min_val = flat.min(dim=1)[0].view(batch, 1, 1, 1)
+    max_val = flat.max(dim=1)[0].view(batch, 1, 1, 1)
+    return (structure_energy - min_val) / (max_val - min_val + 1e-6)
 
 
 def differentiable_otsu(q_complete, num_bins=256, delta=0.02, temperature=0.01):
@@ -1028,23 +1053,10 @@ class VIFNetInconsistencyTeacher(nn.Module):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
         self.q_vis_refine = nn.Sequential(
-            nn.Conv2d(10, 16, kernel_size=3, padding=1),
+            nn.Conv2d(7, 16, kernel_size=3, padding=1),
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-        self.q_ir_estimator = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=2, dilation=2),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=4, dilation=4),
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 1, kernel_size=1),
@@ -1192,17 +1204,13 @@ class VIFNetInconsistencyTeacher(nn.Module):
             ).view(1, 3, 1, 1)
             x_vis_01 = (x_vis * clip_std + clip_mean).clamp(0, 1)
 
-            i_low = compute_gaussian_blur(x_vis_01, sigma=3)
-            i_high = x_vis_01 - i_low
-            a_hat = i_low.mean(dim=[2, 3], keepdim=True)
-            high_norm = torch.norm(i_high, dim=1, keepdim=True)
-            low_air_norm = torch.norm(i_low - a_hat, dim=1, keepdim=True)
-            t_hat = high_norm / (high_norm + low_air_norm + 1e-6)
+            e_ir = compute_structure_energy(x_ir)
+            e_vis = compute_structure_energy(x_vis_01)
+            e_diff = (e_ir - e_vis).clamp(-1, 1)
 
-            vis_input = torch.cat([x_vis_01, i_high, i_low, t_hat], dim=1)
+            vis_input = torch.cat([e_diff, x_vis_01, x_ir], dim=1)
             q_vis = self.q_vis_refine(vis_input)
-            q_ir = self.q_ir_estimator(x_ir)
-            q_complete = (1 - q_vis) * q_ir
+            q_complete = 1.0 - q_vis
             tau = differentiable_otsu(q_complete)
             m_hard = (q_complete >= tau).float()
             m_soft = torch.sigmoid((q_complete - tau) / 0.1)
