@@ -19,6 +19,42 @@ def f(x, y):
     return (1 - x) * (1 - y) + 1 / 2 * x * y
 
 
+def compute_gaussian_blur(x, sigma):
+    """Apply channel-wise Gaussian blur with a kernel derived from sigma."""
+    radius = int(math.ceil(3 * sigma))
+    kernel_size = 2 * radius + 1
+    coords = torch.arange(kernel_size, device=x.device, dtype=x.dtype) - radius
+    yy = coords.view(kernel_size, 1)
+    xx = coords.view(1, kernel_size)
+    kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
+    kernel = kernel / (kernel.sum() + 1e-6)
+    kernel = kernel.view(1, 1, kernel_size, kernel_size).repeat(x.shape[1], 1, 1, 1)
+    return F.conv2d(x, kernel, padding=radius, groups=x.shape[1])
+
+
+def differentiable_otsu(q_complete, num_bins=256, delta=0.02, temperature=0.01):
+    """Differentiable Otsu threshold for a batch of single-channel maps."""
+    b = q_complete.shape[0]
+    q = q_complete.reshape(b, -1)
+    bins = torch.linspace(0, 1, num_bins, device=q_complete.device, dtype=q_complete.dtype)
+
+    diff = q.unsqueeze(-1) - bins.view(1, 1, num_bins)
+    hist = torch.exp(-(diff ** 2) / (2 * delta ** 2)).sum(dim=1)
+    hist = hist / (hist.sum(dim=1, keepdim=True) + 1e-6)
+
+    bin_values = bins.view(1, num_bins)
+    p1 = torch.cumsum(hist, dim=1)
+    mu1 = torch.cumsum(hist * bin_values, dim=1)
+    mu_total = mu1[:, -1:]
+    p2 = 1 - p1
+    mu2 = (mu_total - mu1) / (p2 + 1e-6)
+    sigma_b = p1 * p2 * (mu1 / (p1 + 1e-6) - mu2) ** 2
+
+    weights = torch.softmax(sigma_b / temperature, dim=1)
+    tau = (weights * bin_values).sum(dim=1).view(b, 1, 1, 1)
+    return tau
+
+
 # --- 基础模块 (SobelEdgeDetector, Pre_Res2Net, Bottle2neck, Res2Net(3通道输入), ConvBlock, DeconvBlock, Decoder_MDCBlock1, make_dense, RDB, ConvLayer, UpsampleConvLayer, ResidualBlock) ---
 # ... (这些基础模块的代码与上一个版本相同，确保 Res2Net 输入为 3 通道，这里省略以保持简洁) ...
 # --- [修改] 替换 SobelEdgeDetector 为 CannyEdgeDetector ---
@@ -991,6 +1027,30 @@ class VIFNetInconsistencyTeacher(nn.Module):
     def __init__(self, res_blocks=18):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
+        self.q_vis_refine = nn.Sequential(
+            nn.Conv2d(10, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+        self.q_ir_estimator = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=3, padding=2, dilation=2),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=3, padding=4, dilation=4),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+
         # --- [新增] 阶段一 (Pass 1) 模块 (来自代码库 B) ---
         # VIFnet (代码库 B) 默认 n_feat=64
         b_n_feat = 64
@@ -1119,6 +1179,35 @@ class VIFNetInconsistencyTeacher(nn.Module):
 
     # --- [重写] forward 方法 ---
     def forward(self, x_vis, x_ir, haze_mask=None):
+        if haze_mask is None:
+            clip_mean = torch.tensor(
+                [0.48145466, 0.4578275, 0.40821073],
+                device=x_vis.device,
+                dtype=x_vis.dtype
+            ).view(1, 3, 1, 1)
+            clip_std = torch.tensor(
+                [0.26862954, 0.26130258, 0.27577711],
+                device=x_vis.device,
+                dtype=x_vis.dtype
+            ).view(1, 3, 1, 1)
+            x_vis_01 = (x_vis * clip_std + clip_mean).clamp(0, 1)
+
+            i_low = compute_gaussian_blur(x_vis_01, sigma=3)
+            i_high = x_vis_01 - i_low
+            a_hat = i_low.mean(dim=[2, 3], keepdim=True)
+            high_norm = torch.norm(i_high, dim=1, keepdim=True)
+            low_air_norm = torch.norm(i_low - a_hat, dim=1, keepdim=True)
+            t_hat = high_norm / (high_norm + low_air_norm + 1e-6)
+
+            vis_input = torch.cat([x_vis_01, i_high, i_low, t_hat], dim=1)
+            q_vis = self.q_vis_refine(vis_input)
+            q_ir = self.q_ir_estimator(x_ir)
+            q_complete = (1 - q_vis) * q_ir
+            tau = differentiable_otsu(q_complete)
+            m_hard = (q_complete >= tau).float()
+            m_soft = torch.sigmoid((q_complete - tau) / 0.1)
+            haze_mask = m_hard.detach() + m_soft - m_soft.detach()
+
         # --- 阶段一 & 二：并行结构提取 (Pass 1 - B 模块) ---
         # (这部分保留，用于计算不一致性)
         # 1a. VIS 流 (Pass 1) -> DSFE_vis
