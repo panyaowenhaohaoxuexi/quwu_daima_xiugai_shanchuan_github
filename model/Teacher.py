@@ -19,42 +19,53 @@ def f(x, y):
     return (1 - x) * (1 - y) + 1 / 2 * x * y
 
 
-def compute_structure_energy(x):
-    """Compute normalized local structure energy with channel-wise Sobel filters."""
+def compute_raw_structure_energy(x):
+    """Compute raw (unnormalized) local structure energy with channel-wise Sobel filters."""
+    C = x.shape[1]
     sobel_x = torch.tensor(
         [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-        dtype=x.dtype,
-        device=x.device
+        dtype=x.dtype, device=x.device
     ).view(1, 1, 3, 3)
     sobel_y = torch.tensor(
         [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-        dtype=x.dtype,
-        device=x.device
+        dtype=x.dtype, device=x.device
     ).view(1, 1, 3, 3)
-
-    channels = x.shape[1]
-    sobel_x_mc = sobel_x.repeat(channels, 1, 1, 1)
-    sobel_y_mc = sobel_y.repeat(channels, 1, 1, 1)
-    ix = F.conv2d(x, sobel_x_mc, padding=1, groups=channels)
-    iy = F.conv2d(x, sobel_y_mc, padding=1, groups=channels)
-    grad_energy = (ix ** 2 + iy ** 2).mean(dim=1, keepdim=True)
+    sobel_x_mc = sobel_x.repeat(C, 1, 1, 1)
+    sobel_y_mc = sobel_y.repeat(C, 1, 1, 1)
+    Ix = F.conv2d(x, sobel_x_mc, padding=1, groups=C)
+    Iy = F.conv2d(x, sobel_y_mc, padding=1, groups=C)
+    grad_energy = (Ix ** 2 + Iy ** 2).mean(dim=1, keepdim=True)
 
     radius = 3
     kernel_size = 7
     coords = torch.arange(kernel_size, device=x.device, dtype=x.dtype) - radius
-    yy = coords.view(kernel_size, 1)
-    xx = coords.view(1, kernel_size)
     sigma = 1.5
-    kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
+    kernel = torch.exp(-(coords.view(kernel_size, 1) ** 2 +
+                         coords.view(1, kernel_size) ** 2) / (2 * sigma ** 2))
     kernel = kernel / (kernel.sum() + 1e-6)
     kernel = kernel.view(1, 1, kernel_size, kernel_size)
-    structure_energy = F.conv2d(grad_energy, kernel, padding=radius)
+    return F.conv2d(grad_energy, kernel, padding=radius)  # raw energy, no normalization
 
-    batch = structure_energy.shape[0]
-    flat = structure_energy.view(batch, -1)
-    min_val = flat.min(dim=1)[0].view(batch, 1, 1, 1)
-    max_val = flat.max(dim=1)[0].view(batch, 1, 1, 1)
-    return (structure_energy - min_val) / (max_val - min_val + 1e-6)
+
+def compute_structure_energy_pair(x_ir, x_vis_01):
+    """Compute jointly-normalized IR and VIS structure energies and their difference.
+
+    Joint normalization uses max(raw_ir, raw_vis) as denominator so that
+    E_ir and E_vis share the same scale — making E_diff physically meaningful.
+    """
+    E_ir_raw = compute_raw_structure_energy(x_ir)
+    E_vis_raw = compute_raw_structure_energy(x_vis_01)
+
+    B = E_ir_raw.shape[0]
+    ir_max = E_ir_raw.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1)
+    vis_max = E_vis_raw.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1)
+    joint_max = torch.max(ir_max, vis_max) + 1e-6
+
+    E_ir = E_ir_raw / joint_max   # [0, 1], same scale as E_vis
+    E_vis = E_vis_raw / joint_max  # [0, 1], same scale as E_ir
+    E_diff = (E_ir - E_vis).clamp(-1, 1)
+
+    return E_ir, E_vis, E_diff
 
 
 def differentiable_otsu(q_complete, num_bins=256, delta=0.02, temperature=0.01):
@@ -1204,9 +1215,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
             ).view(1, 3, 1, 1)
             x_vis_01 = (x_vis * clip_std + clip_mean).clamp(0, 1)
 
-            e_ir = compute_structure_energy(x_ir)
-            e_vis = compute_structure_energy(x_vis_01)
-            e_diff = (e_ir - e_vis).clamp(-1, 1)
+            e_ir, e_vis, e_diff = compute_structure_energy_pair(x_ir, x_vis_01)
 
             vis_input = torch.cat([e_diff, x_vis_01, x_ir], dim=1)
             q_vis = self.q_vis_refine(vis_input)
