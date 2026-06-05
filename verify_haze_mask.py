@@ -99,7 +99,7 @@ def compute_ir_structure(x_ir):
     return (E_ir - min_val) / (max_val - min_val + 1e-6)
 
 
-def compute_sky_mask(x_ir, percentile=10.0):
+def compute_sky_mask(x_ir):
     B, _, H_s, W_s = x_ir.shape
     y_coords = torch.linspace(0.0, 1.0, H_s, device=x_ir.device, dtype=x_ir.dtype)
     sky_mask = (y_coords < 0.10).view(1, 1, H_s, 1).float().expand(B, 1, H_s, W_s).contiguous()
@@ -157,7 +157,6 @@ class HazeMaskEstimator(nn.Module):
     def __init__(self):
         super().__init__()
         self.q_vis_refine = QVisRefine()
-        self.sky_percentile = nn.Parameter(torch.tensor(10.0))
 
         self.register_buffer(
             'clip_mean',
@@ -176,8 +175,7 @@ class HazeMaskEstimator(nn.Module):
         H = compute_haze_density(x_vis_01)
         E_ir = compute_ir_structure(x_ir)
 
-        percentile = self.sky_percentile.clamp(3.0, 20.0).item()
-        sky_mask = compute_sky_mask(x_ir, percentile=percentile)
+        sky_mask = compute_sky_mask(x_ir)
         H_calibrated = H * (1.0 - sky_mask)
 
         # Step 3: CNN input (5ch: H_calibrated + E_ir + VIS_01)
@@ -275,9 +273,9 @@ def _imshow(ax, img, title, cmap=None):
     if isinstance(img, torch.Tensor):
         img = tensor_to_numpy(img)
     if img.ndim == 3 and img.shape[2] == 3:
-        ax.imshow(img)
+        ax.imshow(img, aspect='auto')
     else:
-        ax.imshow(img, cmap=cmap or 'viridis')
+        ax.imshow(img, cmap=cmap or 'viridis', aspect='auto')
     ax.set_title(title, fontsize=8)
     ax.axis('off')
 
@@ -406,13 +404,9 @@ def verify_gradient_flow(model, x_vis, x_ir):
     if params_without_grad:
         for n in params_without_grad:
             print(f"    - {n}")
-        if params_without_grad == ['sky_percentile']:
-            print("  [OK] sky_percentile has zero gradient by design (threshold.detach()).")
-            print("  => Will be optimized indirectly by the dehazing loss during training.")
-        else:
-            print("  [WARN] Unexpected zero-gradient params — check computation graph.")
+        print("  [WARN] Unexpected zero-gradient params — check computation graph.")
 
-    cnn_params = trainable_params - 1  # exclude sky_percentile
+    cnn_params = trainable_params
     if params_with_grad >= cnn_params:
         print(f"\n  [OK] {params_with_grad}/{cnn_params} CNN params received gradients!")
         print("  => Module is end-to-end trainable.")
@@ -491,7 +485,7 @@ def main():
                                      device=device).view(1, 3, 1, 1)).clamp(0, 1)
             H = compute_haze_density(x_vis_01)
             E_ir = compute_ir_structure(x_ir)
-            sky_mask = compute_sky_mask(x_ir, percentile=10.0)
+            sky_mask = compute_sky_mask(x_ir)
             H_calibrated = H * (1.0 - sky_mask)
 
         sky_coverage = sky_mask.mean().item() * 100
@@ -608,7 +602,6 @@ How to interpret the results:
 
   Level 3 (gradient flow):
     - CNN params should receive gradients -> trainable.
-    - sky_percentile has zero gradient by design (threshold.detach()).
 
 Suggested workflow:
   1. python verify_haze_mask.py --vis hazy.jpg --ir ir.jpg

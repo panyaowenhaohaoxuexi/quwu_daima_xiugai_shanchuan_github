@@ -104,7 +104,7 @@ def compute_ir_structure(x_ir):
     return (E_ir - min_val) / (max_val - min_val + 1e-6)
 
 
-def compute_sky_mask(x_ir, percentile=10.0):
+def compute_sky_mask(x_ir):
     B, _, H_s, W_s = x_ir.shape
     y_coords = torch.linspace(0.0, 1.0, H_s, device=x_ir.device, dtype=x_ir.dtype)
     sky_mask = (y_coords < 0.10).view(1, 1, H_s, 1).float().expand(B, 1, H_s, W_s).contiguous()
@@ -1117,7 +1117,6 @@ class VIFNetInconsistencyTeacher(nn.Module):
             nn.Sigmoid()
         )
 
-        self.sky_percentile = nn.Parameter(torch.tensor(10.0))
 
         # --- [新增] 阶段一 (Pass 1) 模块 (来自代码库 B) ---
         # VIFnet (代码库 B) 默认 n_feat=64
@@ -1264,8 +1263,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
             E_ir = compute_ir_structure(x_ir)
 
             # Sky exclusion: suppress haze density in flat IR regions
-            percentile = self.sky_percentile.clamp(3.0, 20.0).item()
-            sky_mask = compute_sky_mask(x_ir, percentile=percentile)
+            sky_mask = compute_sky_mask(x_ir)
             H_calibrated = H * (1.0 - sky_mask)
 
             vis_input = torch.cat([H_calibrated, E_ir, x_vis_01], dim=1)
