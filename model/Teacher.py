@@ -106,9 +106,7 @@ def compute_ir_structure(x_ir):
 
 def compute_sky_mask(x_ir):
     B, _, H_s, W_s = x_ir.shape
-    y_coords = torch.linspace(0.0, 1.0, H_s, device=x_ir.device, dtype=x_ir.dtype)
-    sky_mask = (y_coords < 0.10).view(1, 1, H_s, 1).float().expand(B, 1, H_s, W_s).contiguous()
-    return sky_mask
+    return torch.zeros(B, 1, H_s, W_s, device=x_ir.device, dtype=x_ir.dtype)
 
 
 def differentiable_otsu(q_complete, num_bins=256, delta=0.02, temperature=0.01):

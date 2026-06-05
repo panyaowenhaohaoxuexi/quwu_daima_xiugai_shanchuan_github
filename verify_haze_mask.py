@@ -101,9 +101,7 @@ def compute_ir_structure(x_ir):
 
 def compute_sky_mask(x_ir):
     B, _, H_s, W_s = x_ir.shape
-    y_coords = torch.linspace(0.0, 1.0, H_s, device=x_ir.device, dtype=x_ir.dtype)
-    sky_mask = (y_coords < 0.10).view(1, 1, H_s, 1).float().expand(B, 1, H_s, W_s).contiguous()
-    return sky_mask
+    return torch.zeros(B, 1, H_s, W_s, device=x_ir.device, dtype=x_ir.dtype)
 
 
 def differentiable_otsu(q_complete, num_bins=256, delta=0.02, temperature=0.01):
@@ -235,6 +233,7 @@ def build_figure(vis_img, ir_img, intermediates):
     fig, axes = plt.subplots(3, 5, figsize=(20, 12))
     fig.suptitle('Haze Mask Auto-Estimation — Full Intermediate Variable Overview',
                  fontsize=16, fontweight='bold')
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.93, bottom=0.02, hspace=0.35, wspace=0.15)
 
     d = intermediates
 
@@ -264,7 +263,6 @@ def build_figure(vis_img, ir_img, intermediates):
     _overlay(axes[2, 3], ir_img, d['haze_mask'], '13) Mask Overlay on IR\n(red = needs IR help)')
     _legend(axes[2, 4], d['tau'])
 
-    plt.tight_layout()
     return fig
 
 
@@ -275,8 +273,8 @@ def _imshow(ax, img, title, cmap=None):
     if img.ndim == 3 and img.shape[2] == 3:
         ax.imshow(img, aspect='auto')
     else:
-        ax.imshow(img, cmap=cmap or 'viridis', aspect='auto')
-    ax.set_title(title, fontsize=8)
+        im = ax.imshow(img, cmap=cmap or 'viridis', aspect='auto')
+    ax.set_title(title, fontsize=8, pad=3)
     ax.axis('off')
 
 
@@ -502,9 +500,9 @@ def main():
                 'sky_mask (IR flat regions)\n(white = excluded)', cmap='gray')
         _imshow(axes1[3], H_calibrated,
                 'H_calibrated = H*(1-sky)\n(sky regions suppressed)', cmap='inferno')
-        fig1.suptitle('Level 1: Haze-Density Prior + Sky Exclusion (No Training)',
+        fig1.suptitle('Level 1: Cross-Modal Haze Prior + Sky Exclusion (No Training)',
                       fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        fig1.subplots_adjust(left=0.02, right=0.98, top=0.85, bottom=0.05, wspace=0.1)
         level1_path = os.path.join(args.output, 'level1_haze_density_prior.png')
         fig1.savefig(level1_path, dpi=150, bbox_inches='tight')
         plt.close(fig1)
