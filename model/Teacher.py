@@ -19,47 +19,48 @@ def f(x, y):
     return (1 - x) * (1 - y) + 1 / 2 * x * y
 
 
-def compute_vis_ir_haze_prior(x_vis_01, x_ir):
-    def _gradient_magnitude(img):
-        gray = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-                                dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-                                dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
-        Gx = F.conv2d(gray, sobel_x, padding=1)
-        Gy = F.conv2d(gray, sobel_y, padding=1)
-        return torch.sqrt(Gx ** 2 + Gy ** 2 + 1e-6)
+def compute_haze_density(x_vis_01):
+    """Estimate per-pixel haze density from VIS physical cues.
 
-    clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073],
-                              device=x_ir.device, dtype=x_ir.dtype).view(1, 3, 1, 1)
-    clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711],
-                             device=x_ir.device, dtype=x_ir.dtype).view(1, 3, 1, 1)
-    x_ir_01 = (x_ir * clip_std + clip_mean).clamp(0, 1)
+    Three signals that correlate with haze:
+      1. Brightness — haze scatters light, making hazy regions brighter
+      2. Saturation — haze desaturates colors
+      3. Local contrast — haze flattens local texture variance
 
-    grad_vis = _gradient_magnitude(x_vis_01)
-    grad_ir = _gradient_magnitude(x_ir_01)
+    H = brightness * (1 - saturation) * (1 - local_contrast)
+    Higher H -> denser haze.
+    """
+    # 1. Luminance (BT.601)
+    L = 0.299 * x_vis_01[:, 0:1, :, :] + \
+        0.587 * x_vis_01[:, 1:2, :, :] + \
+        0.114 * x_vis_01[:, 2:3, :, :]
 
-    smooth_k = torch.ones(1, 1, 7, 7, device=x_vis_01.device, dtype=x_vis_01.dtype) / 49.0
-    grad_vis_sm = F.conv2d(grad_vis, smooth_k, padding=3)
-    grad_ir_sm = F.conv2d(grad_ir, smooth_k, padding=3)
+    # 2. Saturation (1 - min(R,G,B) / max(R,G,B))
+    max_rgb = x_vis_01.max(dim=1, keepdim=True)[0]
+    min_rgb = x_vis_01.min(dim=1, keepdim=True)[0]
+    S = 1.0 - min_rgb / (max_rgb + 1e-6)
 
-    gap = F.relu(grad_ir_sm - grad_vis_sm)
-
-    L = 0.299 * x_vis_01[:, 0:1] + 0.587 * x_vis_01[:, 1:2] + 0.114 * x_vis_01[:, 2:3]
-    kernel = torch.ones(1, 1, 15, 15, device=x_vis_01.device, dtype=x_vis_01.dtype) / 225.0
-    L_mean = F.conv2d(L, kernel, padding=7)
-    L_sq_mean = F.conv2d(L ** 2, kernel, padding=7)
+    # 3. Local contrast (local std of luminance, kernel=15)
+    kernel_size = 15
+    padding = kernel_size // 2
+    kernel = torch.ones(1, 1, kernel_size, kernel_size,
+                        device=x_vis_01.device,
+                        dtype=x_vis_01.dtype) / (kernel_size ** 2)
+    L_mean = F.conv2d(L, kernel, padding=padding)
+    L_sq_mean = F.conv2d(L ** 2, kernel, padding=padding)
     C = torch.sqrt((L_sq_mean - L_mean ** 2).clamp(min=0) + 1e-6)
-    vis_flat = F.relu(0.3 - C)
 
-    haze_prior = gap * (1.0 + vis_flat)
+    # 4. Joint haze density
+    H = L * (1.0 - S) * (1.0 - C)
 
-    B = haze_prior.shape[0]
-    flat = haze_prior.view(B, -1)
-    min_v = flat.min(dim=1)[0].view(B, 1, 1, 1)
-    max_v = flat.max(dim=1)[0].view(B, 1, 1, 1)
-    haze_prior = (haze_prior - min_v) / (max_v - min_v + 1e-6)
-    return haze_prior
+    # 5. Per-image min-max normalize to [0, 1]
+    B = H.shape[0]
+    flat = H.view(B, -1)
+    min_val = flat.min(dim=1)[0].view(B, 1, 1, 1)
+    max_val = flat.max(dim=1)[0].view(B, 1, 1, 1)
+    H = (H - min_val) / (max_val - min_val + 1e-6)
+
+    return H  # (B, 1, H, W), higher = denser haze
 
 
 def compute_ir_structure(x_ir):
@@ -104,37 +105,9 @@ def compute_ir_structure(x_ir):
 
 
 def compute_sky_mask(x_ir, percentile=10.0):
-    C = x_ir.shape[1]
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-                            dtype=x_ir.dtype, device=x_ir.device).view(1, 1, 3, 3)
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-                            dtype=x_ir.dtype, device=x_ir.device).view(1, 1, 3, 3)
-    sobel_x_mc = sobel_x.repeat(C, 1, 1, 1)
-    sobel_y_mc = sobel_y.repeat(C, 1, 1, 1)
-    Ix = F.conv2d(x_ir, sobel_x_mc, padding=1, groups=C)
-    Iy = F.conv2d(x_ir, sobel_y_mc, padding=1, groups=C)
-    grad_energy = (Ix ** 2 + Iy ** 2).mean(dim=1, keepdim=True)
-
-    radius = 7
-    kernel_size = 15
-    coords = torch.arange(kernel_size, device=x_ir.device, dtype=x_ir.dtype) - radius
-    sigma = 3.0
-    kernel = torch.exp(-(coords.view(kernel_size, 1) ** 2 +
-                         coords.view(1, kernel_size) ** 2) / (2 * sigma ** 2))
-    kernel = kernel / (kernel.sum() + 1e-6)
-    kernel = kernel.view(1, 1, kernel_size, kernel_size)
-    E_ir_raw = F.conv2d(grad_energy, kernel, padding=radius)
-
-    B = E_ir_raw.shape[0]
-    flat = E_ir_raw.view(B, -1)
-    k = max(1, int(flat.shape[1] * percentile / 100.0))
-    threshold = flat.kthvalue(k, dim=1)[0].view(B, 1, 1, 1).detach()
-    sky_raw = (E_ir_raw < threshold).float()
-
-    dilate_k = torch.ones(1, 1, 9, 9, device=x_ir.device, dtype=x_ir.dtype)
-    sky_dilated = F.conv2d(sky_raw, dilate_k, padding=4)
-    sky_mask = (sky_dilated > 0.4 * 81).float()
-
+    B, _, H_s, W_s = x_ir.shape
+    y_coords = torch.linspace(0.0, 1.0, H_s, device=x_ir.device, dtype=x_ir.dtype)
+    sky_mask = (y_coords < 0.10).view(1, 1, H_s, 1).float().expand(B, 1, H_s, W_s).contiguous()
     return sky_mask
 
 
@@ -1287,15 +1260,15 @@ class VIFNetInconsistencyTeacher(nn.Module):
             ).view(1, 3, 1, 1)
             x_vis_01 = (x_vis * clip_std + clip_mean).clamp(0, 1)
 
-            haze_prior = compute_vis_ir_haze_prior(x_vis_01, x_ir)
+            H = compute_haze_density(x_vis_01)
             E_ir = compute_ir_structure(x_ir)
 
             # Sky exclusion: suppress haze density in flat IR regions
             percentile = self.sky_percentile.clamp(3.0, 20.0).item()
             sky_mask = compute_sky_mask(x_ir, percentile=percentile)
-            haze_prior_calibrated = haze_prior * (1.0 - sky_mask)
+            H_calibrated = H * (1.0 - sky_mask)
 
-            vis_input = torch.cat([haze_prior_calibrated, E_ir, x_vis_01], dim=1)
+            vis_input = torch.cat([H_calibrated, E_ir, x_vis_01], dim=1)
             q_vis = self.q_vis_refine(vis_input)
             q_complete = 1.0 - q_vis
             tau = differentiable_otsu(q_complete)
