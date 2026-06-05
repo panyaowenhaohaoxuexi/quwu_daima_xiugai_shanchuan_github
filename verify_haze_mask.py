@@ -32,37 +32,47 @@ from torchvision.transforms import Compose, ToTensor, Normalize
 # 0. Pure functions — identical to Teacher.py
 # ============================================================================
 
-def compute_haze_density(x_vis_01):
-    """Estimate per-pixel haze density from VIS physical cues.
+def compute_vis_ir_haze_prior(x_vis_01, x_ir):
+    def _gradient_magnitude(img):
+        gray = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                                dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                                dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
+        Gx = F.conv2d(gray, sobel_x, padding=1)
+        Gy = F.conv2d(gray, sobel_y, padding=1)
+        return torch.sqrt(Gx ** 2 + Gy ** 2 + 1e-6)
 
-    H = brightness * (1 - saturation) * (1 - local_contrast)
-    Higher H -> denser haze.
-    """
-    L = 0.299 * x_vis_01[:, 0:1, :, :] + \
-        0.587 * x_vis_01[:, 1:2, :, :] + \
-        0.114 * x_vis_01[:, 2:3, :, :]
+    clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073],
+                              device=x_ir.device, dtype=x_ir.dtype).view(1, 3, 1, 1)
+    clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711],
+                             device=x_ir.device, dtype=x_ir.dtype).view(1, 3, 1, 1)
+    x_ir_01 = (x_ir * clip_std + clip_mean).clamp(0, 1)
 
-    max_rgb = x_vis_01.max(dim=1, keepdim=True)[0]
-    min_rgb = x_vis_01.min(dim=1, keepdim=True)[0]
-    S = 1.0 - min_rgb / (max_rgb + 1e-6)
+    grad_vis = _gradient_magnitude(x_vis_01)
+    grad_ir = _gradient_magnitude(x_ir_01)
 
-    kernel_size = 15
-    padding = kernel_size // 2
-    kernel = torch.ones(1, 1, kernel_size, kernel_size,
-                        device=x_vis_01.device,
-                        dtype=x_vis_01.dtype) / (kernel_size ** 2)
-    L_mean = F.conv2d(L, kernel, padding=padding)
-    L_sq_mean = F.conv2d(L ** 2, kernel, padding=padding)
+    smooth_k = torch.ones(1, 1, 7, 7, device=x_vis_01.device, dtype=x_vis_01.dtype) / 49.0
+    grad_vis_sm = F.conv2d(grad_vis, smooth_k, padding=3)
+    grad_ir_sm = F.conv2d(grad_ir, smooth_k, padding=3)
+
+    gap = F.relu(grad_ir_sm - grad_vis_sm)
+
+    L = 0.299 * x_vis_01[:, 0:1] + 0.587 * x_vis_01[:, 1:2] + 0.114 * x_vis_01[:, 2:3]
+    kernel = torch.ones(1, 1, 15, 15, device=x_vis_01.device, dtype=x_vis_01.dtype) / 225.0
+    L_mean = F.conv2d(L, kernel, padding=7)
+    L_sq_mean = F.conv2d(L ** 2, kernel, padding=7)
     C = torch.sqrt((L_sq_mean - L_mean ** 2).clamp(min=0) + 1e-6)
+    vis_flat = F.relu(0.3 - C)
 
-    H = L * (1.0 - S) * (1.0 - C)
+    haze_prior = gap * (1.0 + vis_flat)
 
-    B = H.shape[0]
-    flat = H.view(B, -1)
-    min_val = flat.min(dim=1)[0].view(B, 1, 1, 1)
-    max_val = flat.max(dim=1)[0].view(B, 1, 1, 1)
-    H = (H - min_val) / (max_val - min_val + 1e-6)
-    return H
+    B = haze_prior.shape[0]
+    flat = haze_prior.view(B, -1)
+    min_v = flat.min(dim=1)[0].view(B, 1, 1, 1)
+    max_v = flat.max(dim=1)[0].view(B, 1, 1, 1)
+    haze_prior = (haze_prior - min_v) / (max_v - min_v + 1e-6)
+    return haze_prior
 
 
 def compute_ir_structure(x_ir):
@@ -100,26 +110,21 @@ def compute_ir_structure(x_ir):
 
 
 def compute_sky_mask(x_ir, percentile=10.0):
-    """Detect flat regions (sky / open ground) from IR gradient energy."""
     C = x_ir.shape[1]
-    sobel_x = torch.tensor(
-        [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-        dtype=x_ir.dtype, device=x_ir.device
-    ).view(1, 1, 3, 3)
-    sobel_y = torch.tensor(
-        [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-        dtype=x_ir.dtype, device=x_ir.device
-    ).view(1, 1, 3, 3)
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                            dtype=x_ir.dtype, device=x_ir.device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                            dtype=x_ir.dtype, device=x_ir.device).view(1, 1, 3, 3)
     sobel_x_mc = sobel_x.repeat(C, 1, 1, 1)
     sobel_y_mc = sobel_y.repeat(C, 1, 1, 1)
     Ix = F.conv2d(x_ir, sobel_x_mc, padding=1, groups=C)
     Iy = F.conv2d(x_ir, sobel_y_mc, padding=1, groups=C)
     grad_energy = (Ix ** 2 + Iy ** 2).mean(dim=1, keepdim=True)
 
-    radius = 3
-    kernel_size = 7
+    radius = 7
+    kernel_size = 15
     coords = torch.arange(kernel_size, device=x_ir.device, dtype=x_ir.dtype) - radius
-    sigma = 1.5
+    sigma = 3.0
     kernel = torch.exp(-(coords.view(kernel_size, 1) ** 2 +
                          coords.view(1, kernel_size) ** 2) / (2 * sigma ** 2))
     kernel = kernel / (kernel.sum() + 1e-6)
@@ -130,8 +135,13 @@ def compute_sky_mask(x_ir, percentile=10.0):
     flat = E_ir_raw.view(B, -1)
     k = max(1, int(flat.shape[1] * percentile / 100.0))
     threshold = flat.kthvalue(k, dim=1)[0].view(B, 1, 1, 1).detach()
+    sky_raw = (E_ir_raw < threshold).float()
 
-    return (E_ir_raw < threshold).float()
+    dilate_k = torch.ones(1, 1, 9, 9, device=x_ir.device, dtype=x_ir.dtype)
+    sky_dilated = F.conv2d(sky_raw, dilate_k, padding=4)
+    sky_mask = (sky_dilated > 0.4 * 81).float()
+
+    return sky_mask
 
 
 def differentiable_otsu(q_complete, num_bins=256, delta=0.02, temperature=0.01):
@@ -200,16 +210,16 @@ class HazeMaskEstimator(nn.Module):
         # Step 1: Inverse CLIP normalization -> [0,1]
         x_vis_01 = (x_vis * self.clip_std + self.clip_mean).clamp(0, 1)
 
-        # Step 2: Haze density + IR structure + sky exclusion
-        H = compute_haze_density(x_vis_01)
+        # Step 2: Haze prior + IR structure + sky exclusion
+        haze_prior = compute_vis_ir_haze_prior(x_vis_01, x_ir)
         E_ir = compute_ir_structure(x_ir)
 
         percentile = self.sky_percentile.clamp(3.0, 20.0).item()
         sky_mask = compute_sky_mask(x_ir, percentile=percentile)
-        H_calibrated = H * (1.0 - sky_mask)
+        haze_prior_calibrated = haze_prior * (1.0 - sky_mask)
 
-        # Step 3: CNN input (5ch: H_calibrated + E_ir + VIS_01)
-        vis_input = torch.cat([H_calibrated, E_ir, x_vis_01], dim=1)
+        # Step 3: CNN input (5ch: haze_prior_calibrated + E_ir + VIS_01)
+        vis_input = torch.cat([haze_prior_calibrated, E_ir, x_vis_01], dim=1)
         q_vis = self.q_vis_refine(vis_input)
 
         # Step 4: VIS failure score
@@ -224,11 +234,11 @@ class HazeMaskEstimator(nn.Module):
         if return_all:
             return {
                 'x_vis_01': x_vis_01,
-                'H': H,
+                'haze_prior': haze_prior,
                 'sky_mask': sky_mask,
-                'H_calibrated': H_calibrated,
+                'haze_prior_calibrated': haze_prior_calibrated,
                 'E_ir': E_ir,
-                'H_x_E_ir': H_calibrated * E_ir,
+                'haze_prior_x_E_ir': haze_prior_calibrated * E_ir,
                 'q_vis': q_vis,
                 'q_complete': q_complete,
                 'tau': tau,
@@ -258,7 +268,7 @@ def tensor_to_numpy(t, squeeze_ch=True):
 def build_figure(vis_img, ir_img, intermediates):
     """Build master overview figure: 3 rows x 5 columns.
 
-    Row 1: [Input VIS] [H]       [sky_mask] [H_calibr] [E_ir]
+    Row 1: [Input VIS] [haze_prior] [sky_mask] [haze_prior_calibr] [E_ir]
     Row 2: [q_vis]     [q_compl] [Otsu]     [m_soft]   [blank]
     Row 3: [m_hard]    [haze_mask] [Overlay VIS] [Overlay IR] [Legend]
     """
@@ -268,14 +278,14 @@ def build_figure(vis_img, ir_img, intermediates):
 
     d = intermediates
 
-    # Row 1: Inputs + haze-density prior + sky exclusion
+    # Row 1: Inputs + haze prior + sky exclusion
     _imshow(axes[0, 0], vis_img, '1) Input VIS (hazy)')
-    _imshow(axes[0, 1], d['H'],
-            '2) H Haze Density\n(bright = dense haze)', cmap='inferno')
+    _imshow(axes[0, 1], d['haze_prior'],
+            '2) haze_prior\n(bright = dense haze)', cmap='inferno')
     _imshow(axes[0, 2], d['sky_mask'],
             '3) sky_mask (IR flat)\n(white = excluded)', cmap='gray')
-    _imshow(axes[0, 3], d['H_calibrated'],
-            '4) H_calibrated = H*(1-sky)\n(sky regions suppressed)', cmap='inferno')
+    _imshow(axes[0, 3], d['haze_prior_calibrated'],
+            '4) haze_prior_calibrated\n= haze_prior*(1-sky)', cmap='inferno')
     _imshow(axes[0, 4], d['E_ir'],
             '5) E_ir IR Structure\n(bright = rich IR structure)', cmap='inferno')
 
@@ -365,11 +375,11 @@ def _legend(ax, tau):
     text = (
         "LEGEND\n"
         "===================================\n"
-        "H:         VIS haze density (brightness\n"
-        "           * (1-saturation) * (1-contrast))\n"
-        "sky_mask:  IR flat-region mask\n"
-        "           (1=sky to exclude)\n"
-        "H_calibr:  H * (1 - sky_mask)\n"
+        "haze_prior: cross-modal haze prior\n"
+        "           grad_IR - grad_VIS (ReLU)\n"
+        "sky_mask:   IR flat-region mask\n"
+        "            (1=sky to exclude)\n"
+        "haze_p_cal: haze_prior*(1-sky_mask)\n"
         "           sky areas suppressed\n"
         "E_ir:      IR local structure energy\n"
         "q_vis:     VIS pixel quality (learnable)\n"
@@ -451,8 +461,8 @@ def verify_gradient_flow(model, x_vis, x_ir):
             print(f"\n  {name} mean |grad|: {grad_norm:.6e}")
             break
 
-    H = intermediates['H']
-    print(f"  H.grad_fn: {H.grad_fn}")
+    haze_prior = intermediates['haze_prior']
+    print(f"  haze_prior.grad_fn: {haze_prior.grad_fn}")
 
     h_grad_fn = haze_mask.grad_fn
     print(f"  haze_mask.grad_fn: {h_grad_fn}")
@@ -510,33 +520,33 @@ def main():
         print("\n" + "=" * 60)
         print("Level 1 — Haze Density Prior Verification (no training)")
         print("=" * 60)
-        print("  Computing H, sky_mask, H_calibrated, and E_ir... (no neural network)")
+        print("  Computing haze_prior, sky_mask, haze_prior_calibrated, and E_ir... (no neural network)")
 
         with torch.no_grad():
             x_vis_01 = (x_vis * torch.tensor([0.26862954, 0.26130258, 0.27577711],
                                               device=device).view(1, 3, 1, 1) +
                         torch.tensor([0.48145466, 0.4578275, 0.40821073],
                                      device=device).view(1, 3, 1, 1)).clamp(0, 1)
-            H = compute_haze_density(x_vis_01)
+            haze_prior = compute_vis_ir_haze_prior(x_vis_01, x_ir)
             E_ir = compute_ir_structure(x_ir)
             sky_mask = compute_sky_mask(x_ir, percentile=10.0)
-            H_calibrated = H * (1.0 - sky_mask)
+            haze_prior_calibrated = haze_prior * (1.0 - sky_mask)
 
         sky_coverage = sky_mask.mean().item() * 100
-        print(f"  H stats:                mean={H.mean().item():.4f}, std={H.std().item():.4f}")
-        print(f"  sky_mask coverage:      {sky_coverage:.1f}%")
-        print(f"  H_calibrated stats:     mean={H_calibrated.mean().item():.4f}, "
-              f"std={H_calibrated.std().item():.4f}")
-        print(f"  E_ir stats:             mean={E_ir.mean().item():.4f}, std={E_ir.std().item():.4f}")
+        print(f"  haze_prior stats:                mean={haze_prior.mean().item():.4f}, std={haze_prior.std().item():.4f}")
+        print(f"  sky_mask coverage:                {sky_coverage:.1f}%")
+        print(f"  haze_prior_calibrated stats:      mean={haze_prior_calibrated.mean().item():.4f}, "
+              f"std={haze_prior_calibrated.std().item():.4f}")
+        print(f"  E_ir stats:                       mean={E_ir.mean().item():.4f}, std={E_ir.std().item():.4f}")
 
         fig1, axes1 = plt.subplots(1, 4, figsize=(16, 4))
         _imshow(axes1[0], vis_np, 'VIS Hazy Input')
-        _imshow(axes1[1], H, 'H Haze Density\n(bright = dense haze)', cmap='inferno')
+        _imshow(axes1[1], haze_prior, 'haze_prior\n(bright = dense haze)', cmap='inferno')
         _imshow(axes1[2], sky_mask,
                 'sky_mask (IR flat regions)\n(white = excluded)', cmap='gray')
-        _imshow(axes1[3], H_calibrated,
-                'H_calibrated = H*(1-sky)\n(sky regions suppressed)', cmap='inferno')
-        fig1.suptitle('Level 1: Haze-Density Prior + Sky Exclusion (No Training)',
+        _imshow(axes1[3], haze_prior_calibrated,
+                'haze_prior_calibrated\n= haze_prior*(1-sky)', cmap='inferno')
+        fig1.suptitle('Level 1: Cross-Modal Haze Prior + Sky Exclusion (No Training)',
                       fontsize=14, fontweight='bold')
         plt.tight_layout()
         level1_path = os.path.join(args.output, 'level1_haze_density_prior.png')
@@ -570,7 +580,7 @@ def main():
         plt.close(fig2)
         print(f"  -> Saved to: {level2_path}")
 
-        for key in ['H', 'sky_mask', 'H_calibrated', 'E_ir', 'q_vis', 'q_complete', 'haze_mask']:
+        for key in ['haze_prior', 'sky_mask', 'haze_prior_calibrated', 'E_ir', 'q_vis', 'q_complete', 'haze_mask']:
             val = intermediates[key]
             np_img = tensor_to_numpy(val)
             save_path = os.path.join(args.output, f'intermediate_{key}.png')
@@ -609,14 +619,14 @@ def main():
 
         left_mask = intermediates['haze_mask'][:, :, :, :W // 2].mean().item()
         right_mask = intermediates['haze_mask'][:, :, :, W // 2:].mean().item()
-        left_H = intermediates['H'][:, :, :, :W // 2].mean().item()
-        right_H = intermediates['H'][:, :, :, W // 2:].mean().item()
-        print(f"  H (haze density):  left (clear) = {left_H:.4f}   right (hazy) = {right_H:.4f}")
+        left_haze_prior = intermediates['haze_prior'][:, :, :, :W // 2].mean().item()
+        right_haze_prior = intermediates['haze_prior'][:, :, :, W // 2:].mean().item()
+        print(f"  haze_prior:        left (clear) = {left_haze_prior:.4f}   right (hazy) = {right_haze_prior:.4f}")
         print(f"  haze_mask:         left (clear) = {left_mask:.4f}   right (hazy) = {right_mask:.4f}")
-        if right_H > left_H:
-            print("  [OK] H correctly identifies right half as hazier")
+        if right_haze_prior > left_haze_prior:
+            print("  [OK] haze_prior correctly identifies right half as hazier")
         else:
-            print("  [WARN] H failed to distinguish — check synthetic data construction")
+            print("  [WARN] haze_prior failed to distinguish — check synthetic data construction")
 
     print("\n" + "=" * 60)
     print("VERIFICATION SUMMARY")
@@ -625,9 +635,9 @@ def main():
 How to interpret the results:
 
   Level 1 (haze density prior):
-    - H should be bright where haze is dense.
+    - haze_prior should be bright where haze is dense.
     - sky_mask marks flat IR regions (white = excluded).
-    - H_calibrated = H with sky areas suppressed.
+    - haze_prior_calibrated = haze_prior with sky areas suppressed.
 
   Level 2 (full pipeline, random weights):
     - q_vis with random weights outputs near-uniform noise.
@@ -640,7 +650,7 @@ How to interpret the results:
 
 Suggested workflow:
   1. python verify_haze_mask.py --vis hazy.jpg --ir ir.jpg
-  2. Check level1_haze_density_prior.png -> confirm H, sky_mask, H_calibrated
+  2. Check level1_haze_density_prior.png -> confirm haze_prior, sky_mask, haze_prior_calibrated
   3. Train the model (even just a few hundred steps)
   4. Load trained q_vis_refine weights and re-run to compare
 """)

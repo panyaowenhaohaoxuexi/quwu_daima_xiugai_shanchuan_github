@@ -1,1 +1,50 @@
 深入理解这个代码库，忽略fig、jiaoben文件夹。这是一个做去雾的代码库，深入理解它的网络结构。
+
+Replace structure-energy prior with haze-density prior — Plan
+Context
+The current IR-VIS structure energy contrast approach (Sobel on both images, joint normalization, E_diff) has two weaknesses:
+
+1. E_diff = E_ir - E_vis can be noisy when both IR and VIS are low-texture (e.g., flat sky). False positives.
+2. Requires computing structure energy on IR, which is an indirect proxy. Haze is a property of the VIS image.
+The new approach derives haze density directly from VIS physical cues (brightness, saturation, local contrast), using IR structure only as a spatial calibration signal to suppress sky false positives.
+Files to modify
+1. `model/Teacher.py` — 4 edit sites
+A) Lines 22-57 — Delete `compute_raw_structure_energy` + `compute_structure_energy_pair`. Add two new functions:
+
+* `compute_haze_density(x_vis_01)`: Brightness × (1-Saturation) × (1-local_contrast) → per-image min-max normalize → (B,1,H,W). High value = dense haze.
+* `compute_ir_structure(x_ir)`: Sobel gradient energy → Gaussian smooth → per-image min-max normalize → (B,1,H,W). Same core as old `compute_raw_structure_energy` but with normalization appended.
+B) Line ~1055 — `q_vis_refine` input channels: 7 → 5
+C) Lines 1207-1217 — Replace HAPM block:
+
+```python
+H = compute_haze_density(x_vis_01)
+E_ir = compute_ir_structure(x_ir)
+vis_input = torch.cat([H, E_ir, x_vis_01], dim=1)  # 5ch
+q_vis = self.q_vis_refine(vis_input)
+q_complete = 1.0 - q_vis
+tau = differentiable_otsu(q_complete)
+m_hard = (q_complete >= tau).float()
+m_soft = torch.sigmoid((q_complete - tau) / 0.1)
+haze_mask = m_hard.detach() + m_soft - m_soft.detach()
+
+```
+
+2. `verify_haze_mask.py` — 5 edit sites
+A) Replace `compute_raw_structure_energy` + `compute_structure_energy_pair` with `compute_haze_density` + `compute_ir_structure`
+B) `QVisRefine`: 7 → 5 input channels
+C) `HazeMaskEstimator.forward`: use new functions, return_all dict replace E_vis/E_diff with H/E_ir
+D) Level 1 verification block: display H, E_ir, H*E_ir
+E) `build_figure`: update column layout for new intermediates
+What does NOT change
+
+* `differentiable_otsu`, STE binarization, `forward()` signature
+* Everything after haze_mask generation (Pass 1/2, inf_weights, decoder, IR stream)
+* `HazeMaskEstimator` class structure, `QVisRefine` (except channel count)
+Verification
+
+```bash
+python verify_haze_mask.py --vis ".../REAL_FOGGY/hazy/00896.png" --ir ".../REAL_FOGGY/ir/00896.png"
+
+```
+
+Expected: H (haze density) shows bright areas where haze is dense; E_ir shows IR structure for calibration; gradient flow 10/10 passes.
