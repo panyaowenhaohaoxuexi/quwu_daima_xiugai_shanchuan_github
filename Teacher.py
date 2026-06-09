@@ -179,7 +179,7 @@ def dehaze(model, vis_image_path, ir_image_path, mask_image_path, folder):
 
 # --- [新增结束] ---
 # --- [修改] run_real_world_test 函数，使其查找并传递掩码 ---
-def run_real_world_test(model, epoch, hazy_dir, ir_dir, output_root_dir):
+def run_real_world_test(model, epoch, hazy_dir, ir_dir):
     """
     在指定的真实（无标签）数据集上运行推理。
     (此版本已更新，支持掩码加载)
@@ -209,9 +209,7 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir, output_root_dir):
     # --- [新增结束] ---
 
     # 1. 设置输出目录
-    output_folder = os.path.join(output_root_dir,
-                                 '/root/autodl-tmp/Sup3_canny/train_test/Teacher_guocheng_test',
-                                 f'epoch_{epoch}')
+    output_folder = os.path.join(opt.real_test_output_dir, f'epoch_{epoch}')
     os.makedirs(output_folder, exist_ok=True)
     print(f"\n正在对真实世界图像运行推理 (Epoch {epoch}) -> 保存至 {output_folder}")
 
@@ -276,17 +274,6 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
     psnrs = []
     loader_train_iter = iter(loader_train)
 
-    # ---- 固定可视化样本（每轮看同一批图，便于跨 epoch 比较）----
-    _vis_sample, _ir_sample = None, None
-    try:
-        _sample_iter = iter(loader_train)
-        _sample_batch = next(_sample_iter)
-        _vis_sample = _sample_batch[0][:4]   # 固定取前4张
-        _ir_sample  = _sample_batch[1][:4]
-        del _sample_iter, _sample_batch
-    except Exception as e:
-        print(f"[mask_vis] 无法预取可视化样本: {e}")
-    # -------------------------------------------------------
 
     for step in range(start_step + 1, steps + 1):
         teacher_net.train()
@@ -475,19 +462,44 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             except Exception as e:
                 print(f"\n错误: 保存 losses.npy 失败: {e}")
 
-            # ---- Epoch 结束：保存掩码可视化 ----
-            if _vis_sample is not None and _ir_sample is not None:
+            # ---- Epoch 结束：保存掩码可视化 (使用用户指定文件夹的图像) ----
+            mask_vis_dir = opt.real_test_specific_hazy_dir if opt.real_test_specific_hazy_dir else opt.real_test_hazy_path
+            if mask_vis_dir and os.path.isdir(mask_vis_dir):
                 try:
-                    epoch_idx = step // steps_per_epoch
-                    visualize_epoch_mask(
-                        model      = teacher_net,
-                        vis_batch  = _vis_sample,
-                        ir_batch   = _ir_sample,
-                        epoch      = epoch_idx,
-                        save_dir   = opt.saved_data_dir,
-                        n_samples  = min(4, _vis_sample.shape[0]),
-                        device     = opt.device
-                    )
+                    # 加载指定文件夹的前4张图像
+                    vis_images = sorted(glob.glob(os.path.join(mask_vis_dir, '*.jpg')) +
+                                        glob.glob(os.path.join(mask_vis_dir, '*.png')) +
+                                        glob.glob(os.path.join(mask_vis_dir, '*.jpeg')))
+                    if vis_images:
+                        vis_tensors = []
+                        ir_tensors = []
+                        for img_path in vis_images[:4]:
+                            vis_tensor = transform(Image.open(img_path).convert("RGB"))
+                            vis_tensors.append(vis_tensor)
+                            # 找对应的红外图
+                            base_name = os.path.basename(img_path)
+                            ir_path = os.path.join(opt.real_test_ir_path, base_name)
+                            if os.path.exists(ir_path):
+                                ir_tensor = transform(Image.open(ir_path).convert("RGB"))
+                            else:
+                                # 没有红外图就用可见光图占位
+                                ir_tensor = vis_tensor.clone()
+                            ir_tensors.append(ir_tensor)
+
+                        vis_batch = torch.stack(vis_tensors)  # (N, 3, H, W)
+                        ir_batch = torch.stack(ir_tensors)
+                        epoch_idx = step // steps_per_epoch
+                        visualize_epoch_mask(
+                            model      = teacher_net,
+                            vis_batch  = vis_batch,
+                            ir_batch   = ir_batch,
+                            epoch      = epoch_idx,
+                            save_dir   = opt.saved_data_dir,
+                            n_samples  = vis_batch.shape[0],
+                            device     = opt.device
+                        )
+                    else:
+                        print(f"\n[mask_vis] 在 {mask_vis_dir} 中未找到图像，跳过。")
                 except Exception as e:
                     print(f"\n[mask_vis] 可视化失败，跳过: {e}")
             # ----------------------------------------
@@ -560,13 +572,13 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
                 print(f"\n错误: 保存模型权重失败 (epoch {current_epoch}): {e}")
 
             # --- [新增] 调用真实世界测试 ---
-            # (使用刚保存的 teacher_net 模型在真实数据上运行推理)
+            # (使用刚保存的 teacher_net 模型在真实数据上运行推理，输出到 opt.real_test_output_dir)
+            hazy_source = opt.real_test_specific_hazy_dir if opt.real_test_specific_hazy_dir else opt.real_test_hazy_path
             run_real_world_test(
                 teacher_net,
                 current_epoch,
-                opt.real_test_hazy_path,
-                opt.real_test_ir_path,
-                opt.saved_data_dir  # 将输出保存在 saved_data_dir/real_world_outputs/
+                hazy_source,
+                opt.real_test_ir_path
             )
             # --- [新增结束] ---
 
@@ -719,8 +731,8 @@ if __name__ == "__main__":
 
     # --- [修改] 数据集路径和实例化 ---
     # !! 请将下面的路径修改为你实际的数据集路径 !!
-    train_base_dir = '/root/autodl-tmp/FLIR_zengqiang/train'  # 训练集根目录
-    test_base_dir = '/root/autodl-tmp/FLIR_zengqiang/test'  # 测试集根目录
+    train_base_dir = opt.train_data_dir  # 训练集根目录
+    test_base_dir = opt.test_data_dir  # 测试集根目录
 
     # 训练数据集路径
     hazy_vis_folder = os.path.join(train_base_dir, 'hazy')

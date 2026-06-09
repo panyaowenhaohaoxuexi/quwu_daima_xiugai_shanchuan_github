@@ -59,27 +59,61 @@ parser.add_argument('--boundary_lambda_edge', default=10.0, type=float, help='ed
 
 # --- 3. 定义文件和目录相关的参数 ---
 
-# 定义实验结果的根目录
-parser.add_argument('--exp_dir', type=str, default='./experiment')
-# 定义当前模型的名称
-parser.add_argument('--model_name', type=str, default='THaze')
-# 定义保存模型的子目录名称
-parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/Sup3_canny/Teacher_xunlian/saved_model')
-# 定义保存数据（如日志、损失）的子目录名称
-parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/Sup3_canny/Teacher_xunlian/saved_data')
-# 定义数据集名称（用于构建目录结构）
-parser.add_argument('--dataset', type=str, default='Teacher')
+# =========================================
+# 【模型与日志保存路径】
+# =========================================
+parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/Sup3_canny/Teacher_xunlian/saved_model',
+                    help='模型权重(.pth)保存目录')
+parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/Sup3_canny/Teacher_xunlian/saved_data',
+                    help='训练日志(log.txt)、损失(losses.npy)、指标(ssims.npy/psnrs.npy)保存目录')
 
-# --- [新增] 训练期间的真实世界测试集路径 ---
-# (请在运行时指定这些路径，或在此处设置你的默认值)
-parser.add_argument('--real_test_hazy_path', type=str, default="/root/autodl-tmp/dense_haze/hazy",
-                    help='Path to real-world hazy images (e.g., ./real_test/hazy)')
-parser.add_argument('--real_test_ir_path', type=str, default="/root/autodl-tmp/dense_haze/ir",
-                    help='Path to real-world ir images (e.g., ./real_test/ir)')
-# --- [新增] 掩码图路径 (可选) ---
-parser.add_argument('--real_test_mask_path', type=str, default="/root/autodl-tmp/dense_haze/mask",
-                    help='Path to real-world haze masks (optional)')
-# --- [新增结束] ---
+# =========================================
+# 【训练数据集路径】 (有雾图 + 红外图 + 清晰图GT)
+#   子目录结构: train_data_dir/hazy/, ir/, clear/
+# =========================================
+parser.add_argument('--train_data_dir', type=str, default='/root/autodl-tmp/FLIR_zengqiang/train',
+                    help='训练集根目录，内含 hazy/ ir/ clear/ 三个子文件夹')
+
+# =========================================
+# 【验证/测试数据集路径】 (有雾图 + 红外图 + 清晰图GT)
+#   子目录结构: test_data_dir/hazy/, ir/, clear/
+# =========================================
+parser.add_argument('--test_data_dir', type=str, default='/root/autodl-tmp/FLIR_zengqiang/test',
+                    help='测试集根目录，内含 hazy/ ir/ clear/ 三个子文件夹')
+
+# =========================================
+# 【训练中真实世界推理 — 输入路径】
+#   推理时，对 hazy 文件夹里每张图，按文件名去 ir/ 和 mask/ 找对应文件
+# =========================================
+# 有雾可见光图像 (主要输入)
+parser.add_argument('--real_test_hazy_path', type=str, default='/root/autodl-tmp/dense_haze/hazy',
+                    help='真实测试用有雾可见光图像文件夹')
+# 红外图像 (辅助输入，与 hazy 图像同名)
+parser.add_argument('--real_test_ir_path', type=str, default='/root/autodl-tmp/dense_haze/ir',
+                    help='真实测试用红外图像文件夹')
+# 掩码图 (可选，同名灰度图，标注雾区。留空则不使用掩码)
+parser.add_argument('--real_test_mask_path', type=str, default='/root/autodl-tmp/dense_haze/mask',
+                    help='真实测试用掩码图像文件夹（可选，留空则模型自动估计雾区）')
+# 指定要进行推理的图像文件夹 (替换 real_test_hazy_path，留空则使用默认)
+parser.add_argument('--real_test_specific_hazy_dir', type=str, default='',
+                    help='指定要推理的图像文件夹，替换 real_test_hazy_path（留空则使用默认）')
+
+# =========================================
+# 【训练中真实世界推理 — 输出路径】
+# =========================================
+parser.add_argument('--real_test_output_dir', type=str,
+                    default='/root/autodl-tmp/Sup3_canny/train_test/Teacher_guocheng_test',
+                    help='真实测试去雾结果输出根目录，结果保存在 epoch_N/ 子文件夹下')
+
+# =========================================
+# 【实验记录路径】 (args.txt 配置存档，与训练无关)
+# =========================================
+parser.add_argument('--exp_dir', type=str, default='./experiment',
+                    help='实验记录根目录')
+parser.add_argument('--model_name', type=str, default='THaze',
+                    help='模型名称，用于构建实验子目录')
+parser.add_argument('--dataset', type=str, default='Teacher',
+                    help='数据集名称，用于构建实验子目录')
 
 # --- 4. 解析参数并设置设备 ---
 
@@ -87,27 +121,18 @@ opt = parser.parse_args()  # 解析命令行传入的参数
 # 自动检测设备：如果 CUDA 可用，则使用 'cuda'，否则使用 'cpu'
 opt.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# --- 5. 构建实验目录结构 ---
+# --- 5. 创建保存目录 ---
 
-# 构建特定数据集的目录路径 (例如 ./experiment/Teacher)
-dataset_dir = os.path.join(opt.exp_dir, opt.dataset)
-# 构建特定模型的目录路径 (例如 ./experiment/Teacher/THaze)
-model_dir = os.path.join(dataset_dir, opt.model_name)
-
-# 自动创建不存在的目录
-if not os.path.exists(opt.exp_dir):
-    os.mkdir(opt.exp_dir)  # 创建 ./experiment
-if not os.path.exists(dataset_dir):
-    os.mkdir(dataset_dir)  # 创建 ./experiment/Teacher
-if not os.path.exists(model_dir):
-    os.mkdir(model_dir)  # 创建 ./experiment/Teacher/THaze
-    # 更新 opt 对象中的路径，使其指向新建的模型目录
-    opt.saved_model_dir = os.path.join(model_dir, 'saved_model')
-    opt.saved_data_dir = os.path.join(model_dir, 'saved_data')
-    os.mkdir(opt.saved_model_dir)  # 创建 ./experiment/Teacher/THaze/saved_model
-    os.mkdir(opt.saved_data_dir)  # 创建 ./experiment/Teacher/THaze/saved_data
+# 使用默认定义的路径，直接创建 saved_model 和 saved_data 目录
+os.makedirs(opt.saved_model_dir, exist_ok=True)
+os.makedirs(opt.saved_data_dir, exist_ok=True)
 
 # --- 6. 保存配置参数 ---
+
+# 构建实验目录用于保存 args.txt
+dataset_dir = os.path.join(opt.exp_dir, opt.dataset)
+model_dir = os.path.join(dataset_dir, opt.model_name)
+os.makedirs(model_dir, exist_ok=True)
 
 # 将所有配置参数 (opt 对象) 保存为 JSON 格式的文本文件
 with open(os.path.join(model_dir, 'args.txt'), 'w') as f:
