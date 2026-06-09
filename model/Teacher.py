@@ -10,6 +10,9 @@ from collections import OrderedDict
 from .vifnet_basic_modules import Encoder_B, Decoder_B, Conv_B, CPAB
 from .dsfe import DSFE
 from torchvision.ops import DeformConv2d
+from CLIP.clip_surgery_model import CLIPSurgery, VisionTransformer as SurgeryVisionTransformer
+from CLIP.clip import load as clip_load
+import types
 
 
 # --- [修改结束] ---
@@ -1104,19 +1107,28 @@ class ChannelAttentionFusion(nn.Module):
 
 class RegionColorRestorer(nn.Module):
     """
-    区域颜色恢复模块。
+    双源颜色恢复模块（Dual-Source Region Color Restorer）。
 
-    动机：区域补全范式中，浓雾区域的编码器特征被 IR 完全替换，
-    导致该区域无颜色信息。本模块通过 Cross-Attention 机制，
-    让补全区域（Query）从图像内可靠可见光区域（Key/Value）
-    检索语义一致的颜色表示，实现颜色迁移。
+    K/V 由两个来源联合构成：
+      1. 编码器可靠区域特征（mask=0区域）：图内局部颜色证据
+      2. 冻结CLIP的patch-level特征（可靠区域patches）：跨图语义颜色先验
+
+    Q：补全区域（mask=1区域）的编码器特征，
+       问题："我这里是什么类型的场景，应该有什么颜色？"
+
+    两类K/V沿sequence维度拼接，attention同时检索两类信息，
+    自动学习什么时候信图内证据、什么时候信语义先验。
 
     输入：
-        feat      (B, C, H, W)   编码器瓶颈特征，补全区已被IR门控替换
-        haze_mask (B, 1, H0, W0) 原始分辨率掩码（会自动下采样）
+        feat              (B, C, H, W)        编码器瓶颈特征
+        haze_mask         (B, 1, H0, W0)      原始分辨率掩码
+        clip_patch_feat   (B, N_patches, 512) 冻结CLIP的patch tokens
+        clip_patch_mask   (B, N_patches, 1)   CLIP patch级别的可靠性掩码
     输出：
         (B, C, H, W)  颜色恢复后的特征
     """
+
+    CLIP_DIM = 512  # CLIP ViT-B/32 patch token 维度
 
     def __init__(self, feat_dim=256, num_heads=8, dropout=0.0):
         super(RegionColorRestorer, self).__init__()
@@ -1124,57 +1136,97 @@ class RegionColorRestorer(nn.Module):
         self.num_heads = num_heads
         self.head_dim  = feat_dim // num_heads
         self.scale     = self.head_dim ** -0.5
+        self.feat_dim  = feat_dim
 
-        self.q_proj   = nn.Linear(feat_dim, feat_dim, bias=False)
-        self.k_proj   = nn.Linear(feat_dim, feat_dim, bias=False)
-        self.v_proj   = nn.Linear(feat_dim, feat_dim, bias=False)
+        # Q 投影（补全区域编码器特征 → 查询向量）
+        self.q_proj = nn.Linear(feat_dim, feat_dim, bias=False)
+
+        # 来源1：编码器可靠区域特征的 K/V 投影
+        self.k_enc_proj = nn.Linear(feat_dim, feat_dim, bias=False)
+        self.v_enc_proj = nn.Linear(feat_dim, feat_dim, bias=False)
+
+        # 来源2：CLIP patch特征的 K/V 投影（512 → feat_dim）
+        self.k_clip_proj = nn.Linear(self.CLIP_DIM, feat_dim, bias=False)
+        self.v_clip_proj = nn.Linear(self.CLIP_DIM, feat_dim, bias=False)
+
+        # 输出投影 + LayerNorm
         self.out_proj = nn.Linear(feat_dim, feat_dim, bias=False)
         self.norm     = nn.LayerNorm(feat_dim)
         self.dropout  = nn.Dropout(dropout)
 
-        # 零初始化：训练初期保持恒等映射，不破坏预训练特征
+        # 零初始化：训练初期 color_restorer 等于恒等映射，不破坏预训练特征
         nn.init.zeros_(self.out_proj.weight)
 
-    def forward(self, feat, haze_mask):
+    def forward(self, feat, haze_mask, clip_patch_feat, clip_patch_mask):
+        """
+        feat:            (B, C, H, W)
+        haze_mask:       (B, 1, H_orig, W_orig)  — 自动下采样到 feat 尺寸
+        clip_patch_feat: (B, N, 512)              — 冻结CLIP的patch tokens
+        clip_patch_mask: (B, N, 1)                — 值∈[0,1]，1=不可靠patch
+        """
         B, C, H, W = feat.shape
+        N = clip_patch_feat.shape[1]  # CLIP patch数量（ViT-B/32时为49）
 
-        # 将 mask 下采样到当前特征尺寸
+        # 1. 将 haze_mask 下采样到当前特征尺寸
         mask = F.interpolate(
             haze_mask, size=(H, W), mode='bilinear', align_corners=False
         )  # (B, 1, H, W)
 
-        # 全局抑制：整图几乎无雾时跳过（节省计算，避免引入噪声）
+        # 全局抑制：整图几乎无雾时跳过
         if mask.mean() < 0.03:
             return feat
 
-        # 展平空间维度
-        feat_flat = feat.flatten(2).permute(0, 2, 1)    # (B, HW, C)
-        mask_flat = mask.flatten(2).permute(0, 2, 1)    # (B, HW, 1)
+        # 2. 展平编码器特征的空间维度
+        feat_flat = feat.flatten(2).permute(0, 2, 1)   # (B, HW, C)
+        mask_flat = mask.flatten(2).permute(0, 2, 1)   # (B, HW, 1)，值∈[0,1]
 
-        Q = self.q_proj(feat_flat)   # (B, HW, C)
-        K = self.k_proj(feat_flat)
-        V = self.v_proj(feat_flat)
+        # 3. 计算 Q（所有位置都参与，但只在补全区域输出）
+        Q = self.q_proj(feat_flat)   # (B, HW, D)
 
-        # 多头拆分: (B, HW, C) -> (B, nh, HW, hd)
-        def split_heads(x):
-            return x.view(B, H * W, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        # 4. 来源1：编码器特征的 K/V
+        K_enc = self.k_enc_proj(feat_flat)   # (B, HW, D)
+        V_enc = self.v_enc_proj(feat_flat)   # (B, HW, D)
 
-        Q, K, V = split_heads(Q), split_heads(K), split_heads(V)
+        # 5. 来源2：CLIP patch特征的 K/V
+        K_clip = self.k_clip_proj(clip_patch_feat)   # (B, N, D)
+        V_clip = self.v_clip_proj(clip_patch_feat)   # (B, N, D)
 
-        # Key 位置偏置：补全区域（mask≈1）被屏蔽，不能成为颜色来源
-        # key_bias: (B, 1, 1, HW)，补全区域 Key 得分减去大值
-        key_bias = mask_flat.permute(0, 2, 1).unsqueeze(1) * (-1e4)
+        # 6. 沿 sequence 维度拼接联合 K/V
+        K = torch.cat([K_enc, K_clip], dim=1)   # (B, HW+N, D)
+        V = torch.cat([V_enc, V_clip], dim=1)   # (B, HW+N, D)
 
-        attn = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # (B, nh, HW, HW)
-        attn = attn + key_bias
+        # 7. 构建联合 Key Bias
+        # 编码器侧：补全区域（mask≈1）不能作为颜色来源
+        enc_key_bias  = mask_flat * (-1e4)           # (B, HW, 1)
+        # CLIP侧：雾霾区域对应的patch（clip_patch_mask≈1）不能作为来源
+        clip_key_bias = clip_patch_mask * (-1e4)     # (B, N, 1)
+        # 拼接：(B, HW+N, 1) → (B, 1, 1, HW+N) 用于广播
+        key_bias = torch.cat([enc_key_bias, clip_key_bias], dim=1)
+        key_bias = key_bias.permute(0, 2, 1).unsqueeze(1)   # (B,1,1,HW+N)
+
+        # 8. 多头拆分
+        def split_heads(x, seq_len):
+            # x: (B, seq_len, D) → (B, nh, seq_len, hd)
+            return x.view(B, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        Q = split_heads(Q, H * W)          # (B, nh, HW, hd)
+        K = split_heads(K, H * W + N)      # (B, nh, HW+N, hd)
+        V = split_heads(V, H * W + N)      # (B, nh, HW+N, hd)
+
+        # 9. Scaled Dot-Product Attention，压制不可靠的 Key 位置
+        attn = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+        # attn: (B, nh, HW, HW+N)
+        attn = attn + key_bias   # 广播 key_bias (B,1,1,HW+N) → (B,nh,HW,HW+N)
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
-        out = torch.matmul(attn, V)  # (B, nh, HW, hd)
-        out = out.permute(0, 2, 1, 3).contiguous().view(B, H * W, C)
-        out = self.out_proj(out)
+        out = torch.matmul(attn, V)   # (B, nh, HW, hd)
 
-        # 残差：仅对补全区域叠加 attention 输出；可靠区域不受影响
+        # 10. 合并多头
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, H * W, C)
+        out = self.out_proj(out)   # (B, HW, C)
+
+        # 11. 残差：只对补全区域叠加 attention 输出
         restored = feat_flat + mask_flat * out
         restored = self.norm(restored)
 
@@ -1314,6 +1366,46 @@ class VIFNetInconsistencyTeacher(nn.Module):
         # --- [修改] 移除 final_fusion 并调整 conv_output ---
         # self.final_fusion = ChannelAttentionFusion(in_channels=16, reduction=4, out_channels=32)
 
+        # 冻结 CLIP 视觉编码器（ViT-B/32）+ monkey-patch 返回所有 token
+        _clip_standard, _ = clip_load("ViT-B/32", device="cpu")
+        _vis = _clip_standard.visual
+
+        # Monkey-patch：让 visual 返回所有 token (B,50,512) 而不是只返回 CLS (B,512)
+        _original_forward = _vis.forward.__func__
+        def _patched_forward(self_inner, x):
+            x = self_inner.conv1(x)
+            x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)
+            x = torch.cat([
+                self_inner.class_embedding.to(x.dtype) +
+                torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+                x], dim=1)
+            x = x + self_inner.positional_embedding.to(x.dtype)
+            x = self_inner.ln_pre(x)
+            x = x.permute(1, 0, 2)
+            x = self_inner.transformer(x)
+            x = x.permute(1, 0, 2)
+            x = self_inner.ln_post(x)          # 对所有 token，不只取 [:, 0, :]
+            if self_inner.proj is not None:
+                x = x @ self_inner.proj
+            return x                            # (B, 50, 512)
+
+        _vis.forward = types.MethodType(_patched_forward, _vis)
+        self.clip_visual = _vis
+        del _clip_standard
+        for param in self.clip_visual.parameters():
+            param.requires_grad = False
+        self.clip_visual.eval()
+
+        # CLIP 输入归一化参数（ViT-B/32 标准值）
+        self.register_buffer(
+            'clip_input_mean',
+            torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            'clip_input_std',
+            torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+        )
+
         # 区域颜色恢复（瓶颈层，256ch，H/16 分辨率）
         self.color_restorer = RegionColorRestorer(feat_dim=256, num_heads=8)
 
@@ -1326,19 +1418,10 @@ class VIFNetInconsistencyTeacher(nn.Module):
 
     # --- [重写] forward 方法 ---
     def forward(self, x_vis, x_ir, haze_mask=None):
-        if haze_mask is None:
-            clip_mean = torch.tensor(
-                [0.48145466, 0.4578275, 0.40821073],
-                device=x_vis.device,
-                dtype=x_vis.dtype
-            ).view(1, 3, 1, 1)
-            clip_std = torch.tensor(
-                [0.26862954, 0.26130258, 0.27577711],
-                device=x_vis.device,
-                dtype=x_vis.dtype
-            ).view(1, 3, 1, 1)
-            x_vis_01 = (x_vis * clip_std + clip_mean).clamp(0, 1)
+        # x_vis_01 提前计算：CLIP 反归一化到 [0,1]，供 HDE 和 CLIP patch 提取共用
+        x_vis_01 = (x_vis * self.clip_input_std + self.clip_input_mean).clamp(0, 1)
 
+        if haze_mask is None:
             # --- HAPM: HDE-based haze density estimation ---
             M_vis = self.hde(x_vis_01)          # (B,1,H,W) high=dense haze
             tau = differentiable_otsu(M_vis)
@@ -1399,8 +1482,30 @@ class VIFNetInconsistencyTeacher(nn.Module):
         # 5a. CRA 降维 (输入是已融合的特征)
         res16x_vis = self.CRA1_vis(x_layer3_fused)  # (256)
 
-        # 颜色恢复：补全区域从可靠可见光区域检索语义颜色
-        res16x_vis = self.color_restorer(res16x_vis, haze_mask)
+        # --- 颜色恢复：双源 K/V（编码器可靠特征 + CLIP语义先验）---
+
+        # 1. 提取 CLIP patch-level 特征（冻结，无梯度）
+        with torch.no_grad():
+            x_vis_clip = (x_vis_01 - self.clip_input_mean) / self.clip_input_std
+            x_vis_clip_224 = F.interpolate(
+                x_vis_clip, size=(224, 224), mode='bilinear', align_corners=False
+            )
+            clip_tokens = self.clip_visual(x_vis_clip_224)           # (B, 50, 512)
+            clip_patch_feat = clip_tokens[:, 1:, :]                   # (B, 49, 512) 去掉 CLS
+
+        # 2. 计算 CLIP patch 级别的可靠性掩码
+        clip_patch_mask = F.interpolate(
+            haze_mask, size=(7, 7), mode='bilinear', align_corners=False
+        )  # (B, 1, 7, 7)
+        clip_patch_mask = clip_patch_mask.flatten(2).permute(0, 2, 1)  # (B, 49, 1)
+
+        # 3. 调用双源颜色恢复模块
+        res16x_vis = self.color_restorer(
+            res16x_vis,
+            haze_mask,
+            clip_patch_feat,
+            clip_patch_mask
+        )
 
         res8x_vis = self.CRA2_vis(x_layer2_fused)  # (128)
         res4x_vis = self.CRA3_vis(x_layer1_fused)  # (64)

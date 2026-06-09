@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ftfy; print\\('ftfy OK'\\)\")",
+      "Bash(python -c \"import regex; print\\('regex OK'\\)\")",
+      "Bash(/d/anaconda/envs/coa/python -c \"import ftfy; print\\('ftfy OK'\\)\")",
+      "Bash(/d/anaconda/envs/coa/python -c \"from model.Teacher import VIFNetInconsistencyTeacher, RegionColorRestorer; print\\('Import OK'\\)\")",
+      "Bash(curl -L -o bpe_simple_vocab_16e6.txt.gz \"https://github.com/openai/CLIP/raw/main/clip/bpe_simple_vocab_16e6.txt.gz\")",
+      "Bash(/d/anaconda/envs/coa/python -c ' *)"
     ]
   }
 }
