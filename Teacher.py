@@ -23,7 +23,7 @@ from torch.backends import cudnn
 from torch.utils.data import DataLoader
 
 # --- [修改] 导入 SSIM, ContrastLoss 和 PerceptualLoss ---
-from loss import SSIM, ContrastLoss, PerceptualLoss, DiceLoss
+from loss import SSIM, ContrastLoss, PerceptualLoss, DiceLoss, BoundarySmoothnessLoss
 # --- [修改结束] ---
 
 # --- [修改] 导入新的数据集类和模型类 ---
@@ -264,8 +264,8 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
     """
     losses = []
     # --- [修改] 增加 Edge, Style, CrossModal 日志 ---
-    loss_log = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'total': []}
-    loss_log_tmp = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'total': []}
+    loss_log = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'Boundary': [], 'total': []}
+    loss_log_tmp = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'Boundary': [], 'total': []}
     # --- [修改结束] ---
     psnr_log = []
 
@@ -337,9 +337,9 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         clear_vis = clear_vis.to(opt.device, non_blocking=True)
         # --- [修改结束] ---
 
-        # --- [修改] 模型前向传播 (双输入)，接收4个输出 ---
+        # --- [修改] 模型前向传播 (双输入)，接收5个输出 ---
         # 训练时不使用掩码 (haze_mask=None)
-        pred_image, vis_h_features, vis_features, ir_features = teacher_net(hazy_vis, infrared, haze_mask=None)
+        pred_image, vis_h_features, vis_features, ir_features, m_hard = teacher_net(hazy_vis, infrared, haze_mask=None)
         # --- [修改结束] ---
 
         # --- [修改] 计算损失 (使用 clear_vis 作为 GT) ---
@@ -384,13 +384,20 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             loss_CrossModal = criterion[5](vis_features, ir_features.detach())
         # --- [新增结束] ---
 
+        # --- [新增] 计算边界平滑损失 ---
+        loss_Boundary = torch.tensor(0.0, device=opt.device)
+        if opt.w_loss_Boundary > 0 and criterion[6] is not None:
+            loss_Boundary = criterion[6](pred_image, m_hard, gt_image=clear_vis)
+        # --- [新增结束] ---
+
         # --- [修改] 总损失 ---
         loss = (opt.w_loss_L1 * loss_L1 +
                 opt.w_loss_SSIM * loss_SSIM +
                 opt.w_loss_Cr * loss_Cr +
                 opt.w_loss_Edge * loss_Edge +
                 opt.w_loss_Style * loss_Style +  # <-- 新增
-                opt.w_loss_CrossModal * loss_CrossModal)  # <-- 新增
+                opt.w_loss_CrossModal * loss_CrossModal +  # <-- 新增
+                opt.w_loss_Boundary * loss_Boundary)  # <-- 新增
         # --- [修改结束] ---
 
         # --- 反向传播和优化 ---
@@ -413,6 +420,8 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         loss_log_tmp['CrossModal'].append(
             loss_CrossModal.item() if isinstance(loss_CrossModal, torch.Tensor) else loss_CrossModal)
         # --- [新增结束] ---
+        loss_log_tmp['Boundary'].append(
+            loss_Boundary.item() if isinstance(loss_Boundary, torch.Tensor) else loss_Boundary)
         loss_log_tmp['total'].append(loss.item())
 
         l1_val = (opt.w_loss_L1 * loss_L1.item()) if isinstance(loss_L1, torch.Tensor) and opt.w_loss_L1 > 0 else 0.0
@@ -430,6 +439,9 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
                                                                                         torch.Tensor) and opt.w_loss_CrossModal > 0 else 0.0
         # --- [新增结束] ---
 
+        bnd_val = (opt.w_loss_Boundary * loss_Boundary.item()) if isinstance(loss_Boundary,
+                                                                               torch.Tensor) and opt.w_loss_Boundary > 0 else 0.0
+
         # AAA
 
         # AAA
@@ -437,6 +449,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         print(
             f'\rloss:{loss.item():.5f} | L1:{l1_val:.5f} | SSIM:{ssim_val:.5f} | Cr:{cr_val:.5f} | Edge:{edge_val:.5f} '
             f'| Style:{style_val:.5f} | CrossM:{crossmodal_val:.5f} '  # <-- 新增
+            f'| Bnd:{bnd_val:.5f} '
             f'| step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}',
             end='', flush=True)
         # --- [修改结束] ---
@@ -637,8 +650,8 @@ def test(net, loader_test):
 
             try:
                 # --- [修改] 正确调用双流模型 (测试时不用掩码, haze_mask=None) ---
-                # [修改]：解包4个输出，但只用第1个 (pred)
-                pred_output, _, _, _ = net(inputs_vis_padded, inputs_ir_padded, haze_mask=None)
+                # [修改]：解包5个输出，但只用第1个 (pred)
+                pred_output, _, _, _, _ = net(inputs_vis_padded, inputs_ir_padded, haze_mask=None)
                 # --- [修改结束] ---
 
                 pred = pred_output  # pred_output 已经是图像
@@ -864,6 +877,11 @@ if __name__ == "__main__":
     # criterion[5]: Cross-Modal Consistency Loss (L1)
     criterion.append(nn.L1Loss().to(opt.device))
     # --- [新增结束] ---
+
+    # criterion[6]: Boundary Smoothness Loss
+    criterion.append(BoundarySmoothnessLoss(
+        band_k=opt.boundary_band_k, lambda_edge=opt.boundary_lambda_edge
+    ).to(opt.device))
 
     # --- [修改结束] ---
 

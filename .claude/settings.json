@@ -11,7 +11,10 @@
       "Bash(python -c \"import einops; print\\('einops OK'\\)\")",
       "Bash(where python *)",
       "Bash(d:/anaconda/envs/coa/python.exe -c \"import einops; print\\('einops OK'\\)\")",
-      "Bash(d:/anaconda/envs/coa/python.exe -c ' *)"
+      "Bash(d:/anaconda/envs/coa/python.exe -c ' *)",
+      "Bash(python3 -c ' *)",
+      "Bash(python -c \"from loss import BoundarySmoothnessLoss; print\\('Import OK:', BoundarySmoothnessLoss\\)\")",
+      "Bash(git diff *)"
     ]
   }
 }

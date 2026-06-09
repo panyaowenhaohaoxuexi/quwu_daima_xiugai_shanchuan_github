@@ -1362,11 +1362,14 @@ class VIFNetInconsistencyTeacher(nn.Module):
         # x_vis_01: 反归一化到 [0,1]，供 HDE 雾密度估计用
         x_vis_01 = (x_vis * self.clip_input_std + self.clip_input_mean).clamp(0, 1)
 
+        m_hard_out = None  # 仅在 haze_mask is None 分支赋值，用于边界平滑损失
+
         if haze_mask is None:
             # --- HAPM: HDE-based haze density estimation ---
             M_vis = self.hde(x_vis_01)          # (B,1,H,W) high=dense haze
             tau = differentiable_otsu(M_vis)
             m_hard = (M_vis >= tau).float()
+            m_hard_out = m_hard  # 暴露给调用方用于 L_boundary
             m_soft = torch.sigmoid((M_vis - tau) / 0.1)
             haze_mask = m_hard.detach() + m_soft - m_soft.detach()
 
@@ -1547,7 +1550,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
         # --- [修改结束] ---
 
         # [修改] 返回融合前的特征用于计算新损失
-        return output, vis_h_features, vis_features, ir_features
+        return output, vis_h_features, vis_features, ir_features, m_hard_out
 
 
 # --- 主函数测试部分 (保持不变) ---
@@ -1558,8 +1561,8 @@ if __name__ == "__main__":
     dummy_input_vis = torch.randn(1, 3, 256, 256).to(device)
     dummy_input_ir = torch.randn(1, 3, 256, 256).to(device)
 
-    # [修改] 接收 4 个输出
-    output_tensor, intermediate_features, vis_features_out, ir_features_out = net(dummy_input_vis, dummy_input_ir)
+    # [修改] 接收 5 个输出
+    output_tensor, intermediate_features, vis_features_out, ir_features_out, m_hard_out = net(dummy_input_vis, dummy_input_ir)
 
     print("Output shape:", output_tensor.shape)
     print("Vis Features (Decoder Output) shape:", vis_features_out.shape)

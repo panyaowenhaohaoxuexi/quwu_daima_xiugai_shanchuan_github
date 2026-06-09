@@ -8,3 +8,4 @@ from .Dice import *
 # --- [新增] 导入感知损失 (用于风格损失) ---
 from .perceptual import PerceptualLoss
 # --- [新增结束] ---
+from .boundary import BoundarySmoothnessLoss

@@ -51,6 +51,11 @@ parser.add_argument('--w_loss_Edge', default=0.15, type=float, help='weight of I
 parser.add_argument('--w_loss_Style', default=0.1, type=float, help='weight of Style loss (Perceptual)')
 parser.add_argument('--w_loss_CrossModal', default=0.1, type=float, help='weight of Cross-Modal Consistency loss (L1 between vis/ir features)')
 # --- [新增结束] ---
+# --- [新增] 边界平滑损失 ---
+parser.add_argument('--w_loss_Boundary', default=0.02, type=float, help='weight of Boundary Smoothness loss')
+parser.add_argument('--boundary_band_k', default=5, type=int, help='kernel size for boundary band dilation/erosion')
+parser.add_argument('--boundary_lambda_edge', default=10.0, type=float, help='edge-aware weight decay factor')
+# --- [新增结束] ---
 
 # --- 3. 定义文件和目录相关的参数 ---
 
