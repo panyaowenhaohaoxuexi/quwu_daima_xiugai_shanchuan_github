@@ -42,6 +42,7 @@ from tqdm import tqdm
 from torchvision.transforms import Compose, ToTensor, Normalize, Resize, InterpolationMode
 
 # --- [新增结束] ---
+from utils.visualize_mask import visualize_epoch_mask
 # --- [新增] 将 device 和 transform 移至全局 ---
 # (以便 dehaze 函数和 train 函数都能访问)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -274,6 +275,19 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
     ssims = []
     psnrs = []
     loader_train_iter = iter(loader_train)
+
+    # ---- 固定可视化样本（每轮看同一批图，便于跨 epoch 比较）----
+    _vis_sample, _ir_sample = None, None
+    try:
+        _sample_iter = iter(loader_train)
+        _sample_batch = next(_sample_iter)
+        _vis_sample = _sample_batch[0][:4]   # 固定取前4张
+        _ir_sample  = _sample_batch[1][:4]
+        del _sample_iter, _sample_batch
+    except Exception as e:
+        print(f"[mask_vis] 无法预取可视化样本: {e}")
+    # -------------------------------------------------------
+
     for step in range(start_step + 1, steps + 1):
         teacher_net.train()
         lr = opt.start_lr
@@ -447,6 +461,23 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
                 np.save(os.path.join(opt.saved_data_dir, 'losses.npy'), losses)
             except Exception as e:
                 print(f"\n错误: 保存 losses.npy 失败: {e}")
+
+            # ---- Epoch 结束：保存掩码可视化 ----
+            if _vis_sample is not None and _ir_sample is not None:
+                try:
+                    epoch_idx = step // steps_per_epoch
+                    visualize_epoch_mask(
+                        model      = teacher_net,
+                        vis_batch  = _vis_sample,
+                        ir_batch   = _ir_sample,
+                        epoch      = epoch_idx,
+                        save_dir   = opt.saved_data_dir,
+                        n_samples  = min(4, _vis_sample.shape[0]),
+                        device     = opt.device
+                    )
+                except Exception as e:
+                    print(f"\n[mask_vis] 可视化失败，跳过: {e}")
+            # ----------------------------------------
 
         # 确定评估频率 (与之前逻辑保持一致)
         eval_freq_fine = 5 * steps_per_epoch if steps_per_epoch > 0 else opt.iters_per_epoch

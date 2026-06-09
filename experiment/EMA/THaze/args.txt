@@ -1,0 +1,19 @@
+{
+  "device": "cuda",
+  "epochs": 20,
+  "iters_per_epoch": 1000,
+  "finer_eval_step": 20000,
+  "start_lr": 1e-07,
+  "end_lr": 1e-08,
+  "no_lr_sche": false,
+  "w_loss_L1_r": 1,
+  "w_loss_Clip": 0.5,
+  "w_loss_Edge": 0.3,
+  "exp_dir": "./experiment",
+  "model_name": "THaze",
+  "saved_model_dir": "./experiment\\EMA\\THaze\\saved_model",
+  "saved_data_dir": "./experiment\\EMA\\THaze\\saved_data",
+  "dataset": "EMA",
+  "real_test_hazy_path": "/root/autodl-tmp/FLIR_zengqiang/xunlian_guocheng_ceshi/hazy",
+  "real_test_ir_path": "/root/autodl-tmp/FLIR_zengqiang/xunlian_guocheng_ceshi/ir"
+}
