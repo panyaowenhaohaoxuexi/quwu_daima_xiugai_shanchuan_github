@@ -598,11 +598,9 @@ class Res2Net(nn.Module):
 
             # --- [核心修改 V2] (基础/增强) 注入逻辑 ---
             if haze_mask is not None:
-                # 1. 提供了掩码：计算缩放掩码
                 mask_l1 = F.interpolate(haze_mask, size=inf_w_4.shape[2:], mode='bilinear', align_corners=False)
-                # (0.0 -> base_weight, 1.0 -> 1.0)
-                scaled_mask = self.base_inject_weight + (mask_l1 * (1.0 - self.base_inject_weight))
-                x_layer1_fused = x_layer1_orig + (inf_w_4 * scaled_mask)
+                # 门控替换：mask=1 → 纯IR，mask=0 → 纯VIS，边界软过渡
+                x_layer1_fused = (1.0 - mask_l1) * x_layer1_orig + mask_l1 * inf_w_4
             else:
                 # 2. 未提供掩码：仅使用基础注入
                 x_layer1_fused = x_layer1_orig + (inf_w_4 * self.base_inject_weight)
@@ -618,8 +616,8 @@ class Res2Net(nn.Module):
             # --- [核心修改 V2] (基础/增强) 注入逻辑 ---
             if haze_mask is not None:
                 mask_l2 = F.interpolate(haze_mask, size=inf_w_8.shape[2:], mode='bilinear', align_corners=False)
-                scaled_mask_l2 = self.base_inject_weight + (mask_l2 * (1.0 - self.base_inject_weight))
-                x_layer2_fused = x_layer2_orig + (inf_w_8 * scaled_mask_l2)
+                # 门控替换：mask=1 → 纯IR，mask=0 → 纯VIS，边界软过渡
+                x_layer2_fused = (1.0 - mask_l2) * x_layer2_orig + mask_l2 * inf_w_8
             else:
                 x_layer2_fused = x_layer2_orig + (inf_w_8 * self.base_inject_weight)
             # --- [核心修改 V2 结束] ---
@@ -634,8 +632,8 @@ class Res2Net(nn.Module):
             # --- [核心修改 V2] (基础/增强) 注入逻辑 ---
             if haze_mask is not None:
                 mask_l3 = F.interpolate(haze_mask, size=inf_w_16.shape[2:], mode='bilinear', align_corners=False)
-                scaled_mask_l3 = self.base_inject_weight + (mask_l3 * (1.0 - self.base_inject_weight))
-                x_layer3_fused = x_layer3_orig + (inf_w_16 * scaled_mask_l3)
+                # 门控替换：mask=1 → 纯IR，mask=0 → 纯VIS，边界软过渡
+                x_layer3_fused = (1.0 - mask_l3) * x_layer3_orig + mask_l3 * inf_w_16
             else:
                 x_layer3_fused = x_layer3_orig + (inf_w_16 * self.base_inject_weight)
             # --- [核心修改 V2 结束] ---
@@ -1104,6 +1102,85 @@ class ChannelAttentionFusion(nn.Module):
 # --- [新增结束] ---
 
 
+class RegionColorRestorer(nn.Module):
+    """
+    区域颜色恢复模块。
+
+    动机：区域补全范式中，浓雾区域的编码器特征被 IR 完全替换，
+    导致该区域无颜色信息。本模块通过 Cross-Attention 机制，
+    让补全区域（Query）从图像内可靠可见光区域（Key/Value）
+    检索语义一致的颜色表示，实现颜色迁移。
+
+    输入：
+        feat      (B, C, H, W)   编码器瓶颈特征，补全区已被IR门控替换
+        haze_mask (B, 1, H0, W0) 原始分辨率掩码（会自动下采样）
+    输出：
+        (B, C, H, W)  颜色恢复后的特征
+    """
+
+    def __init__(self, feat_dim=256, num_heads=8, dropout=0.0):
+        super(RegionColorRestorer, self).__init__()
+        assert feat_dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim  = feat_dim // num_heads
+        self.scale     = self.head_dim ** -0.5
+
+        self.q_proj   = nn.Linear(feat_dim, feat_dim, bias=False)
+        self.k_proj   = nn.Linear(feat_dim, feat_dim, bias=False)
+        self.v_proj   = nn.Linear(feat_dim, feat_dim, bias=False)
+        self.out_proj = nn.Linear(feat_dim, feat_dim, bias=False)
+        self.norm     = nn.LayerNorm(feat_dim)
+        self.dropout  = nn.Dropout(dropout)
+
+        # 零初始化：训练初期保持恒等映射，不破坏预训练特征
+        nn.init.zeros_(self.out_proj.weight)
+
+    def forward(self, feat, haze_mask):
+        B, C, H, W = feat.shape
+
+        # 将 mask 下采样到当前特征尺寸
+        mask = F.interpolate(
+            haze_mask, size=(H, W), mode='bilinear', align_corners=False
+        )  # (B, 1, H, W)
+
+        # 全局抑制：整图几乎无雾时跳过（节省计算，避免引入噪声）
+        if mask.mean() < 0.03:
+            return feat
+
+        # 展平空间维度
+        feat_flat = feat.flatten(2).permute(0, 2, 1)    # (B, HW, C)
+        mask_flat = mask.flatten(2).permute(0, 2, 1)    # (B, HW, 1)
+
+        Q = self.q_proj(feat_flat)   # (B, HW, C)
+        K = self.k_proj(feat_flat)
+        V = self.v_proj(feat_flat)
+
+        # 多头拆分: (B, HW, C) -> (B, nh, HW, hd)
+        def split_heads(x):
+            return x.view(B, H * W, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        Q, K, V = split_heads(Q), split_heads(K), split_heads(V)
+
+        # Key 位置偏置：补全区域（mask≈1）被屏蔽，不能成为颜色来源
+        # key_bias: (B, 1, 1, HW)，补全区域 Key 得分减去大值
+        key_bias = mask_flat.permute(0, 2, 1).unsqueeze(1) * (-1e4)
+
+        attn = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # (B, nh, HW, HW)
+        attn = attn + key_bias
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+
+        out = torch.matmul(attn, V)  # (B, nh, HW, hd)
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, H * W, C)
+        out = self.out_proj(out)
+
+        # 残差：仅对补全区域叠加 attention 输出；可靠区域不受影响
+        restored = feat_flat + mask_flat * out
+        restored = self.norm(restored)
+
+        return restored.permute(0, 2, 1).view(B, C, H, W)
+
+
 # --- 修改后的 VIFNetInconsistencyTeacher 模型 ---
 class VIFNetInconsistencyTeacher(nn.Module):
     """
@@ -1237,6 +1314,9 @@ class VIFNetInconsistencyTeacher(nn.Module):
         # --- [修改] 移除 final_fusion 并调整 conv_output ---
         # self.final_fusion = ChannelAttentionFusion(in_channels=16, reduction=4, out_channels=32)
 
+        # 区域颜色恢复（瓶颈层，256ch，H/16 分辨率）
+        self.color_restorer = RegionColorRestorer(feat_dim=256, num_heads=8)
+
         # [修改] conv_output 现在直接接收来自 vis_features 的 16 个通道
         self.conv_output = ConvLayer(16, 3, kernel_size=3, stride=1)
         # --- [修改结束] ---
@@ -1318,6 +1398,10 @@ class VIFNetInconsistencyTeacher(nn.Module):
 
         # 5a. CRA 降维 (输入是已融合的特征)
         res16x_vis = self.CRA1_vis(x_layer3_fused)  # (256)
+
+        # 颜色恢复：补全区域从可靠可见光区域检索语义颜色
+        res16x_vis = self.color_restorer(res16x_vis, haze_mask)
+
         res8x_vis = self.CRA2_vis(x_layer2_fused)  # (128)
         res4x_vis = self.CRA3_vis(x_layer1_fused)  # (64)
         res2x_vis = self.CRA4_vis(x_layer0)  # (32) (x_layer0 未被注入)
