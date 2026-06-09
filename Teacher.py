@@ -471,16 +471,18 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
                                         glob.glob(os.path.join(mask_vis_dir, '*.png')) +
                                         glob.glob(os.path.join(mask_vis_dir, '*.jpeg')))
                     if vis_images:
+                        # 缩放尺寸，防止大图 OOM（取训练尺寸 256 或 512，这里用 max_size=512）
+                        mask_vis_resize = Resize((512, 512), interpolation=InterpolationMode.BICUBIC, antialias=True)
                         vis_tensors = []
                         ir_tensors = []
                         for img_path in vis_images[:4]:
-                            vis_tensor = transform(Image.open(img_path).convert("RGB"))
+                            vis_tensor = transform(mask_vis_resize(Image.open(img_path).convert("RGB")))
                             vis_tensors.append(vis_tensor)
                             # 找对应的红外图
                             base_name = os.path.basename(img_path)
                             ir_path = os.path.join(opt.real_test_ir_path, base_name)
                             if os.path.exists(ir_path):
-                                ir_tensor = transform(Image.open(ir_path).convert("RGB"))
+                                ir_tensor = transform(mask_vis_resize(Image.open(ir_path).convert("RGB")))
                             else:
                                 # 没有红外图就用可见光图占位
                                 ir_tensor = vis_tensor.clone()
@@ -488,6 +490,10 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
 
                         vis_batch = torch.stack(vis_tensors)  # (N, 3, H, W)
                         ir_batch = torch.stack(ir_tensors)
+
+                        # 释放显存碎片后再做可视化
+                        torch.cuda.empty_cache()
+
                         epoch_idx = step // steps_per_epoch
                         visualize_epoch_mask(
                             model      = teacher_net,
