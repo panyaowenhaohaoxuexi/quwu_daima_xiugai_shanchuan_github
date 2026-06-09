@@ -10,9 +10,7 @@ from collections import OrderedDict
 from .vifnet_basic_modules import Encoder_B, Decoder_B, Conv_B, CPAB
 from .dsfe import DSFE
 from torchvision.ops import DeformConv2d
-from CLIP.clip_surgery_model import CLIPSurgery, VisionTransformer as SurgeryVisionTransformer
-from CLIP.clip import load as clip_load
-import types
+# [已移除] CLIP 导入 — 颜色恢复改为纯图内 Cross-Attention
 
 
 # --- [修改结束] ---
@@ -154,7 +152,7 @@ class CannyEdgeDetector(nn.Module):
     可微的 Canny 边缘检测器 (Soft Canny / Gradient Magnitude)。
     包含：高斯模糊 -> Sobel 梯度计算 -> 梯度幅值。
     为了保持训练时的可微性，这里省略了非极大值抑制(NMS)和双阈值硬截断。
-    这种“软边缘”非常适合作为 Dice Loss 或 L1 Loss 的输入。
+    这种"软边缘"非常适合作为 Dice Loss 或 L1 Loss 的输入。
     """
 
     def __init__(self, kernel_size=5, sigma=1.0):
@@ -510,7 +508,7 @@ class Bottle2neck(nn.Module):
 class Res2Net(nn.Module):
     """
         Res2Net: 去雾模型的编码器部分，基于 Res2Net 结构。
-        *** [修改]：支持“串联注入”不一致性权重 ***
+        *** [区域补全范式]：按 HAPM 掩码分流 — M=1 纯IR补全，M=0 自适应融合 ***
     """
 
     def __init__(self, block, layers, baseWidth=26, scale=4, in_channels=3):  # 添加 in_channels 参数
@@ -536,16 +534,11 @@ class Res2Net(nn.Module):
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
 
         # --- [新增] 注入权重适配器 (用于 Pass 2 注入) ---
-        # 匹配 DSFE(B) 输出 -> Res2Net(A) *输入* (layer 1/2/3 的输出通道)
-        # DSFE [64, 128, 256] -> Res2Net Layer [256, 512, 1024]
+        # 匹配 ir_feat (DSFE) 输出 -> Res2Net layer 输出通道
+        # ir_feat [64(H/4), 128(H/8), 256(H/16)] -> [256, 512, 1024]
         self.inject_conv1 = nn.Conv2d(64, 256, kernel_size=1, bias=False)  # H/4
         self.inject_conv2 = nn.Conv2d(128, 512, kernel_size=1, bias=False)  # H/8
         self.inject_conv3 = nn.Conv2d(256, 1024, kernel_size=1, bias=False)  # H/16
-        # --- [新增结束] ---
-
-        # --- [新增] 定义基础注入权重 ---
-        self.base_inject_weight = 0.2  # 基础注入权重 (例如 20%)
-        # --- [新增结束] ---
 
         # 初始化权重
         for m in self.modules():
@@ -575,14 +568,17 @@ class Res2Net(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x, inf_weights=None, haze_mask=None):  # [修改] 增加 haze_mask=None 参数
+    def forward(self, x, ir_feat_list=None, beta_list=None, haze_mask=None):
         """
-        [修改后] 的 Res2Net forward，支持串联注入 (Sequential Injection)
-        [修改V2] 支持 (基础/增强) 注入逻辑
+        [区域补全范式] Res2Net forward，按 HAPM 掩码严格分流：
+          - M=1（补全区）：beta_eff=1，纯 IR 填充，VIS 特征完全丢弃
+          - M=0（融合区）：beta_eff=beta，可见光与红外自适应凸组合
 
-        inf_weights: 一个列表 [Stru3(256), Stru2(128), Stru1(64)]
-                     对应 [H/16, H/8, H/4] 尺度
-        haze_mask:   一个 (B, 1, H, W) 的掩码 (如果提供了)
+        ir_feat_list: 纯 IR 结构特征 [H/16(256ch), H/8(128ch), H/4(64ch)]
+        beta_list:    逐像素 IR 融合权重 [H/16(1ch), H/8(1ch), H/4(1ch)]
+        haze_mask:    (B,1,H,W) 二值掩码，None 时 mask=0 退化为纯自适应融合
+
+        ir_feat_list=None 时为纯特征提取模式（IR 并行编码器使用，不做注入）
         """
 
         x = self.conv1(x)
@@ -592,56 +588,55 @@ class Res2Net(nn.Module):
         x_layer0 = x  # (B, 64, H/2, W/2) - 用于 H4 蒸馏 和 H/2 解码
         x_maxpool = self.maxpool(x)  # (B, 64, H/4, W/4)
 
-        # --- H/4 尺度 ---
+        # --- 纯特征提取模式（IR 编码器，不做注入）---
+        if ir_feat_list is None:
+            x_layer1_orig = self.layer1(x_maxpool)    # (B, 256, H/4, W/4)
+            x_layer2_orig = self.layer2(x_layer1_orig) # (B, 512, H/8, W/8)
+            x_layer3_orig = self.layer3(x_layer2_orig) # (B, 1024, H/16, W/16)
+            fused_outputs = [x_layer3_orig, x_layer2_orig, x_layer1_orig, x_layer0]
+            original_outputs = [x_layer3_orig, x_layer2_orig, x_layer1_orig, x_layer0]
+            return fused_outputs, original_outputs
+
+        # --- H/4 尺度 (layer1, 256ch) ---
         x_layer1_orig = self.layer1(x_maxpool)  # (B, 256, H/4, W/4)
-        x_layer1_fused = x_layer1_orig  # 默认等于原始特征
-        if inf_weights is not None:
-            inf_w_4 = self.inject_conv1(inf_weights[2])  # 64 -> 256
-            inf_w_4 = F.interpolate(inf_w_4, size=x_layer1_orig.shape[2:], mode='bilinear', align_corners=False)
+        F_vis_1 = x_layer1_orig
+        F_ir_1 = self.inject_conv1(ir_feat_list[2])  # 64→256, 纯IR
+        F_ir_1 = F.interpolate(F_ir_1, size=F_vis_1.shape[2:], mode='bilinear', align_corners=False)
+        beta_1 = F.interpolate(beta_list[2], size=F_vis_1.shape[2:], mode='bilinear', align_corners=False)
+        if haze_mask is not None:
+            mask_1 = F.interpolate(haze_mask, size=F_vis_1.shape[2:], mode='bilinear', align_corners=False)
+        else:
+            mask_1 = torch.zeros_like(beta_1)
+        beta_eff_1 = mask_1 + (1.0 - mask_1) * beta_1  # M=1→1(纯IR), M=0→β
+        x_layer1_fused = (1.0 - beta_eff_1) * F_vis_1 + beta_eff_1 * F_ir_1
 
-            # --- [核心修改 V2] (基础/增强) 注入逻辑 ---
-            if haze_mask is not None:
-                mask_l1 = F.interpolate(haze_mask, size=inf_w_4.shape[2:], mode='bilinear', align_corners=False)
-                # 门控替换：mask=1 → 纯IR，mask=0 → 纯VIS，边界软过渡
-                x_layer1_fused = (1.0 - mask_l1) * x_layer1_orig + mask_l1 * inf_w_4
-            else:
-                # 2. 未提供掩码：仅使用基础注入
-                x_layer1_fused = x_layer1_orig + (inf_w_4 * self.base_inject_weight)
-            # --- [核心修改 V2 结束] ---
-
-        # --- H/8 尺度 ---
+        # --- H/8 尺度 (layer2, 512ch) ---
         x_layer2_orig = self.layer2(x_layer1_fused)  # (B, 512, H/8, W/8)
-        x_layer2_fused = x_layer2_orig  # 默认
-        if inf_weights is not None:
-            inf_w_8 = self.inject_conv2(inf_weights[1])  # 128 -> 512
-            inf_w_8 = F.interpolate(inf_w_8, size=x_layer2_orig.shape[2:], mode='bilinear', align_corners=False)
+        F_vis_2 = x_layer2_orig
+        F_ir_2 = self.inject_conv2(ir_feat_list[1])  # 128→512, 纯IR
+        F_ir_2 = F.interpolate(F_ir_2, size=F_vis_2.shape[2:], mode='bilinear', align_corners=False)
+        beta_2 = F.interpolate(beta_list[1], size=F_vis_2.shape[2:], mode='bilinear', align_corners=False)
+        if haze_mask is not None:
+            mask_2 = F.interpolate(haze_mask, size=F_vis_2.shape[2:], mode='bilinear', align_corners=False)
+        else:
+            mask_2 = torch.zeros_like(beta_2)
+        beta_eff_2 = mask_2 + (1.0 - mask_2) * beta_2
+        x_layer2_fused = (1.0 - beta_eff_2) * F_vis_2 + beta_eff_2 * F_ir_2
 
-            # --- [核心修改 V2] (基础/增强) 注入逻辑 ---
-            if haze_mask is not None:
-                mask_l2 = F.interpolate(haze_mask, size=inf_w_8.shape[2:], mode='bilinear', align_corners=False)
-                # 门控替换：mask=1 → 纯IR，mask=0 → 纯VIS，边界软过渡
-                x_layer2_fused = (1.0 - mask_l2) * x_layer2_orig + mask_l2 * inf_w_8
-            else:
-                x_layer2_fused = x_layer2_orig + (inf_w_8 * self.base_inject_weight)
-            # --- [核心修改 V2 结束] ---
-
-        # --- H/16 尺度 ---
+        # --- H/16 尺度 (layer3, 1024ch) ---
         x_layer3_orig = self.layer3(x_layer2_fused)  # (B, 1024, H/16, W/16)
-        x_layer3_fused = x_layer3_orig  # 默认
-        if inf_weights is not None:
-            inf_w_16 = self.inject_conv3(inf_weights[0])  # 256 -> 1024
-            inf_w_16 = F.interpolate(inf_w_16, size=x_layer3_orig.shape[2:], mode='bilinear', align_corners=False)
+        F_vis_3 = x_layer3_orig
+        F_ir_3 = self.inject_conv3(ir_feat_list[0])  # 256→1024, 纯IR
+        F_ir_3 = F.interpolate(F_ir_3, size=F_vis_3.shape[2:], mode='bilinear', align_corners=False)
+        beta_3 = F.interpolate(beta_list[0], size=F_vis_3.shape[2:], mode='bilinear', align_corners=False)
+        if haze_mask is not None:
+            mask_3 = F.interpolate(haze_mask, size=F_vis_3.shape[2:], mode='bilinear', align_corners=False)
+        else:
+            mask_3 = torch.zeros_like(beta_3)
+        beta_eff_3 = mask_3 + (1.0 - mask_3) * beta_3
+        x_layer3_fused = (1.0 - beta_eff_3) * F_vis_3 + beta_eff_3 * F_ir_3
 
-            # --- [核心修改 V2] (基础/增强) 注入逻辑 ---
-            if haze_mask is not None:
-                mask_l3 = F.interpolate(haze_mask, size=inf_w_16.shape[2:], mode='bilinear', align_corners=False)
-                # 门控替换：mask=1 → 纯IR，mask=0 → 纯VIS，边界软过渡
-                x_layer3_fused = (1.0 - mask_l3) * x_layer3_orig + mask_l3 * inf_w_16
-            else:
-                x_layer3_fused = x_layer3_orig + (inf_w_16 * self.base_inject_weight)
-            # --- [核心修改 V2 结束] ---
-
-        # [修改] 返回 注入后(fused)的特征（用于解码）和 注入前(orig)的特征（用于蒸馏）
+        # 返回 注入后(fused)的特征（解码用）和 注入前(orig)的特征（蒸馏用）
         fused_outputs = [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0]
         original_outputs = [x_layer3_orig, x_layer2_orig, x_layer1_orig, x_layer0]
 
@@ -1107,28 +1102,20 @@ class ChannelAttentionFusion(nn.Module):
 
 class RegionColorRestorer(nn.Module):
     """
-    双源颜色恢复模块（Dual-Source Region Color Restorer）。
+    区域颜色恢复模块（Region Color Restorer）。
 
-    K/V 由两个来源联合构成：
-      1. 编码器可靠区域特征（mask=0区域）：图内局部颜色证据
-      2. 冻结CLIP的patch-level特征（可靠区域patches）：跨图语义颜色先验
+    K/V 只来自编码器 M=0 可靠区域特征（key_bias 压制 M=1 位置），
+    纯图内 Cross-Attention，不依赖外部语义先验。
 
     Q：补全区域（mask=1区域）的编码器特征，
        问题："我这里是什么类型的场景，应该有什么颜色？"
 
-    两类K/V沿sequence维度拼接，attention同时检索两类信息，
-    自动学习什么时候信图内证据、什么时候信语义先验。
-
     输入：
-        feat              (B, C, H, W)        编码器瓶颈特征
-        haze_mask         (B, 1, H0, W0)      原始分辨率掩码
-        clip_patch_feat   (B, N_patches, 512) 冻结CLIP的patch tokens
-        clip_patch_mask   (B, N_patches, 1)   CLIP patch级别的可靠性掩码
+        feat       (B, C, H, W)         编码器瓶颈特征
+        haze_mask  (B, 1, H0, W0)       原始分辨率掩码
     输出：
         (B, C, H, W)  颜色恢复后的特征
     """
-
-    CLIP_DIM = 512  # CLIP ViT-B/32 patch token 维度
 
     def __init__(self, feat_dim=256, num_heads=8, dropout=0.0):
         super(RegionColorRestorer, self).__init__()
@@ -1141,13 +1128,9 @@ class RegionColorRestorer(nn.Module):
         # Q 投影（补全区域编码器特征 → 查询向量）
         self.q_proj = nn.Linear(feat_dim, feat_dim, bias=False)
 
-        # 来源1：编码器可靠区域特征的 K/V 投影
+        # K/V 投影（只来自编码器 M=0 可靠区域特征，纯图内 Cross-Attention）
         self.k_enc_proj = nn.Linear(feat_dim, feat_dim, bias=False)
         self.v_enc_proj = nn.Linear(feat_dim, feat_dim, bias=False)
-
-        # 来源2：CLIP patch特征的 K/V 投影（512 → feat_dim）
-        self.k_clip_proj = nn.Linear(self.CLIP_DIM, feat_dim, bias=False)
-        self.v_clip_proj = nn.Linear(self.CLIP_DIM, feat_dim, bias=False)
 
         # 输出投影 + LayerNorm
         self.out_proj = nn.Linear(feat_dim, feat_dim, bias=False)
@@ -1157,15 +1140,15 @@ class RegionColorRestorer(nn.Module):
         # 零初始化：训练初期 color_restorer 等于恒等映射，不破坏预训练特征
         nn.init.zeros_(self.out_proj.weight)
 
-    def forward(self, feat, haze_mask, clip_patch_feat, clip_patch_mask):
+    def forward(self, feat, haze_mask):
         """
-        feat:            (B, C, H, W)
-        haze_mask:       (B, 1, H_orig, W_orig)  — 自动下采样到 feat 尺寸
-        clip_patch_feat: (B, N, 512)              — 冻结CLIP的patch tokens
-        clip_patch_mask: (B, N, 1)                — 值∈[0,1]，1=不可靠patch
+        feat:       (B, C, H, W)        编码器瓶颈特征
+        haze_mask:  (B, 1, H_orig, W_orig) — 自动下采样到 feat 尺寸
+
+        K/V 只来自编码器 M=0 可靠区域（key_bias 压制 M=1 位置），
+        纯图内 Cross-Attention，不依赖外部语义先验。
         """
         B, C, H, W = feat.shape
-        N = clip_patch_feat.shape[1]  # CLIP patch数量（ViT-B/32时为49）
 
         # 1. 将 haze_mask 下采样到当前特征尺寸
         mask = F.interpolate(
@@ -1183,62 +1166,48 @@ class RegionColorRestorer(nn.Module):
         # 3. 计算 Q（所有位置都参与，但只在补全区域输出）
         Q = self.q_proj(feat_flat)   # (B, HW, D)
 
-        # 4. 来源1：编码器特征的 K/V
-        K_enc = self.k_enc_proj(feat_flat)   # (B, HW, D)
-        V_enc = self.v_enc_proj(feat_flat)   # (B, HW, D)
+        # 4. 编码器特征的 K/V（M=0 可靠区为有效来源）
+        K = self.k_enc_proj(feat_flat)   # (B, HW, D)
+        V = self.v_enc_proj(feat_flat)   # (B, HW, D)
 
-        # 5. 来源2：CLIP patch特征的 K/V
-        K_clip = self.k_clip_proj(clip_patch_feat)   # (B, N, D)
-        V_clip = self.v_clip_proj(clip_patch_feat)   # (B, N, D)
+        # 5. Key Bias：补全区域（mask≈1）不能作为颜色来源
+        key_bias = (mask_flat * (-1e4)).permute(0, 2, 1).unsqueeze(1)  # (B,1,1,HW)
 
-        # 6. 沿 sequence 维度拼接联合 K/V
-        K = torch.cat([K_enc, K_clip], dim=1)   # (B, HW+N, D)
-        V = torch.cat([V_enc, V_clip], dim=1)   # (B, HW+N, D)
-
-        # 7. 构建联合 Key Bias
-        # 编码器侧：补全区域（mask≈1）不能作为颜色来源
-        enc_key_bias  = mask_flat * (-1e4)           # (B, HW, 1)
-        # CLIP侧：雾霾区域对应的patch（clip_patch_mask≈1）不能作为来源
-        clip_key_bias = clip_patch_mask * (-1e4)     # (B, N, 1)
-        # 拼接：(B, HW+N, 1) → (B, 1, 1, HW+N) 用于广播
-        key_bias = torch.cat([enc_key_bias, clip_key_bias], dim=1)
-        key_bias = key_bias.permute(0, 2, 1).unsqueeze(1)   # (B,1,1,HW+N)
-
-        # 8. 多头拆分
+        # 6. 多头拆分
         def split_heads(x, seq_len):
             # x: (B, seq_len, D) → (B, nh, seq_len, hd)
             return x.view(B, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
         Q = split_heads(Q, H * W)          # (B, nh, HW, hd)
-        K = split_heads(K, H * W + N)      # (B, nh, HW+N, hd)
-        V = split_heads(V, H * W + N)      # (B, nh, HW+N, hd)
+        K = split_heads(K, H * W)          # (B, nh, HW, hd)
+        V = split_heads(V, H * W)          # (B, nh, HW, hd)
 
-        # 9. Scaled Dot-Product Attention，压制不可靠的 Key 位置
-        attn = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-        # attn: (B, nh, HW, HW+N)
-        attn = attn + key_bias   # 广播 key_bias (B,1,1,HW+N) → (B,nh,HW,HW+N)
+        # 7. Scaled Dot-Product Attention，压制不可靠的 Key 位置
+        attn = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # (B, nh, HW, HW)
+        attn = attn + key_bias   # 广播 key_bias (B,1,1,HW) → (B,nh,HW,HW)
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
         out = torch.matmul(attn, V)   # (B, nh, HW, hd)
 
-        # 10. 合并多头
+        # 8. 合并多头
         out = out.permute(0, 2, 1, 3).contiguous().view(B, H * W, C)
         out = self.out_proj(out)   # (B, HW, C)
 
-        # 11. 残差：只对补全区域叠加 attention 输出
+        # 9. 残差：只对补全区域叠加 attention 输出
         restored = feat_flat + mask_flat * out
         restored = self.norm(restored)
 
         return restored.permute(0, 2, 1).view(B, C, H, W)
 
 
-# --- 修改后的 VIFNetInconsistencyTeacher 模型 ---
+# --- [区域补全范式] VIFNetInconsistencyTeacher 模型 ---
 class VIFNetInconsistencyTeacher(nn.Module):
     """
-    [修改后] 双流教师模型，采用“两阶段精炼”架构。
-    阶段一：使用 VIFnet 轻量级模块提取结构特征。
-    阶段二：使用 Res2Net 重量级模块进行去雾精炼。
+    Region-completion paradigm teacher model. HAPM mask splits into two paths:
+      - Pass 1 (lightweight dual-stream): pure IR structure + per-pixel fusion weight beta
+      - Pass 2 (Res2Net): M=1 -> pure IR fill, M=0 -> adaptive VIS/IR fusion
+      - Color restoration: in-image Cross-Attention, K/V from M=0 reliable regions only
     """
 
     def __init__(self, res_blocks=18):
@@ -1366,37 +1335,9 @@ class VIFNetInconsistencyTeacher(nn.Module):
         # --- [修改] 移除 final_fusion 并调整 conv_output ---
         # self.final_fusion = ChannelAttentionFusion(in_channels=16, reduction=4, out_channels=32)
 
-        # 冻结 CLIP 视觉编码器（ViT-B/32）+ monkey-patch 返回所有 token
-        _clip_standard, _ = clip_load("ViT-B/32", device="cpu")
-        _vis = _clip_standard.visual
+        # [已移除] CLIP 视觉编码器加载 — 颜色恢复改为纯图内 Cross-Attention
 
-        # Monkey-patch：让 visual 返回所有 token (B,50,512) 而不是只返回 CLS (B,512)
-        _original_forward = _vis.forward.__func__
-        def _patched_forward(self_inner, x):
-            x = self_inner.conv1(x)
-            x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)
-            x = torch.cat([
-                self_inner.class_embedding.to(x.dtype) +
-                torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
-                x], dim=1)
-            x = x + self_inner.positional_embedding.to(x.dtype)
-            x = self_inner.ln_pre(x)
-            x = x.permute(1, 0, 2)
-            x = self_inner.transformer(x)
-            x = x.permute(1, 0, 2)
-            x = self_inner.ln_post(x)          # 对所有 token，不只取 [:, 0, :]
-            if self_inner.proj is not None:
-                x = x @ self_inner.proj
-            return x                            # (B, 50, 512)
-
-        _vis.forward = types.MethodType(_patched_forward, _vis)
-        self.clip_visual = _vis
-        del _clip_standard
-        for param in self.clip_visual.parameters():
-            param.requires_grad = False
-        self.clip_visual.eval()
-
-        # CLIP 输入归一化参数（ViT-B/32 标准值）
+        # CLIP 输入归一化参数（ViT-B/32 标准值，HDE 的 x_vis_01 反归一化必需）
         self.register_buffer(
             'clip_input_mean',
             torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
@@ -1418,7 +1359,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
 
     # --- [重写] forward 方法 ---
     def forward(self, x_vis, x_ir, haze_mask=None):
-        # x_vis_01 提前计算：CLIP 反归一化到 [0,1]，供 HDE 和 CLIP patch 提取共用
+        # x_vis_01: 反归一化到 [0,1]，供 HDE 雾密度估计用
         x_vis_01 = (x_vis * self.clip_input_std + self.clip_input_mean).clamp(0, 1)
 
         if haze_mask is None:
@@ -1443,24 +1384,21 @@ class VIFNetInconsistencyTeacher(nn.Module):
         ir_b_dec_features = self.decoder_b_ir(ir_b_enc_features)  # [64, 128, 256]
         ir_structure = self.dsfe_ir(ir_b_enc_features, ir_b_dec_features)  # [64, 128, 256]
 
-        # --- 阶段三：计算不一致性权重 ---
-        # (这部分保留)
-        # 列表顺序：[H/16(256), H/8(128), H/4(64)]
-        inf_weight_list = [None, None, None]
+        # --- 阶段三：构建 Pass 2 注入源 (区域补全范式) ---
+        # ir_feat_list: 纯 IR 结构特征，索引 [H/16, H/8, H/4]
+        ir_feat_list = [ir_structure[2], ir_structure[1], ir_structure[0]]
 
-        incons_feature_3 = f(vis_structure[2], ir_structure[2])
-        inf_weight_list[0] = incons_feature_3 * ir_structure[2]  # H/16 尺度 (256 通道)
-
-        incons_feature_2 = f(vis_structure[1], ir_structure[1])
-        inf_weight_list[1] = incons_feature_2 * ir_structure[1]  # H/8 尺度 (128 通道)
-
-        incons_feature_1 = f(vis_structure[0], ir_structure[0])
-        inf_weight_list[2] = incons_feature_1 * ir_structure[0]  # H/4 尺度 (64 通道)
+        # beta_list: 逐像素 IR 融合权重 β∈[0,1]
+        # β = ir_structure * (1 - vis_structure)，channel-mean 到单通道
+        # 物理含义：可见光结构丢失(vis_s↓) 且 红外有结构(ir_s↑) → β↑ → 该处更信 IR
+        beta_list = []
+        for i in range(3):  # i=0:H/4, 1:H/8, 2:H/16
+            beta = (ir_structure[i] * (1.0 - vis_structure[i])).mean(dim=1, keepdim=True)
+            beta_list.append(beta)
+        beta_list = [beta_list[2], beta_list[1], beta_list[0]]  # 重排为 [H/16, H/8, H/4]
 
         # --- 阶段四：精炼编码与注入（Pass 2 - A 模块）---
-        # (这部分保留，包含掩码逻辑)
-        # 4a. 运行 Pass 2 Encoder (代码库 A) 并进行串联注入
-        fused_outputs, original_outputs = self.encoder_vis(x_vis, inf_weight_list, haze_mask)
+        fused_outputs, original_outputs = self.encoder_vis(x_vis, ir_feat_list, beta_list, haze_mask)
 
         # (fused_outputs)  [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0]
         # (original_outputs) [x_layer3_orig, x_layer2_orig, x_layer1_orig, x_layer0]
@@ -1482,30 +1420,8 @@ class VIFNetInconsistencyTeacher(nn.Module):
         # 5a. CRA 降维 (输入是已融合的特征)
         res16x_vis = self.CRA1_vis(x_layer3_fused)  # (256)
 
-        # --- 颜色恢复：双源 K/V（编码器可靠特征 + CLIP语义先验）---
-
-        # 1. 提取 CLIP patch-level 特征（冻结，无梯度）
-        with torch.no_grad():
-            x_vis_clip = (x_vis_01 - self.clip_input_mean) / self.clip_input_std
-            x_vis_clip_224 = F.interpolate(
-                x_vis_clip, size=(224, 224), mode='bilinear', align_corners=False
-            )
-            clip_tokens = self.clip_visual(x_vis_clip_224)           # (B, 50, 512)
-            clip_patch_feat = clip_tokens[:, 1:, :]                   # (B, 49, 512) 去掉 CLS
-
-        # 2. 计算 CLIP patch 级别的可靠性掩码
-        clip_patch_mask = F.interpolate(
-            haze_mask, size=(7, 7), mode='bilinear', align_corners=False
-        )  # (B, 1, 7, 7)
-        clip_patch_mask = clip_patch_mask.flatten(2).permute(0, 2, 1)  # (B, 49, 1)
-
-        # 3. 调用双源颜色恢复模块
-        res16x_vis = self.color_restorer(
-            res16x_vis,
-            haze_mask,
-            clip_patch_feat,
-            clip_patch_mask
-        )
+        # --- 颜色恢复：图内 Cross-Attention（K/V 只来自 M=0 可靠区）---
+        res16x_vis = self.color_restorer(res16x_vis, haze_mask)
 
         res8x_vis = self.CRA2_vis(x_layer2_fused)  # (128)
         res4x_vis = self.CRA3_vis(x_layer1_fused)  # (64)
