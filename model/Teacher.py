@@ -9,6 +9,7 @@ from collections import OrderedDict
 # --- [修改] 使用绝对导入（因为我们添加了项目根目录到 sys.path） ---
 from .vifnet_basic_modules import Encoder_B, Decoder_B, Conv_B, CPAB
 from .dsfe import DSFE
+from torchvision.ops import DeformConv2d
 
 
 # --- [修改结束] ---
@@ -17,96 +18,6 @@ from .dsfe import DSFE
 def f(x, y):
     """VIFNet inconsistency function (code version)"""
     return (1 - x) * (1 - y) + 1 / 2 * x * y
-
-
-def compute_haze_density(x_vis_01):
-    """Estimate per-pixel haze density from VIS physical cues.
-
-    Three signals that correlate with haze:
-      1. Brightness — haze scatters light, making hazy regions brighter
-      2. Saturation — haze desaturates colors
-      3. Local contrast — haze flattens local texture variance
-
-    H = brightness * (1 - saturation) * (1 - local_contrast)
-    Higher H -> denser haze.
-    """
-    # 1. Luminance (BT.601)
-    L = 0.299 * x_vis_01[:, 0:1, :, :] + \
-        0.587 * x_vis_01[:, 1:2, :, :] + \
-        0.114 * x_vis_01[:, 2:3, :, :]
-
-    # 2. Saturation (1 - min(R,G,B) / max(R,G,B))
-    max_rgb = x_vis_01.max(dim=1, keepdim=True)[0]
-    min_rgb = x_vis_01.min(dim=1, keepdim=True)[0]
-    S = 1.0 - min_rgb / (max_rgb + 1e-6)
-
-    # 3. Local contrast (local std of luminance, kernel=15)
-    kernel_size = 15
-    padding = kernel_size // 2
-    kernel = torch.ones(1, 1, kernel_size, kernel_size,
-                        device=x_vis_01.device,
-                        dtype=x_vis_01.dtype) / (kernel_size ** 2)
-    L_mean = F.conv2d(L, kernel, padding=padding)
-    L_sq_mean = F.conv2d(L ** 2, kernel, padding=padding)
-    C = torch.sqrt((L_sq_mean - L_mean ** 2).clamp(min=0) + 1e-6)
-
-    # 4. Joint haze density
-    H = L * (1.0 - S) * (1.0 - C)
-
-    # 5. Per-image min-max normalize to [0, 1]
-    B = H.shape[0]
-    flat = H.view(B, -1)
-    min_val = flat.min(dim=1)[0].view(B, 1, 1, 1)
-    max_val = flat.max(dim=1)[0].view(B, 1, 1, 1)
-    H = (H - min_val) / (max_val - min_val + 1e-6)
-
-    return H  # (B, 1, H, W), higher = denser haze
-
-
-def compute_ir_structure(x_ir):
-    """Compute per-pixel IR local structure energy, normalized to [0, 1].
-
-    Same Sobel-gradient pipeline as the old compute_raw_structure_energy,
-    but with per-image min-max normalization appended so the output is
-    directly usable as a spatial calibration map.
-    """
-    C = x_ir.shape[1]
-    sobel_x = torch.tensor(
-        [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-        dtype=x_ir.dtype, device=x_ir.device
-    ).view(1, 1, 3, 3)
-    sobel_y = torch.tensor(
-        [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-        dtype=x_ir.dtype, device=x_ir.device
-    ).view(1, 1, 3, 3)
-    sobel_x_mc = sobel_x.repeat(C, 1, 1, 1)
-    sobel_y_mc = sobel_y.repeat(C, 1, 1, 1)
-    Ix = F.conv2d(x_ir, sobel_x_mc, padding=1, groups=C)
-    Iy = F.conv2d(x_ir, sobel_y_mc, padding=1, groups=C)
-    grad_energy = (Ix ** 2 + Iy ** 2).mean(dim=1, keepdim=True)
-
-    radius = 3
-    kernel_size = 7
-    coords = torch.arange(kernel_size, device=x_ir.device,
-                          dtype=x_ir.dtype) - radius
-    sigma = 1.5
-    kernel = torch.exp(-(coords.view(kernel_size, 1) ** 2 +
-                         coords.view(1, kernel_size) ** 2) / (2 * sigma ** 2))
-    kernel = kernel / (kernel.sum() + 1e-6)
-    kernel = kernel.view(1, 1, kernel_size, kernel_size)
-    E_ir = F.conv2d(grad_energy, kernel, padding=radius)
-
-    # Per-image min-max normalize
-    B = E_ir.shape[0]
-    flat = E_ir.view(B, -1)
-    min_val = flat.min(dim=1)[0].view(B, 1, 1, 1)
-    max_val = flat.max(dim=1)[0].view(B, 1, 1, 1)
-    return (E_ir - min_val) / (max_val - min_val + 1e-6)
-
-
-def compute_sky_mask(x_ir):
-    B, _, H_s, W_s = x_ir.shape
-    return torch.zeros(B, 1, H_s, W_s, device=x_ir.device, dtype=x_ir.dtype)
 
 
 def differentiable_otsu(q_complete, num_bins=256, delta=0.02, temperature=0.01):
@@ -130,6 +41,106 @@ def differentiable_otsu(q_complete, num_bins=256, delta=0.02, temperature=0.01):
     weights = torch.softmax(sigma_b / temperature, dim=1)
     tau = (weights * bin_values).sum(dim=1).view(b, 1, 1, 1)
     return tau
+
+
+class HDE(nn.Module):
+    """Haze Distribution Estimator (adopted from HDCFN, ACM MM'25).
+
+    Estimates per-pixel haze density from visible image only,
+    using deformable convolutions to adapt to irregular haze
+    shapes and multi-scale spatial attention for density output.
+
+    Input:  x_vis_01  (B, 3, H, W)  de-normalized to [0, 1]
+    Output: M_vis     (B, 1, H, W)  in [0, 1], high = dense haze
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Stage 1: Initial feature extraction
+        self.conv_init = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # Stage 2: Deformable conv block 1  32->64
+        # offset channels = 2 * kH * kW = 2*3*3 = 18
+        self.offset_conv1 = nn.Conv2d(32, 18, kernel_size=3,
+                                      padding=1, bias=True)
+        self.deform_conv1 = DeformConv2d(32, 64, kernel_size=3,
+                                         padding=1, bias=False)
+        self.bn_relu1 = nn.Sequential(
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+
+        # Stage 3: Deformable conv block 2  64->64
+        self.offset_conv2 = nn.Conv2d(64, 18, kernel_size=3,
+                                      padding=1, bias=True)
+        self.deform_conv2 = DeformConv2d(64, 64, kernel_size=3,
+                                         padding=1, bias=False)
+        self.bn_relu2 = nn.Sequential(
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+
+        # Stage 4: Multi-scale convolutions (3 parallel branches)
+        self.conv_ms1 = nn.Conv2d(64, 32, kernel_size=1,
+                                  padding=0, bias=False)
+        self.conv_ms2 = nn.Conv2d(64, 32, kernel_size=3,
+                                  padding=2, dilation=2, bias=False)
+        self.conv_ms3 = nn.Conv2d(64, 32, kernel_size=3,
+                                  padding=4, dilation=4, bias=False)
+
+        # Stage 5: Spatial attention -> haze density map
+        self.attn_conv = nn.Conv2d(2, 1, kernel_size=7,
+                                   padding=3, bias=True)
+
+        # Weight init
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight,
+                                        mode='fan_out',
+                                        nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        # offset convs -> zero init = identity deformation at start
+        nn.init.zeros_(self.offset_conv1.weight)
+        nn.init.zeros_(self.offset_conv1.bias)
+        nn.init.zeros_(self.offset_conv2.weight)
+        nn.init.zeros_(self.offset_conv2.bias)
+
+    def forward(self, x_vis_01):
+        # Stage 1
+        f = self.conv_init(x_vis_01)            # (B, 32, H, W)
+
+        # Stage 2
+        offset1 = self.offset_conv1(f)          # (B, 18, H, W)
+        f = self.deform_conv1(f, offset1)       # (B, 64, H, W)
+        f = self.bn_relu1(f)
+
+        # Stage 3
+        offset2 = self.offset_conv2(f)          # (B, 18, H, W)
+        f = self.deform_conv2(f, offset2)       # (B, 64, H, W)
+        f = self.bn_relu2(f)
+
+        # Stage 4: multi-scale concat
+        f1 = self.conv_ms1(f)                   # (B, 32, H, W)
+        f2 = self.conv_ms2(f)                   # (B, 32, H, W)
+        f3 = self.conv_ms3(f)                   # (B, 32, H, W)
+        fm = torch.cat([f1, f2, f3], dim=1)    # (B, 96, H, W)
+
+        # Stage 5: spatial attention
+        gap = fm.mean(dim=1, keepdim=True)      # (B, 1, H, W)
+        gmp = fm.max(dim=1, keepdim=True)[0]   # (B, 1, H, W)
+        M_vis = torch.sigmoid(
+            self.attn_conv(torch.cat([gap, gmp], dim=1))
+        )                                        # (B, 1, H, W)
+        return M_vis
 
 
 # --- 基础模块 (SobelEdgeDetector, Pre_Res2Net, Bottle2neck, Res2Net(3通道输入), ConvBlock, DeconvBlock, Decoder_MDCBlock1, make_dense, RDB, ConvLayer, UpsampleConvLayer, ResidualBlock) ---
@@ -1104,16 +1115,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
     def __init__(self, res_blocks=18):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
-        self.q_vis_refine = nn.Sequential(
-            nn.Conv2d(5, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
+        self.hde = HDE()
 
 
         # --- [新增] 阶段一 (Pass 1) 模块 (来自代码库 B) ---
@@ -1257,19 +1259,11 @@ class VIFNetInconsistencyTeacher(nn.Module):
             ).view(1, 3, 1, 1)
             x_vis_01 = (x_vis * clip_std + clip_mean).clamp(0, 1)
 
-            H = compute_haze_density(x_vis_01)
-            E_ir = compute_ir_structure(x_ir)
-
-            # Sky exclusion: suppress haze density in flat IR regions
-            sky_mask = compute_sky_mask(x_ir)
-            H_calibrated = H * (1.0 - sky_mask)
-
-            vis_input = torch.cat([H_calibrated, E_ir, x_vis_01], dim=1)
-            q_vis = self.q_vis_refine(vis_input)
-            q_complete = 1.0 - q_vis
-            tau = differentiable_otsu(q_complete)
-            m_hard = (q_complete >= tau).float()
-            m_soft = torch.sigmoid((q_complete - tau) / 0.1)
+            # --- HAPM: HDE-based haze density estimation ---
+            M_vis = self.hde(x_vis_01)          # (B,1,H,W) high=dense haze
+            tau = differentiable_otsu(M_vis)
+            m_hard = (M_vis >= tau).float()
+            m_soft = torch.sigmoid((M_vis - tau) / 0.1)
             haze_mask = m_hard.detach() + m_soft - m_soft.detach()
 
         # --- 阶段一 & 二：并行结构提取 (Pass 1 - B 模块) ---
