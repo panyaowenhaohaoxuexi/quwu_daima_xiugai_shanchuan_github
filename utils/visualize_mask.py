@@ -16,6 +16,7 @@ utils/visualize_mask.py
 import os
 import torch
 import torch.nn.functional as F
+from model.Teacher import differentiable_otsu
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')   # 非交互式后端，服务器上安全
@@ -129,12 +130,9 @@ def visualize_epoch_mask(
     M_vis = _captured['M_vis'][:n]   # (n, 1, H, W)
 
     # 从 M_vis 重新计算 haze_mask（与 model/Teacher.py 中逻辑一致）
-    # 简单用全图 0.5 阈值得到二值图（仅用于可视化，不影响训练）
-    # 也可以用 Otsu，但 cpu 上直接用中位数代替更简单
-    thresholds = M_vis.flatten(1).median(dim=1).values   # (n,)
-    haze_mask_hard = torch.zeros_like(M_vis)
-    for i in range(n):
-        haze_mask_hard[i] = (M_vis[i] >= thresholds[i]).float()
+    # 使用 differentiable_otsu 计算阈值，与训练 forward 完全一致
+    tau = differentiable_otsu(M_vis)                     # (n,1,1,1)
+    haze_mask_hard = (M_vis >= tau).float()               # (n,1,H,W) 训练真实硬掩码
 
     # 反归一化可见光
     vis_01   = _denorm_vis(vis, device).cpu()   # (n, 3, H, W)
@@ -146,7 +144,7 @@ def visualize_epoch_mask(
         figsize=(16, 4 * n),
         squeeze=False
     )
-    col_titles = ['可见光雾图', '红外图', 'HAPM 软密度图 M_vis', '二值掩码 haze_mask']
+    col_titles = ['可见光雾图', '红外图', 'HAPM 软密度图 M_vis', '二值掩码 haze_mask (Otsu)']
 
     for row in range(n):
         # 列1：可见光

@@ -14,7 +14,8 @@
       "Bash(d:/anaconda/envs/coa/python.exe -c ' *)",
       "Bash(python3 -c ' *)",
       "Bash(python -c \"from loss import BoundarySmoothnessLoss; print\\('Import OK:', BoundarySmoothnessLoss\\)\")",
-      "Bash(git diff *)"
+      "Bash(git diff *)",
+      "Bash(python -c \"from model.Teacher import differentiable_otsu; print\\('Import OK:', differentiable_otsu\\)\")"
     ]
   }
 }
