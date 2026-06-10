@@ -20,7 +20,29 @@
       "Bash(python -c \"from model.hde import HDE, differentiable_otsu; print\\('Direct import from model.hde OK'\\)\")",
       "Bash(python -c \"import sys; sys.modules['einops'] = type\\(sys\\)\\('einops'\\); sys.modules['einops.layers'] = type\\(sys\\)\\('einops.layers'\\); sys.modules['einops.layers.torch'] = type\\(sys\\)\\('einops.layers.torch'\\); from model import HDE, differentiable_otsu; print\\('HDE and differentiable_otsu accessible from model namespace OK'\\)\")",
       "Bash(python -c \"from utils.visualize_mask import differentiable_otsu; print\\('visualize_mask import OK'\\)\")",
-      "Bash(python -c \"from model.hde import HDE, differentiable_otsu; h = HDE\\(\\); print\\(f'HDE instantiated OK, params: {sum\\(p.numel\\(\\) for p in h.parameters\\(\\)\\):,}'\\); t = torch.randn\\(2, 3, 256, 256\\); out = h\\(t\\); print\\(f'Forward pass OK, output shape: {out.shape}'\\); tau = differentiable_otsu\\(out\\); print\\(f'differentiable_otsu OK, tau shape: {tau.shape}, tau mean: {tau.mean\\(\\).item\\(\\):.4f}'\\)\")"
+      "Bash(python -c \"from model.hde import HDE, differentiable_otsu; h = HDE\\(\\); print\\(f'HDE instantiated OK, params: {sum\\(p.numel\\(\\) for p in h.parameters\\(\\)\\):,}'\\); t = torch.randn\\(2, 3, 256, 256\\); out = h\\(t\\); print\\(f'Forward pass OK, output shape: {out.shape}'\\); tau = differentiable_otsu\\(out\\); print\\(f'differentiable_otsu OK, tau shape: {tau.shape}, tau mean: {tau.mean\\(\\).item\\(\\):.4f}'\\)\")",
+      "Bash(python probe_hooks.py)",
+      "Bash(pip install *)",
+      "Bash(python -c \"import sys; print\\(sys.path[:5]\\)\")",
+      "Bash(python -c \"import CLIP; print\\(CLIP.__file__\\)\")",
+      "Bash(pip --version)",
+      "Bash(D:/anaconda/envs/CoA/python.exe -c \"import torch; print\\('torch', torch.__version__\\); import ftfy; print\\('ftfy ok'\\)\")",
+      "Read(//d/anaconda/envs/CoA/**)",
+      "Bash(D:/anaconda/envs/CoA/python.exe probe_hooks.py)",
+      "Bash(curl -L -o CLIP/bpe_simple_vocab_16e6.txt.gz \"https://github.com/openai/CLIP/raw/main/clip/bpe_simple_vocab_16e6.txt.gz\")",
+      "Bash(rm -rf DINOv2/facebookresearch_dinov2_main)",
+      "Bash(git clone *)",
+      "Bash(ls \"F:/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/hazy/00960.png\" 2>&1)",
+      "Read(//f/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/hazy/**)",
+      "Bash(D:/anaconda/envs/CoA/python.exe -c \"from scipy.ndimage import zoom; print\\('scipy OK'\\)\")",
+      "Bash(D:/anaconda/envs/CoA/python.exe -c ' *)",
+      "Bash(ls \"F:/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/ir/00960.png\" 2>&1 && ls \"F:/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/hazy/00960.png\" 2>&1)",
+      "Read(//f/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/ir/**)",
+      "Bash(D:/anaconda/envs/CoA/python.exe verify_cmdn_semantics.py)",
+      "Bash(D:/anaconda/envs/CoA/python.exe diagnose_disc_gfog.py)",
+      "Bash(D:/anaconda/envs/CoA/python.exe diagnose_gfog_sliding.py)",
+      "Bash(D:/anaconda/envs/CoA/python.exe verify_cmdn_fusion.py)",
+      "Bash(D:/anaconda/envs/CoA/python.exe model/Teacher.py)"
     ]
   }
 }

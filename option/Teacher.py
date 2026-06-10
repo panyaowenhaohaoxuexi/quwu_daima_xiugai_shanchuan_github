@@ -57,6 +57,13 @@ parser.add_argument('--boundary_band_k', default=5, type=int, help='kernel size 
 parser.add_argument('--boundary_lambda_edge', default=10.0, type=float, help='edge-aware weight decay factor')
 # --- [新增结束] ---
 
+# --- [新增] CMDN 掩码损失权重 ---
+parser.add_argument('--w_loss_Disc', default=0.15, type=float, help='weight of CMDN pseudo-label BCE loss')
+parser.add_argument('--w_loss_Bimodal', default=0.05, type=float, help='weight of CMDN bimodal push penalty')
+parser.add_argument('--w_loss_Sparse', default=0.05, type=float, help='weight of CMDN sparse ratio target loss')
+parser.add_argument('--target_haze_ratio', default=0.35, type=float, help='target mean haze ratio for M_vis')
+# --- [新增结束] ---
+
 # --- 3. 定义文件和目录相关的参数 ---
 
 # =========================================

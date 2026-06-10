@@ -7,7 +7,7 @@ import torchvision.transforms.functional as TF
 # --- [修改] 使用绝对导入（因为我们添加了项目根目录到 sys.path） ---
 from .vifnet_basic_modules import Encoder_B, Decoder_B, Conv_B, CPAB
 from .dsfe import DSFE
-from .hde import HDE, differentiable_otsu
+from .cmdn import CMDN
 # [已移除] CLIP 导入 — 颜色恢复改为纯图内 Cross-Attention
 
 
@@ -1088,7 +1088,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
     def __init__(self, res_blocks=18):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
-        self.hde = HDE()
+        self.cmdn = CMDN()
 
 
         # --- [新增] 阶段一 (Pass 1) 模块 (来自代码库 B) ---
@@ -1233,20 +1233,17 @@ class VIFNetInconsistencyTeacher(nn.Module):
     # (这两个函数的功能将被内联并重构到新的 forward 方法中)
 
     # --- [重写] forward 方法 ---
-    def forward(self, x_vis, x_ir, haze_mask=None):
-        # x_vis_01: 反归一化到 [0,1]，供 HDE 雾密度估计用
-        x_vis_01 = (x_vis * self.clip_input_std + self.clip_input_mean).clamp(0, 1)
-
+    def forward(self, x_vis, x_ir, haze_mask=None, disc_alpha=0.0):
         m_hard_out = None  # 仅在 haze_mask is None 分支赋值，用于边界平滑损失
+        M_vis = None
+        disc_pseudo = None
 
         if haze_mask is None:
-            # --- HAPM: HDE-based haze density estimation ---
-            M_vis = self.hde(x_vis_01)          # (B,1,H,W) high=dense haze
-            tau = differentiable_otsu(M_vis)
-            m_hard = (M_vis >= tau).float()
+            # --- CMDN: Cross-Modal Decision Network mask estimation ---
+            M_vis, disc_pseudo = self.cmdn(x_vis, x_ir, disc_alpha=disc_alpha)
+            m_hard = (M_vis >= 0.5).float()
             m_hard_out = m_hard  # 暴露给调用方用于 L_boundary
-            m_soft = torch.sigmoid((M_vis - tau) / 0.1)
-            haze_mask = m_hard.detach() + m_soft - m_soft.detach()
+            haze_mask = m_hard.detach() + M_vis - M_vis.detach()  # STE
 
         # --- 阶段一 & 二：并行结构提取 (Pass 1 - B 模块) ---
         # (这部分保留，用于计算不一致性)
@@ -1424,8 +1421,8 @@ class VIFNetInconsistencyTeacher(nn.Module):
         output = self.conv_output(vis_features)  # [修改] (16 -> 3)
         # --- [修改结束] ---
 
-        # [修改] 返回融合前的特征用于计算新损失
-        return output, vis_h_features, vis_features, ir_features, m_hard_out
+        # [修改] 返回融合前的特征 + mask 信息用于计算新损失
+        return output, vis_h_features, vis_features, ir_features, m_hard_out, M_vis, disc_pseudo
 
 
 # --- 主函数测试部分 (保持不变) ---
@@ -1436,12 +1433,14 @@ if __name__ == "__main__":
     dummy_input_vis = torch.randn(1, 3, 256, 256).to(device)
     dummy_input_ir = torch.randn(1, 3, 256, 256).to(device)
 
-    # [修改] 接收 5 个输出
-    output_tensor, intermediate_features, vis_features_out, ir_features_out, m_hard_out = net(dummy_input_vis, dummy_input_ir)
+    # [修改] 接收 7 个输出
+    output_tensor, intermediate_features, vis_features_out, ir_features_out, m_hard_out, M_vis, disc_pseudo = net(dummy_input_vis, dummy_input_ir)
 
     print("Output shape:", output_tensor.shape)
     print("Vis Features (Decoder Output) shape:", vis_features_out.shape)
     print("IR Features (Decoder Output) shape:", ir_features_out.shape)
+    print("M_vis shape:", M_vis.shape if M_vis is not None else "None")
+    print("disc_pseudo shape:", disc_pseudo.shape if disc_pseudo is not None else "None")
     print("Intermediate features shapes:")
     for feat in intermediate_features:
         print(feat.shape)

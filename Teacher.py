@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 # Teacher.py (Training Script)
 
 # 导入数学库，用于数学计算，例如余弦函数
@@ -262,8 +262,10 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
     """
     losses = []
     # --- [修改] 增加 Edge, Style, CrossModal 日志 ---
-    loss_log = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'Boundary': [], 'total': []}
-    loss_log_tmp = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'Boundary': [], 'total': []}
+    loss_log = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'Boundary': [],
+                'Disc': [], 'Bimodal': [], 'Sparse': [], 'total': []}
+    loss_log_tmp = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'Boundary': [],
+                    'Disc': [], 'Bimodal': [], 'Sparse': [], 'total': []}
     # --- [修改结束] ---
     psnr_log = []
 
@@ -324,9 +326,14 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         clear_vis = clear_vis.to(opt.device, non_blocking=True)
         # --- [修改结束] ---
 
-        # --- [修改] 模型前向传播 (双输入)，接收5个输出 ---
+        # --- [修改] 模型前向传播 (双输入)，接收7个输出 ---
         # 训练时不使用掩码 (haze_mask=None)
-        pred_image, vis_h_features, vis_features, ir_features, m_hard = teacher_net(hazy_vis, infrared, haze_mask=None)
+        # disc_alpha: cold-start schedule (first 5 epochs = 0, linear ramp to 1 by epoch 15)
+        disc_alpha = 0.0
+        if epoch_idx >= 5:
+            disc_alpha = min(1.0, (epoch_idx - 5) / 10.0)  # 5→15, linear 0→1
+        pred_image, vis_h_features, vis_features, ir_features, m_hard, M_vis, disc_pseudo = \
+            teacher_net(hazy_vis, infrared, haze_mask=None, disc_alpha=disc_alpha)
         # --- [修改结束] ---
 
         # --- [修改] 计算损失 (使用 clear_vis 作为 GT) ---
@@ -377,6 +384,15 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             loss_Boundary = criterion[6](pred_image, m_hard, gt_image=clear_vis)
         # --- [新增结束] ---
 
+        # --- [新增] CMDN 掩码损失 ---
+        loss_Disc = F.binary_cross_entropy(M_vis, disc_pseudo) if M_vis is not None else torch.tensor(0.0, device=opt.device)
+        loss_Bimodal = (4.0 * M_vis * (1 - M_vis)).mean() if M_vis is not None else torch.tensor(0.0, device=opt.device)
+        loss_Sparse = F.mse_loss(
+            M_vis.mean(),
+            torch.tensor(opt.target_haze_ratio, device=M_vis.device)
+        ) if M_vis is not None else torch.tensor(0.0, device=opt.device)
+        # --- [新增结束] ---
+
         # --- [修改] 总损失 ---
         loss = (opt.w_loss_L1 * loss_L1 +
                 opt.w_loss_SSIM * loss_SSIM +
@@ -384,7 +400,10 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
                 opt.w_loss_Edge * loss_Edge +
                 opt.w_loss_Style * loss_Style +  # <-- 新增
                 opt.w_loss_CrossModal * loss_CrossModal +  # <-- 新增
-                opt.w_loss_Boundary * loss_Boundary)  # <-- 新增
+                opt.w_loss_Boundary * loss_Boundary +  # <-- 新增
+                opt.w_loss_Disc * loss_Disc +           # CMDN 新增
+                opt.w_loss_Bimodal * loss_Bimodal +     # CMDN 新增
+                opt.w_loss_Sparse * loss_Sparse)        # CMDN 新增
         # --- [修改结束] ---
 
         # --- 反向传播和优化 ---
@@ -409,6 +428,11 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         # --- [新增结束] ---
         loss_log_tmp['Boundary'].append(
             loss_Boundary.item() if isinstance(loss_Boundary, torch.Tensor) else loss_Boundary)
+        # --- [新增 CMDN] ---
+        loss_log_tmp['Disc'].append(loss_Disc.item() if isinstance(loss_Disc, torch.Tensor) else loss_Disc)
+        loss_log_tmp['Bimodal'].append(loss_Bimodal.item() if isinstance(loss_Bimodal, torch.Tensor) else loss_Bimodal)
+        loss_log_tmp['Sparse'].append(loss_Sparse.item() if isinstance(loss_Sparse, torch.Tensor) else loss_Sparse)
+        # --- [新增结束] ---
         loss_log_tmp['total'].append(loss.item())
 
         l1_val = (opt.w_loss_L1 * loss_L1.item()) if isinstance(loss_L1, torch.Tensor) and opt.w_loss_L1 > 0 else 0.0
@@ -428,6 +452,14 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
 
         bnd_val = (opt.w_loss_Boundary * loss_Boundary.item()) if isinstance(loss_Boundary,
                                                                                torch.Tensor) and opt.w_loss_Boundary > 0 else 0.0
+        # --- [新增 CMDN] ---
+        disc_val = (opt.w_loss_Disc * loss_Disc.item()) if isinstance(loss_Disc,
+                                                                       torch.Tensor) and opt.w_loss_Disc > 0 else 0.0
+        bimodal_val = (opt.w_loss_Bimodal * loss_Bimodal.item()) if isinstance(loss_Bimodal,
+                                                                                torch.Tensor) and opt.w_loss_Bimodal > 0 else 0.0
+        sparse_val = (opt.w_loss_Sparse * loss_Sparse.item()) if isinstance(loss_Sparse,
+                                                                             torch.Tensor) and opt.w_loss_Sparse > 0 else 0.0
+        # --- [新增结束] ---
 
         # AAA
 
@@ -437,6 +469,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             f'\rloss:{loss.item():.5f} | L1:{l1_val:.5f} | SSIM:{ssim_val:.5f} | Cr:{cr_val:.5f} | Edge:{edge_val:.5f} '
             f'| Style:{style_val:.5f} | CrossM:{crossmodal_val:.5f} '  # <-- 新增
             f'| Bnd:{bnd_val:.5f} '
+            f'| Disc:{disc_val:.5f} | Bim:{bimodal_val:.5f} | Spar:{sparse_val:.5f} '  # <-- CMDN 新增
             f'| step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}',
             end='', flush=True)
         # --- [修改结束] ---
