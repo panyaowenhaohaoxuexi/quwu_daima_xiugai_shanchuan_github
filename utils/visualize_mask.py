@@ -16,7 +16,7 @@ Fixed first N samples ensure cross-epoch comparability.
 import os
 import torch
 import torch.nn.functional as F
-from model.Teacher import differentiable_otsu
+from model.hde import differentiable_otsu
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')   # Non-interactive backend, safe on headless servers
