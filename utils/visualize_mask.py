@@ -6,15 +6,18 @@ Call visualize_epoch_mask() at the end of each epoch,
 saves a multi-column comparison image:
   Col1: Hazy visible image (denormalized to [0,1])
   Col2: Infrared image (normalized to [0,1])
-  Col3: g_fog — CLIP sliding-window fog density
-  Col4: attn_deg — DINOv2 local structure variance
-  Col5: P_pseudo - fused pseudo-label
-  Col6: P_fail - CMDN visible failure probability map
-  Col7: tau - image-adaptive threshold
-  Col8: G_dec - adaptive decision gate
-  Col9: P_support - detached conservative support
-  Col10: G_soft - final conservative soft gate
-  Col11: M_hard - binary region mask from G_soft
+  Col3: g_fog diagnostic — CLIP sliding-window signal, not used in P_pseudo
+  Col4: haze_app — fixed visible fog-white appearance prior
+  Col5: attn_deg — DINOv2 local structure variance
+  Col6: struct_deg — DINOv2 structure degradation
+  Col7: ir_adv — fixed VIS-IR structure advantage
+  Col8: P_pseudo - stable fixed pseudo-label
+  Col9: P_fail - CMDN visible failure probability map
+  Col10: tau - image-adaptive threshold
+  Col11: G_dec - adaptive decision gate
+  Col12: P_support - detached conservative support
+  Col13: G_soft - final conservative soft gate
+  Col14: M_hard - binary region mask from G_soft
 
 Saved to {save_dir}/mask_vis/epoch_{epoch:03d}.png each epoch.
 Fixed first N samples ensure cross-epoch comparability.
@@ -125,24 +128,33 @@ def visualize_epoch_mask(
     G_soft = to_np(debug["G_soft"])
     M_hard = to_np(debug["M_hard"])
     g_fog = to_np(debug["g_fog"])
+    haze_app = to_np(debug["haze_app"])
     attn_deg = to_np(debug["attn_deg"])
+    struct_deg = to_np(debug["struct_deg"])
+    ir_adv = to_np(debug["ir_adv"])
 
     # Denormalize visible
     vis_01   = _denorm_vis(vis, device).cpu()   # (n, 3, H, W)
     ir_01    = _norm_ir(ir)                      # (n, 3, H, W)
 
-    # ---- Plotting: 11 columns ----
+    # ---- Plotting: 14 columns ----
     fig, axes = plt.subplots(
-        nrows=n, ncols=11,
-        figsize=(38, 4 * n),
+        nrows=n, ncols=14,
+        figsize=(48, 4 * n),
         squeeze=False
     )
     col_titles = [
         'Hazy Visible', 'Infrared',
-        'g_fog (CLIP sliding)', 'attn_deg (DINOv2)',
+        'g_fog diagnostic', 'haze_app',
+        'attn_deg', 'struct_deg', 'ir_adv',
         'P_pseudo', 'P_fail', 'tau',
         'G_dec', 'P_support', 'G_soft', 'M_hard'
     ]
+
+    def _plot_heat(row, col, data, cmap='hot'):
+        im = axes[row, col].imshow(data, cmap=cmap, vmin=0, vmax=1)
+        axes[row, col].axis('off')
+        plt.colorbar(im, ax=axes[row, col], fraction=0.046, pad=0.04)
 
     for row in range(n):
         # Col1: Visible
@@ -153,58 +165,30 @@ def visualize_epoch_mask(
         axes[row, 1].imshow(_to_numpy_rgb(ir_01[row]))
         axes[row, 1].axis('off')
 
-        # Col3: g_fog
-        m_gf = g_fog[row, 0].numpy()
-        im3 = axes[row, 2].imshow(m_gf, cmap='hot', vmin=0, vmax=1)
-        axes[row, 2].axis('off')
-        plt.colorbar(im3, ax=axes[row, 2], fraction=0.046, pad=0.04)
+        # Col3-Col9: pseudo-label diagnostics and P_fail
+        _plot_heat(row, 2, g_fog[row, 0].numpy())
+        _plot_heat(row, 3, haze_app[row, 0].numpy())
+        _plot_heat(row, 4, attn_deg[row, 0].numpy())
+        _plot_heat(row, 5, struct_deg[row, 0].numpy())
+        _plot_heat(row, 6, ir_adv[row, 0].numpy())
+        _plot_heat(row, 7, P_pseudo[row, 0].numpy())
 
-        # Col4: attn_deg
-        m_ad = attn_deg[row, 0].numpy()
-        im4 = axes[row, 3].imshow(m_ad, cmap='hot', vmin=0, vmax=1)
-        axes[row, 3].axis('off')
-        plt.colorbar(im4, ax=axes[row, 3], fraction=0.046, pad=0.04)
-
-        # Col5: disc_refined
-        m_dr = P_pseudo[row, 0].numpy()
-        im5 = axes[row, 4].imshow(m_dr, cmap='hot', vmin=0, vmax=1)
-        axes[row, 4].axis('off')
-        plt.colorbar(im5, ax=axes[row, 4], fraction=0.046, pad=0.04)
-
-        # Col6: P_fail (soft density)
         m_vis = P_fail[row, 0].numpy()
-        im6 = axes[row, 5].imshow(m_vis, cmap='hot', vmin=0, vmax=1)
-        axes[row, 5].axis('off')
-        plt.colorbar(im6, ax=axes[row, 5], fraction=0.046, pad=0.04)
+        _plot_heat(row, 8, m_vis)
 
-        # Col7: tau broadcast preview
+        # Col10: tau broadcast preview
         tau_map = np.full_like(m_vis, tau[row, 0, 0, 0].item())
-        im7 = axes[row, 6].imshow(tau_map, cmap='viridis', vmin=0, vmax=1)
-        axes[row, 6].axis('off')
-        plt.colorbar(im7, ax=axes[row, 6], fraction=0.046, pad=0.04)
+        _plot_heat(row, 9, tau_map, cmap='viridis')
 
-        # Col8: G_dec
-        m_gdec = G_dec[row, 0].numpy()
-        im8 = axes[row, 7].imshow(m_gdec, cmap='hot', vmin=0, vmax=1)
-        axes[row, 7].axis('off')
-        plt.colorbar(im8, ax=axes[row, 7], fraction=0.046, pad=0.04)
+        # Col11-Col13: gates
+        _plot_heat(row, 10, G_dec[row, 0].numpy())
+        _plot_heat(row, 11, P_support[row, 0].numpy())
+        _plot_heat(row, 12, G_soft[row, 0].numpy())
 
-        # Col9: P_support
-        m_support = P_support[row, 0].numpy()
-        im9 = axes[row, 8].imshow(m_support, cmap='hot', vmin=0, vmax=1)
-        axes[row, 8].axis('off')
-        plt.colorbar(im9, ax=axes[row, 8], fraction=0.046, pad=0.04)
-
-        # Col10: G_soft
-        m_gsoft = G_soft[row, 0].numpy()
-        im10 = axes[row, 9].imshow(m_gsoft, cmap='hot', vmin=0, vmax=1)
-        axes[row, 9].axis('off')
-        plt.colorbar(im10, ax=axes[row, 9], fraction=0.046, pad=0.04)
-
-        # Col11: M_hard
+        # Col14: M_hard
         m_hard = M_hard[row, 0].numpy()
-        axes[row, 10].imshow(m_hard, cmap='gray', vmin=0, vmax=1)
-        axes[row, 10].axis('off')
+        axes[row, 13].imshow(m_hard, cmap='gray', vmin=0, vmax=1)
+        axes[row, 13].axis('off')
 
         axes[row, 0].set_ylabel(f'Sample {row+1}', fontsize=10)
 

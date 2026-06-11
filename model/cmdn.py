@@ -2,10 +2,16 @@
 model/cmdn.py — Cross-Modal Decision Network
 
 Replaces HDE+differentiable_otsu for haze mask estimation.
-Pseudo-label: g_fog × (1-attn_deg) × disc_gate, where:
-  g_fog : CLIP sliding-window CLS (image-level fog-sky similarity, 7×7 grid)
-  attn_deg : DINOv2 local structure variance (high=clear, low=smoke)
-  disc_gate : VIS-IR dissimilarity, cold-started with alpha schedule
+Stable pseudo-label: haze_app × (DINOv2 structure degradation + fixed VIS-IR
+structure advantage), where:
+  haze_app   : fixed visible fog-white appearance prior
+  attn_deg   : DINOv2 local structure variance (high=clear, low=degraded)
+  struct_deg : 1 - attn_deg
+  ir_adv     : fixed Sobel/local-contrast IR advantage over visible
+
+g_fog is kept only as a CLIP sliding-window diagnostic signal. It does not
+enter P_pseudo, P_support, or loss_Disc. CLIP patch tokens still enter the
+decoder as feat_clip for trainable P_fail prediction.
 
 Probe-verified design decisions (see probe_hooks.py):
   - CLIP per-patch tokens CANNOT encode fog/sky semantics (all cos-sim ~0).
@@ -26,6 +32,10 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 
 # ---------------------------------------------------------------------------
@@ -60,13 +70,13 @@ class CMDN(nn.Module):
     Args:
         dino_source_dir : path to DINOv2 source
         dino_weight_path: path to dinov2_vitb14_pretrain.pth
-        gamma           : pseudo-label sparsification exponent (default 1.5)
+        gamma           : pseudo-label sparsification exponent (default 1.2)
     """
 
     def __init__(self,
                  dino_source_dir="./DINOv2/facebookresearch_dinov2_main",
                  dino_weight_path="./dinov2_model/dinov2_vitb14_pretrain.pth",
-                 gamma=1.5,
+                 gamma=1.2,
                  tau_min=0.25,
                  tau_max=0.85,
                  gate_temperature=0.10,
@@ -109,6 +119,16 @@ class CMDN(nn.Module):
         self.register_buffer(
             'imagenet_std',
             torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        self.register_buffer(
+            'sobel_x',
+            torch.tensor([[-1, 0, 1],
+                          [-2, 0, 2],
+                          [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3))
+        self.register_buffer(
+            'sobel_y',
+            torch.tensor([[-1, -2, -1],
+                          [0, 0, 0],
+                          [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3))
 
         # ------------------------------------------------------------------
         # 3. CLIP loading (frozen)
@@ -201,7 +221,7 @@ class CMDN(nn.Module):
         nn.init.normal_(self.dino_proj.weight, std=1e-4)
 
         # ------------------------------------------------------------------
-        # 6. Decoder: 32(vis)+32(clip)+32(dino)+1(disc_refined) = 97 → 1
+        # 6. Decoder: 32(vis)+32(clip)+32(dino)+1(P_pseudo) = 97 → 1
         # ------------------------------------------------------------------
         self.decoder = nn.Sequential(
             nn.Conv2d(97, 64, 3, padding=1, bias=False),
@@ -238,6 +258,53 @@ class CMDN(nn.Module):
     # ------------------------------------------------------------------
     def _clip_hook(self, module, inp, out):
         self._clip_patch_tokens = out  # (seq, batch, dim) = (50, B, 768)
+
+    # ------------------------------------------------------------------
+    # Fixed image operators for stable pseudo-label generation
+    # ------------------------------------------------------------------
+    def _rgb_to_gray(self, x):
+        return x[:, 0:1] * 0.299 + x[:, 1:2] * 0.587 + x[:, 2:3] * 0.114
+
+    def _sobel_edge(self, gray, eps=1e-8):
+        sobel_x = self.sobel_x.to(dtype=gray.dtype)
+        sobel_y = self.sobel_y.to(dtype=gray.dtype)
+        gx = F.conv2d(gray, sobel_x, padding=1)
+        gy = F.conv2d(gray, sobel_y, padding=1)
+        return torch.sqrt(gx * gx + gy * gy + eps)
+
+    def _local_std(self, gray, kernel_size=7, eps=1e-8):
+        pad = kernel_size // 2
+        mean = F.avg_pool2d(gray, kernel_size, stride=1, padding=pad)
+        mean_sq = F.avg_pool2d(gray * gray, kernel_size, stride=1, padding=pad)
+        var = (mean_sq - mean * mean).clamp_min(0.0)
+        return torch.sqrt(var + eps)
+
+    def _robust_norm(self, x, low_q=0.02, high_q=0.98, min_range=1e-4):
+        B = x.shape[0]
+        flat = x.reshape(B, -1)
+
+        try:
+            low = torch.quantile(flat, low_q, dim=1, keepdim=True)
+            high = torch.quantile(flat, high_q, dim=1, keepdim=True)
+        except Exception:
+            n = flat.shape[1]
+            low_k = max(1, min(n, int((n - 1) * low_q) + 1))
+            high_k = max(1, min(n, int((n - 1) * high_q) + 1))
+            low = flat.kthvalue(low_k, dim=1, keepdim=True).values
+            high = flat.kthvalue(high_k, dim=1, keepdim=True).values
+
+        tail = [1] * (x.dim() - 1)
+        low = low.view(B, *tail)
+        high = high.view(B, *tail)
+        span = high - low
+        valid = span >= min_range
+        norm = ((x - low) / (span + 1e-8)).clamp(0.0, 1.0)
+        return torch.where(valid, norm, torch.zeros_like(norm))
+
+    def _smooth01(self, x, kernel_size=5):
+        pad = kernel_size // 2
+        x = F.avg_pool2d(x, kernel_size, stride=1, padding=pad)
+        return x.clamp(0.0, 1.0)
 
     # ------------------------------------------------------------------
     # Sliding-window g_fog via CLS token
@@ -363,30 +430,31 @@ class CMDN(nn.Module):
         Args:
             x_vis_clipnorm: (B, 3, H, W) visible in CLIP normalisation
             x_ir:           (B, 3, H, W) infrared
-            disc_alpha:     cold-start weight for disc gate (0=cold, 1=full)
-            return_debug:   if True, also return g_fog, attn_deg, disc, disc_refined
+            disc_alpha:     kept for interface compatibility; does not affect P_pseudo
+            return_debug:   if True, also return pseudo-label diagnostics
 
         Returns:
-            P_fail:     (B, 1, H, W) visible failure probability
-            disc_pseudo:(B, 1, H, W) pseudo-label (detached)
+            P_fail:    (B, 1, H, W) visible failure probability
+            P_pseudo:  (B, 1, H, W) fixed pseudo-label (detached)
         """
         B, _, H, W = x_vis_clipnorm.shape
 
         # ================================================================
-        # (a) VIS-IR dissimilarity
+        # (a) Trainable visible feature for P_fail prediction
         # ================================================================
         f_vis = self.vis_enc(x_vis_clipnorm)
-        f_ir  = self.ir_enc(x_ir)
-        disc_raw = (1.0 - F.cosine_similarity(f_vis, f_ir, dim=1)).unsqueeze(1)
-        disc = per_image_minmax(disc_raw)
 
         # ================================================================
-        # (b) CLIP features + sliding-window g_fog
+        # (b) Denormalise inputs for fixed image operators and CLIP
         # ================================================================
-        # Denormalise to [0,1]
         x_vis_01 = (x_vis_clipnorm * self.clip_std + self.clip_mean).clamp(0, 1)
+        x_ir_01 = (x_ir * self.clip_std + self.clip_mean).clamp(0, 1)
 
+        # ================================================================
+        # (c) CLIP features + sliding-window g_fog
+        # ================================================================
         # --- g_fog: sliding-window CLS (image-level semantics) ---
+        # Diagnostic only: not used in P_pseudo, P_support, or loss_Disc.
         x_vis_448 = F.interpolate(x_vis_01, size=(448, 448),
                                   mode='bilinear', align_corners=False)
         g_fog = self._compute_gfog_sliding(x_vis_448)  # (B, 1, 448, 448)
@@ -410,7 +478,7 @@ class CMDN(nn.Module):
                                   mode='bilinear', align_corners=False)      # (B,32,H,W)
 
         # ================================================================
-        # (c) DINOv2 degradation
+        # (d) DINOv2 degradation
         # ================================================================
         x_vis_imagenet = (x_vis_01 - self.imagenet_mean) / self.imagenet_std
         x_vis_dino = F.interpolate(x_vis_imagenet, size=(448, 448),
@@ -418,25 +486,48 @@ class CMDN(nn.Module):
         feat_dino, attn_deg = self._compute_attn_deg(x_vis_dino, target_hw=(H, W))
 
         # ================================================================
-        # (d) Three-way pseudo-label fusion
+        # (e) Stable fixed pseudo-label generation
         # ================================================================
-        # g_fog 已从伪标签链路中移除（CLIP ViT-B/32 patch级信号在噪声底层，
-        # minmax 放大后无语义意义）。feat_clip 仍作为 decoder 输入参与可学习路径。
-        struct_deg = 1.0 - attn_deg                # high = uniform/degraded
-        disc_gate  = 1.0 - disc_alpha + disc_alpha * disc   # cold start → full
+        # P_pseudo is fixed for a given VIS/IR input and does not depend on
+        # trainable encoders, disc_alpha, or epoch schedules.
+        with torch.no_grad():
+            gray_vis = self._rgb_to_gray(x_vis_01)
+            gray_ir = self._rgb_to_gray(x_ir_01)
 
-        raw = struct_deg * disc_gate
-        disc_refined = per_image_minmax(raw)
-        disc_refined = disc_refined ** self.gamma
-        disc_refined = per_image_minmax(disc_refined)
-        disc_pseudo = disc_refined.detach()
+            brightness = gray_vis
+            saturation = x_vis_01.max(dim=1, keepdim=True).values - \
+                x_vis_01.min(dim=1, keepdim=True).values
+            local_contrast_vis = self._local_std(gray_vis)
+            local_contrast_ir = self._local_std(gray_ir)
+
+            bright_gate = torch.sigmoid((brightness - 0.60) / 0.10)
+            low_sat_gate = torch.sigmoid((0.35 - saturation) / 0.08)
+            low_contrast_gate = torch.sigmoid((0.08 - local_contrast_vis) / 0.03)
+            haze_app = self._smooth01(
+                bright_gate * low_sat_gate * low_contrast_gate)
+
+            struct_deg = self._smooth01((1.0 - attn_deg).clamp(0.0, 1.0))
+
+            edge_vis = self._robust_norm(self._sobel_edge(gray_vis))
+            edge_ir = self._robust_norm(self._sobel_edge(gray_ir))
+            contrast_vis = self._robust_norm(local_contrast_vis)
+            contrast_ir = self._robust_norm(local_contrast_ir)
+
+            edge_adv = F.relu(edge_ir - edge_vis)
+            contrast_adv = F.relu(contrast_ir - contrast_vis)
+            ir_adv = self._smooth01(
+                (0.7 * edge_adv + 0.3 * contrast_adv).clamp(0.0, 1.0))
+
+            evidence = 0.4 * struct_deg + 0.6 * ir_adv
+            P_pseudo = self._smooth01(haze_app * evidence)
+            P_pseudo = P_pseudo.clamp(0.0, 1.0) ** self.gamma
+            P_pseudo = P_pseudo.detach()
 
         # ================================================================
-        # (e) Decoder
+        # (f) Decoder
         # ================================================================
-        dec_input = torch.cat([f_vis, feat_clip, feat_dino, disc_refined], dim=1)
+        dec_input = torch.cat([f_vis, feat_clip, feat_dino, P_pseudo], dim=1)
         P_fail = self.decoder(dec_input)
-        P_pseudo = disc_pseudo
 
         tau_raw = self.thr_head(dec_input)
         tau = self.tau_min + (self.tau_max - self.tau_min) * tau_raw
@@ -459,8 +550,15 @@ class CMDN(nn.Module):
                 "haze_mask": haze_mask,
                 "g_fog": g_fog,
                 "attn_deg": attn_deg,
-                "disc": disc,
-                "disc_refined": disc_refined,
+                "haze_app": haze_app,
+                "struct_deg": struct_deg,
+                "ir_adv": ir_adv,
+                "edge_vis": edge_vis,
+                "edge_ir": edge_ir,
+                "contrast_vis": contrast_vis,
+                "contrast_ir": contrast_ir,
+                "disc": ir_adv,
+                "disc_refined": P_pseudo,
             }
         return P_fail, P_pseudo, tau, G_dec, P_support, G_soft, M_hard, haze_mask
 
@@ -478,8 +576,9 @@ if __name__ == "__main__":
     print(f"P_fail: {P_fail.shape}, P_pseudo: {P_pseudo.shape}, tau: {tau.shape}")
     dbg = m(x, y, return_debug=True)
     print(
-        f"Debug: g_fog={dbg['g_fog'].shape}, attn_deg={dbg['attn_deg'].shape}, "
-        f"disc={dbg['disc'].shape}, disc_refined={dbg['disc_refined'].shape}"
+        f"Debug: g_fog={dbg['g_fog'].shape}, haze_app={dbg['haze_app'].shape}, "
+        f"struct_deg={dbg['struct_deg'].shape}, ir_adv={dbg['ir_adv'].shape}, "
+        f"P_pseudo_requires_grad={dbg['P_pseudo'].requires_grad}"
     )
     trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
     frozen   = sum(p.numel() for p in m.parameters() if not p.requires_grad)
