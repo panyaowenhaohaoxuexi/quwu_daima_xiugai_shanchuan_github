@@ -573,7 +573,8 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
                             epoch      = epoch_idx,
                             save_dir   = opt.saved_data_dir,
                             n_samples  = vis_batch.shape[0],
-                            device     = opt.device
+                            device     = opt.device,
+                            disc_alpha = disc_alpha
                         )
                     else:
                         print(f"\n[mask_vis] 在 {mask_vis_dir} 中未找到图像，跳过。")

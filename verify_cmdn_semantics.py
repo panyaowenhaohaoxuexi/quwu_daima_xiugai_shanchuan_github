@@ -5,10 +5,19 @@ Loads 00960 (hazy + IR), runs CMDN with return_debug=True,
 prints per-signal region statistics and saves a 6-panel overlay PNG.
 """
 import torch, cv2, numpy as np
+import argparse
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--hazy', type=str,
+                    default='F:/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/hazy/00887.png')
+parser.add_argument('--ir',   type=str,
+                    default='F:/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/ir/00887.png')
+parser.add_argument('--out',  type=str, default='cmdn_verify_results/cmdn_semantic_check_00887.png')
+args = parser.parse_args()
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {device}")
@@ -16,11 +25,8 @@ print(f"Device: {device}")
 # ---------------------------------------------------------------------------
 # Load & normalise
 # ---------------------------------------------------------------------------
-hazy = cv2.cvtColor(
-    cv2.imread("F:/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/hazy/00960.png"),
-    cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-ir   = cv2.imread("F:/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/ir/00960.png",
-                  cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+hazy = cv2.cvtColor(cv2.imread(args.hazy), cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+ir   = cv2.imread(args.ir, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
 H, W = 448, 448
 hazy = cv2.resize(hazy, (W, H))
 ir   = cv2.resize(ir,   (W, H))
@@ -155,7 +161,7 @@ for ax, (title, data) in zip(axes.flat, titles):
         plt.colorbar(im, ax=ax, fraction=0.046)
 
 plt.tight_layout()
-out = "cmdn_semantic_check_00960.png"
+out = args.out
 plt.savefig(out, dpi=150, bbox_inches='tight')
 plt.close(fig)
 print(f"\nSaved: {out}")

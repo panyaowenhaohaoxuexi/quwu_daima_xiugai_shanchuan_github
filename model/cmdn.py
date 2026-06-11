@@ -420,11 +420,12 @@ class CMDN(nn.Module):
         # ================================================================
         # (d) Three-way pseudo-label fusion
         # ================================================================
-        sky_suppress = g_fog                         # high = fog/smoke
-        struct_deg   = 1.0 - attn_deg                # high = uniform smoke
-        disc_gate    = 1.0 - disc_alpha + disc_alpha * disc   # cold start → full
+        # g_fog 已从伪标签链路中移除（CLIP ViT-B/32 patch级信号在噪声底层，
+        # minmax 放大后无语义意义）。feat_clip 仍作为 decoder 输入参与可学习路径。
+        struct_deg = 1.0 - attn_deg                # high = uniform/degraded
+        disc_gate  = 1.0 - disc_alpha + disc_alpha * disc   # cold start → full
 
-        raw = sky_suppress * struct_deg * disc_gate
+        raw = struct_deg * disc_gate
         disc_refined = per_image_minmax(raw)
         disc_refined = disc_refined ** self.gamma
         disc_refined = per_image_minmax(disc_refined)
