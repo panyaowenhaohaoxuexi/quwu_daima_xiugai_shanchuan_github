@@ -98,8 +98,7 @@ def visualize_epoch_mask(
     _model = model.module if hasattr(model, 'module') else model
 
     try:
-        M_vis, disc_pseudo, g_fog, attn_deg, disc, disc_refined = \
-            _model.cmdn(vis, ir, disc_alpha=0.0, return_debug=True)
+        debug = _model.cmdn(vis, ir, disc_alpha=0.0, return_debug=True)
     except Exception as e:
         print(f"[visualize_mask] CMDN forward failed: {e}")
         if training_before:
@@ -113,28 +112,31 @@ def visualize_epoch_mask(
     def to_np(t):
         return t.detach().cpu()[:n]
 
-    M_vis = to_np(M_vis)             # (n, 1, H, W)
-    g_fog = to_np(g_fog)
-    attn_deg = to_np(attn_deg)
-    disc_refined = to_np(disc_refined)
-
-    # Binary mask: fixed threshold 0.5
-    haze_mask_hard = (M_vis >= 0.5).float()
+    P_fail = to_np(debug["P_fail"])
+    P_pseudo = to_np(debug["P_pseudo"])
+    tau = to_np(debug["tau"])
+    G_dec = to_np(debug["G_dec"])
+    P_support = to_np(debug["P_support"])
+    G_soft = to_np(debug["G_soft"])
+    M_hard = to_np(debug["M_hard"])
+    g_fog = to_np(debug["g_fog"])
+    attn_deg = to_np(debug["attn_deg"])
 
     # Denormalize visible
     vis_01   = _denorm_vis(vis, device).cpu()   # (n, 3, H, W)
     ir_01    = _norm_ir(ir)                      # (n, 3, H, W)
 
-    # ---- Plotting: 7 columns ----
+    # ---- Plotting: 11 columns ----
     fig, axes = plt.subplots(
-        nrows=n, ncols=7,
-        figsize=(24, 4 * n),
+        nrows=n, ncols=11,
+        figsize=(38, 4 * n),
         squeeze=False
     )
     col_titles = [
         'Hazy Visible', 'Infrared',
         'g_fog (CLIP sliding)', 'attn_deg (DINOv2)',
-        'disc_refined', 'M_vis (CMDN)', 'Binary Mask (>=0.5)'
+        'P_pseudo', 'P_fail', 'tau',
+        'G_dec', 'P_support', 'G_soft', 'M_hard'
     ]
 
     for row in range(n):
@@ -159,21 +161,45 @@ def visualize_epoch_mask(
         plt.colorbar(im4, ax=axes[row, 3], fraction=0.046, pad=0.04)
 
         # Col5: disc_refined
-        m_dr = disc_refined[row, 0].numpy()
+        m_dr = P_pseudo[row, 0].numpy()
         im5 = axes[row, 4].imshow(m_dr, cmap='hot', vmin=0, vmax=1)
         axes[row, 4].axis('off')
         plt.colorbar(im5, ax=axes[row, 4], fraction=0.046, pad=0.04)
 
-        # Col6: M_vis (soft density)
-        m_vis = M_vis[row, 0].numpy()
+        # Col6: P_fail (soft density)
+        m_vis = P_fail[row, 0].numpy()
         im6 = axes[row, 5].imshow(m_vis, cmap='hot', vmin=0, vmax=1)
         axes[row, 5].axis('off')
         plt.colorbar(im6, ax=axes[row, 5], fraction=0.046, pad=0.04)
 
-        # Col7: Binary mask
-        m_hard = haze_mask_hard[row, 0].numpy()
-        axes[row, 6].imshow(m_hard, cmap='gray', vmin=0, vmax=1)
+        # Col7: tau broadcast preview
+        tau_map = np.full_like(m_vis, tau[row, 0, 0, 0].item())
+        im7 = axes[row, 6].imshow(tau_map, cmap='viridis', vmin=0, vmax=1)
         axes[row, 6].axis('off')
+        plt.colorbar(im7, ax=axes[row, 6], fraction=0.046, pad=0.04)
+
+        # Col8: G_dec
+        m_gdec = G_dec[row, 0].numpy()
+        im8 = axes[row, 7].imshow(m_gdec, cmap='hot', vmin=0, vmax=1)
+        axes[row, 7].axis('off')
+        plt.colorbar(im8, ax=axes[row, 7], fraction=0.046, pad=0.04)
+
+        # Col9: P_support
+        m_support = P_support[row, 0].numpy()
+        im9 = axes[row, 8].imshow(m_support, cmap='hot', vmin=0, vmax=1)
+        axes[row, 8].axis('off')
+        plt.colorbar(im9, ax=axes[row, 8], fraction=0.046, pad=0.04)
+
+        # Col10: G_soft
+        m_gsoft = G_soft[row, 0].numpy()
+        im10 = axes[row, 9].imshow(m_gsoft, cmap='hot', vmin=0, vmax=1)
+        axes[row, 9].axis('off')
+        plt.colorbar(im10, ax=axes[row, 9], fraction=0.046, pad=0.04)
+
+        # Col11: M_hard
+        m_hard = M_hard[row, 0].numpy()
+        axes[row, 10].imshow(m_hard, cmap='gray', vmin=0, vmax=1)
+        axes[row, 10].axis('off')
 
         axes[row, 0].set_ylabel(f'Sample {row+1}', fontsize=10)
 

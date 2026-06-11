@@ -38,14 +38,22 @@ from model.cmdn import CMDN
 
 cmdn = CMDN().to(device).eval()
 with torch.no_grad():
-    M_vis, disc_pseudo, g_fog, attn_deg, disc_refined = cmdn(xv, xi, return_debug=True)
+    debug = cmdn(xv, xi, return_debug=True)
 
 def to_np(t):
     return t.squeeze().cpu().numpy()
 
-maps = dict(g_fog=to_np(g_fog), attn_deg=to_np(attn_deg),
-            disc_refined=to_np(disc_refined), M_vis=to_np(M_vis),
-            disc_pseudo=to_np(disc_pseudo))
+maps = dict(
+    g_fog=to_np(debug["g_fog"]),
+    attn_deg=to_np(debug["attn_deg"]),
+    disc_refined=to_np(debug["disc_refined"]),
+    P_fail=to_np(debug["P_fail"]),
+    P_pseudo=to_np(debug["P_pseudo"]),
+    G_dec=to_np(debug["G_dec"]),
+    P_support=to_np(debug["P_support"]),
+    G_soft=to_np(debug["G_soft"]),
+    M_hard=to_np(debug["M_hard"]),
+)
 
 # ---------------------------------------------------------------------------
 # Region statistics (pixel coords on 448x448, plus 32x32 grid core patches)
@@ -122,11 +130,11 @@ def draw_boxes(ax):
 fig, axes = plt.subplots(2, 3, figsize=(21, 14))
 
 titles = [
-    ("g_fog\nCLIP fog-sky diff (per-image minmax)\nNOT in pseudo-label (direction unreliable)", to_np(g_fog)),
-    ("attn_deg\nDINOv2 x_prenorm 3x3 local structure variance\nHIGH=textured/clear, LOW=uniform/smoke", to_np(attn_deg)),
-    ("disc_refined = (1-attn_deg)^5.0 + re-minmax\nPseudo-label target\nSmoke core P95={:.3f}, Grass core P5={:.3f}".format(p95s, p5g), to_np(disc_refined)),
-    ("disc_pseudo = disc_refined.detach()\nBCE target (identical to disc_refined, no grad)", to_np(disc_pseudo)),
-    ("M_vis = decoder output\nUntrained -- check [0,1] range only", to_np(M_vis)),
+    ("g_fog\nCLIP fog-sky diff (per-image minmax)\nNOT in pseudo-label (direction unreliable)", maps["g_fog"]),
+    ("attn_deg\nDINOv2 x_prenorm 3x3 local structure variance\nHIGH=textured/clear, LOW=uniform/smoke", maps["attn_deg"]),
+    ("disc_refined = pseudo-label source\nSmoke core P95={:.3f}, Grass core P5={:.3f}".format(p95s, p5g), maps["disc_refined"]),
+    ("P_fail = decoder output\nUntrained -- check [0,1] range only", maps["P_fail"]),
+    ("G_soft = G_dec * P_support\nFinal conservative soft gate", maps["G_soft"]),
     ("Original 00960.png (448x448)", np.ones((448, 448), dtype=np.float32)),
 ]
 

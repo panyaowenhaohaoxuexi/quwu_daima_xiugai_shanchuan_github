@@ -41,11 +41,13 @@ box_data = []
 for alpha in [0.0, 0.5, 1.0]:
     cmdn = CMDN().to(device).eval()
     with torch.no_grad():
-        M_vis, disc_pseudo, g_fog, attn_deg, disc, disc_refined = \
-            cmdn(xv, xi, disc_alpha=alpha, return_debug=True)
+        debug = cmdn(xv, xi, disc_alpha=alpha, return_debug=True)
 
     def tonp(t): return t.squeeze().detach().cpu().numpy()
-    gf = tonp(g_fog); ad = tonp(attn_deg); dc = tonp(disc); dr = tonp(disc_refined)
+    gf = tonp(debug["g_fog"])
+    ad = tonp(debug["attn_deg"])
+    dc = tonp(debug["disc"])
+    dr = tonp(debug["disc_refined"])
 
     print(f"\nalpha={alpha:.1f}:")
     print(f"  {'Signal':<20} {'SKY':>8} {'SMOKE':>8} {'GRASS':>8} {'MTN':>8} {'SM-SK':>8}")

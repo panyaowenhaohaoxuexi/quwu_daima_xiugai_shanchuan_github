@@ -263,9 +263,9 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
     losses = []
     # --- [修改] 增加 Edge, Style, CrossModal 日志 ---
     loss_log = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'Boundary': [],
-                'Disc': [], 'Bimodal': [], 'Sparse': [], 'total': []}
+                'Disc': [], 'Gate': [], 'Margin': [], 'Area': [], 'Bimodal': [], 'Sparse': [], 'total': []}
     loss_log_tmp = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'Boundary': [],
-                    'Disc': [], 'Bimodal': [], 'Sparse': [], 'total': []}
+                    'Disc': [], 'Gate': [], 'Margin': [], 'Area': [], 'Bimodal': [], 'Sparse': [], 'total': []}
     # --- [修改结束] ---
     psnr_log = []
 
@@ -326,13 +326,15 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         clear_vis = clear_vis.to(opt.device, non_blocking=True)
         # --- [修改结束] ---
 
-        # --- [修改] 模型前向传播 (双输入)，接收7个输出 ---
+        # --- [修改] 模型前向传播 (双输入)，接收11个输出 ---
         # 训练时不使用掩码 (haze_mask=None)
         # disc_alpha: cold-start schedule (first 5 epochs = 0, linear ramp to 1 by epoch 15)
+        steps_per_epoch_for_alpha = len(loader_train) if loader_train else opt.iters_per_epoch
+        epoch_idx = step // steps_per_epoch_for_alpha if steps_per_epoch_for_alpha > 0 else 0
         disc_alpha = 0.0
         if epoch_idx >= 5:
             disc_alpha = min(1.0, (epoch_idx - 5) / 10.0)  # 5→15, linear 0→1
-        pred_image, vis_h_features, vis_features, ir_features, m_hard, M_vis, disc_pseudo = \
+        pred_image, vis_h_features, vis_features, ir_features, m_hard, M_vis, disc_pseudo, tau, G_dec, P_support, G_soft = \
             teacher_net(hazy_vis, infrared, haze_mask=None, disc_alpha=disc_alpha)
         # --- [修改结束] ---
 
@@ -384,13 +386,33 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             loss_Boundary = criterion[6](pred_image, m_hard, gt_image=clear_vis)
         # --- [新增结束] ---
 
-        # --- [新增] CMDN 掩码损失 ---
-        loss_Disc = F.binary_cross_entropy(M_vis, disc_pseudo) if M_vis is not None else torch.tensor(0.0, device=opt.device)
-        loss_Bimodal = (4.0 * M_vis * (1 - M_vis)).mean() if M_vis is not None else torch.tensor(0.0, device=opt.device)
-        loss_Sparse = F.mse_loss(
-            M_vis.mean(),
-            torch.tensor(opt.target_haze_ratio, device=M_vis.device)
-        ) if M_vis is not None else torch.tensor(0.0, device=opt.device)
+        # --- [新增] CMDN 自适应区域决策损失 ---
+        region_ready = (
+            M_vis is not None and
+            disc_pseudo is not None and
+            tau is not None and
+            G_dec is not None and
+            P_support is not None and
+            G_soft is not None
+        )
+        zero = torch.tensor(0.0, device=opt.device)
+        if region_ready:
+            loss_Disc = F.binary_cross_entropy(
+                M_vis.clamp(1e-6, 1 - 1e-6),
+                disc_pseudo.detach().clamp(1e-6, 1 - 1e-6)
+            )
+            loss_Gate = F.binary_cross_entropy(
+                G_dec.clamp(1e-6, 1 - 1e-6),
+                P_support.detach().clamp(1e-6, 1 - 1e-6)
+            )
+            loss_Margin = F.relu(opt.margin_delta - torch.abs(M_vis - tau)).mean()
+            area_pred = G_soft.flatten(1).mean(dim=1)
+            area_target = P_support.flatten(1).mean(dim=1).detach()
+            loss_Area = F.relu(area_pred - area_target - opt.area_epsilon).pow(2).mean()
+        else:
+            loss_Disc = loss_Gate = loss_Margin = loss_Area = zero
+        loss_Bimodal = zero
+        loss_Sparse = zero
         # --- [新增结束] ---
 
         # --- [修改] 总损失 ---
@@ -402,8 +424,9 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
                 opt.w_loss_CrossModal * loss_CrossModal +  # <-- 新增
                 opt.w_loss_Boundary * loss_Boundary +  # <-- 新增
                 opt.w_loss_Disc * loss_Disc +           # CMDN 新增
-                opt.w_loss_Bimodal * loss_Bimodal +     # CMDN 新增
-                opt.w_loss_Sparse * loss_Sparse)        # CMDN 新增
+                opt.w_loss_Gate * loss_Gate +
+                opt.w_loss_Margin * loss_Margin +
+                opt.w_loss_Area * loss_Area)
         # --- [修改结束] ---
 
         # --- 反向传播和优化 ---
@@ -430,6 +453,9 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             loss_Boundary.item() if isinstance(loss_Boundary, torch.Tensor) else loss_Boundary)
         # --- [新增 CMDN] ---
         loss_log_tmp['Disc'].append(loss_Disc.item() if isinstance(loss_Disc, torch.Tensor) else loss_Disc)
+        loss_log_tmp['Gate'].append(loss_Gate.item() if isinstance(loss_Gate, torch.Tensor) else loss_Gate)
+        loss_log_tmp['Margin'].append(loss_Margin.item() if isinstance(loss_Margin, torch.Tensor) else loss_Margin)
+        loss_log_tmp['Area'].append(loss_Area.item() if isinstance(loss_Area, torch.Tensor) else loss_Area)
         loss_log_tmp['Bimodal'].append(loss_Bimodal.item() if isinstance(loss_Bimodal, torch.Tensor) else loss_Bimodal)
         loss_log_tmp['Sparse'].append(loss_Sparse.item() if isinstance(loss_Sparse, torch.Tensor) else loss_Sparse)
         # --- [新增结束] ---
@@ -455,10 +481,19 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         # --- [新增 CMDN] ---
         disc_val = (opt.w_loss_Disc * loss_Disc.item()) if isinstance(loss_Disc,
                                                                        torch.Tensor) and opt.w_loss_Disc > 0 else 0.0
-        bimodal_val = (opt.w_loss_Bimodal * loss_Bimodal.item()) if isinstance(loss_Bimodal,
-                                                                                torch.Tensor) and opt.w_loss_Bimodal > 0 else 0.0
-        sparse_val = (opt.w_loss_Sparse * loss_Sparse.item()) if isinstance(loss_Sparse,
-                                                                             torch.Tensor) and opt.w_loss_Sparse > 0 else 0.0
+        gate_val = (opt.w_loss_Gate * loss_Gate.item()) if isinstance(loss_Gate,
+                                                                      torch.Tensor) and opt.w_loss_Gate > 0 else 0.0
+        margin_val = (opt.w_loss_Margin * loss_Margin.item()) if isinstance(loss_Margin,
+                                                                            torch.Tensor) and opt.w_loss_Margin > 0 else 0.0
+        area_val = (opt.w_loss_Area * loss_Area.item()) if isinstance(loss_Area,
+                                                                      torch.Tensor) and opt.w_loss_Area > 0 else 0.0
+        bimodal_val = 0.0
+        sparse_val = 0.0
+        tau_mean = tau.mean().item() if tau is not None else 0.0
+        G_dec_mean = G_dec.mean().item() if G_dec is not None else 0.0
+        G_soft_mean = G_soft.mean().item() if G_soft is not None else 0.0
+        support_mean = P_support.mean().item() if P_support is not None else 0.0
+        M_hard_mean = m_hard.mean().item() if m_hard is not None else 0.0
         # --- [新增结束] ---
 
         # AAA
@@ -469,7 +504,10 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             f'\rloss:{loss.item():.5f} | L1:{l1_val:.5f} | SSIM:{ssim_val:.5f} | Cr:{cr_val:.5f} | Edge:{edge_val:.5f} '
             f'| Style:{style_val:.5f} | CrossM:{crossmodal_val:.5f} '  # <-- 新增
             f'| Bnd:{bnd_val:.5f} '
-            f'| Disc:{disc_val:.5f} | Bim:{bimodal_val:.5f} | Spar:{sparse_val:.5f} '  # <-- CMDN 新增
+            f'| Disc:{disc_val:.5f} | Gate:{gate_val:.5f} | Margin:{margin_val:.5f} | Area:{area_val:.5f} '
+            f'| Bim:{bimodal_val:.5f} | Spar:{sparse_val:.5f} '
+            f'| tau:{tau_mean:.4f} | G_dec:{G_dec_mean:.4f} | G_soft:{G_soft_mean:.4f} '
+            f'| support:{support_mean:.4f} | M_hard:{M_hard_mean:.4f} '
             f'| step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}',
             end='', flush=True)
         # --- [修改结束] ---
@@ -701,8 +739,7 @@ def test(net, loader_test):
 
             try:
                 # --- [修改] 正确调用双流模型 (测试时不用掩码, haze_mask=None) ---
-                # [修改]：解包5个输出，但只用第1个 (pred)
-                pred_output, _, _, _, _ = net(inputs_vis_padded, inputs_ir_padded, haze_mask=None)
+                pred_output = net(inputs_vis_padded, inputs_ir_padded, haze_mask=None)[0]
                 # --- [修改结束] ---
 
                 pred = pred_output  # pred_output 已经是图像
@@ -841,7 +878,13 @@ if __name__ == "__main__":
         )
 
     # --- [修改] 模型初始化 ---
-    teacher_net = VIFNetInconsistencyTeacher().to(opt.device)  # 实例化新的模型
+    teacher_net = VIFNetInconsistencyTeacher(
+        tau_min=opt.tau_min,
+        tau_max=opt.tau_max,
+        gate_temperature=opt.gate_temperature,
+        support_gamma=opt.support_gamma,
+        hard_gate_threshold=opt.hard_gate_threshold,
+    ).to(opt.device)  # 实例化新的模型
     teacher_net = teacher_net.to(opt.device)
     # --- [修改结束] ---
 

@@ -1085,10 +1085,21 @@ class VIFNetInconsistencyTeacher(nn.Module):
       - Color restoration: in-image Cross-Attention, K/V from M=0 reliable regions only
     """
 
-    def __init__(self, res_blocks=18):
+    def __init__(self, res_blocks=18,
+                 tau_min=0.25,
+                 tau_max=0.85,
+                 gate_temperature=0.10,
+                 support_gamma=1.0,
+                 hard_gate_threshold=0.5):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
-        self.cmdn = CMDN()
+        self.cmdn = CMDN(
+            tau_min=tau_min,
+            tau_max=tau_max,
+            gate_temperature=gate_temperature,
+            support_gamma=support_gamma,
+            hard_gate_threshold=hard_gate_threshold,
+        )
 
 
         # --- [新增] 阶段一 (Pass 1) 模块 (来自代码库 B) ---
@@ -1237,13 +1248,19 @@ class VIFNetInconsistencyTeacher(nn.Module):
         m_hard_out = None  # 仅在 haze_mask is None 分支赋值，用于边界平滑损失
         M_vis = None
         disc_pseudo = None
+        tau = None
+        G_dec = None
+        P_support = None
+        G_soft = None
 
         if haze_mask is None:
             # --- CMDN: Cross-Modal Decision Network mask estimation ---
-            M_vis, disc_pseudo = self.cmdn(x_vis, x_ir, disc_alpha=disc_alpha)
-            m_hard = (M_vis >= 0.5).float()
+            M_vis, disc_pseudo, tau, G_dec, P_support, G_soft, m_hard, haze_mask = self.cmdn(
+                x_vis, x_ir, disc_alpha=disc_alpha
+            )
             m_hard_out = m_hard  # 暴露给调用方用于 L_boundary
-            haze_mask = m_hard.detach() + M_vis - M_vis.detach()  # STE
+        else:
+            m_hard_out = (haze_mask >= 0.5).float()
 
         # --- 阶段一 & 二：并行结构提取 (Pass 1 - B 模块) ---
         # (这部分保留，用于计算不一致性)
@@ -1422,7 +1439,19 @@ class VIFNetInconsistencyTeacher(nn.Module):
         # --- [修改结束] ---
 
         # [修改] 返回融合前的特征 + mask 信息用于计算新损失
-        return output, vis_h_features, vis_features, ir_features, m_hard_out, M_vis, disc_pseudo
+        return (
+            output,
+            vis_h_features,
+            vis_features,
+            ir_features,
+            m_hard_out,
+            M_vis,
+            disc_pseudo,
+            tau,
+            G_dec,
+            P_support,
+            G_soft,
+        )
 
 
 # --- 主函数测试部分 (保持不变) ---
@@ -1433,14 +1462,15 @@ if __name__ == "__main__":
     dummy_input_vis = torch.randn(1, 3, 256, 256).to(device)
     dummy_input_ir = torch.randn(1, 3, 256, 256).to(device)
 
-    # [修改] 接收 7 个输出
-    output_tensor, intermediate_features, vis_features_out, ir_features_out, m_hard_out, M_vis, disc_pseudo = net(dummy_input_vis, dummy_input_ir)
+    # [修改] 接收 11 个输出
+    output_tensor, intermediate_features, vis_features_out, ir_features_out, m_hard_out, M_vis, disc_pseudo, tau, G_dec, P_support, G_soft = net(dummy_input_vis, dummy_input_ir)
 
     print("Output shape:", output_tensor.shape)
     print("Vis Features (Decoder Output) shape:", vis_features_out.shape)
     print("IR Features (Decoder Output) shape:", ir_features_out.shape)
     print("M_vis shape:", M_vis.shape if M_vis is not None else "None")
     print("disc_pseudo shape:", disc_pseudo.shape if disc_pseudo is not None else "None")
+    print("tau shape:", tau.shape if tau is not None else "None")
     print("Intermediate features shapes:")
     for feat in intermediate_features:
         print(feat.shape)

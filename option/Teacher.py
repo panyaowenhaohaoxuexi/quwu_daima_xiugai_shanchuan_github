@@ -62,6 +62,16 @@ parser.add_argument('--w_loss_Disc', default=0.15, type=float, help='weight of C
 parser.add_argument('--w_loss_Bimodal', default=0.05, type=float, help='weight of CMDN bimodal push penalty')
 parser.add_argument('--w_loss_Sparse', default=0.05, type=float, help='weight of CMDN sparse ratio target loss')
 parser.add_argument('--target_haze_ratio', default=0.35, type=float, help='target mean haze ratio for M_vis')
+parser.add_argument('--w_loss_Gate', default=0.10, type=float, help='weight of conservative gate supervision loss')
+parser.add_argument('--w_loss_Margin', default=0.03, type=float, help='weight of adaptive threshold margin loss')
+parser.add_argument('--w_loss_Area', default=0.05, type=float, help='weight of one-sided completion area upper-bound loss')
+parser.add_argument('--tau_min', default=0.25, type=float, help='minimum adaptive threshold')
+parser.add_argument('--tau_max', default=0.85, type=float, help='maximum adaptive threshold')
+parser.add_argument('--gate_temperature', default=0.10, type=float, help='temperature for soft adaptive binarization')
+parser.add_argument('--support_gamma', default=1.0, type=float, help='gamma for conservative prior support')
+parser.add_argument('--hard_gate_threshold', default=0.5, type=float, help='threshold for hardening final G_soft')
+parser.add_argument('--margin_delta', default=0.10, type=float, help='minimum distance between P_fail and tau')
+parser.add_argument('--area_epsilon', default=0.03, type=float, help='tolerance for one-sided area upper-bound loss')
 # --- [新增结束] ---
 
 # --- 3. 定义文件和目录相关的参数 ---

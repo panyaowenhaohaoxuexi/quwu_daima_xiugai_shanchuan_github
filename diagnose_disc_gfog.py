@@ -264,7 +264,8 @@ print(f"  SKY={a:.4f} SMOKE={b:.4f} GRASS={c:.4f} MTN={d:.4f}")
 
 # 4) CMDN actual g_fog
 with torch.no_grad():
-    _, _, g_fog_cmdn, _, _ = cmdn(xv, torch.randn(1,3,448,448).to(device), return_debug=True)
+    debug = cmdn(xv, torch.randn(1,3,448,448).to(device), return_debug=True)
+    g_fog_cmdn = debug["g_fog"]
 gfc = g_fog_cmdn.squeeze().detach().cpu().numpy()
 print(f"\nCMDN actual g_fog (with random IR): range [{gfc.min():.4f}, {gfc.max():.4f}]")
 a=rm(gfc,*R['SKY']); b=rm(gfc,*R['SMOKE']); c=rm(gfc,*R['GRASS']); d=rm(gfc,*R['MTN'])

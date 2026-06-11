@@ -15,6 +15,10 @@ Probe-verified design decisions (see probe_hooks.py):
   - attn_deg uses x_prenorm with 3×3 local structure variance
     (not x_norm_patchtokens nor global L2 norm — 5× better margin in probe).
   - CLIP feat_clip (decoder input) still uses per-patch tokens via hook.
+
+Current region decision:
+  P_fail -> tau -> G_dec, then conservative support P_support gates G_soft.
+  The forward value uses binary M_hard, while gradients flow through G_soft.
 """
 
 import sys
@@ -62,9 +66,19 @@ class CMDN(nn.Module):
     def __init__(self,
                  dino_source_dir="./DINOv2/facebookresearch_dinov2_main",
                  dino_weight_path="./dinov2_model/dinov2_vitb14_pretrain.pth",
-                 gamma=1.5):
+                 gamma=1.5,
+                 tau_min=0.25,
+                 tau_max=0.85,
+                 gate_temperature=0.10,
+                 support_gamma=1.0,
+                 hard_gate_threshold=0.5):
         super().__init__()
         self.gamma = gamma
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+        self.gate_temperature = gate_temperature
+        self.support_gamma = support_gamma
+        self.hard_gate_threshold = hard_gate_threshold
 
         # ------------------------------------------------------------------
         # 1. Trainable VIS / IR encoders (lightweight, no weight sharing)
@@ -199,6 +213,16 @@ class CMDN(nn.Module):
             nn.Conv2d(32, 1, 3, padding=1),
             nn.Sigmoid(),
         )
+
+        self.thr_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(97, 32, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, 1),
+            nn.Sigmoid(),
+        )
+        nn.init.zeros_(self.thr_head[-2].weight)
+        nn.init.zeros_(self.thr_head[-2].bias)
 
         # ------------------------------------------------------------------
         # 7. Sliding-window g_fog: pre-compute fixed grid positions
@@ -410,11 +434,34 @@ class CMDN(nn.Module):
         # (e) Decoder
         # ================================================================
         dec_input = torch.cat([f_vis, feat_clip, feat_dino, disc_refined], dim=1)
-        M_vis = self.decoder(dec_input)
+        P_fail = self.decoder(dec_input)
+        P_pseudo = disc_pseudo
+
+        tau_raw = self.thr_head(dec_input)
+        tau = self.tau_min + (self.tau_max - self.tau_min) * tau_raw
+
+        G_dec = torch.sigmoid((P_fail - tau) / self.gate_temperature)
+        P_support = torch.clamp(P_pseudo.detach(), 0.0, 1.0) ** self.support_gamma
+        G_soft = torch.clamp(G_dec * P_support, 0.0, 1.0)
+        M_hard = (G_soft >= self.hard_gate_threshold).float()
+        haze_mask = M_hard.detach() + G_soft - G_soft.detach()
 
         if return_debug:
-            return M_vis, disc_pseudo, g_fog, attn_deg, disc, disc_refined
-        return M_vis, disc_pseudo
+            return {
+                "P_fail": P_fail,
+                "P_pseudo": P_pseudo,
+                "tau": tau,
+                "G_dec": G_dec,
+                "P_support": P_support,
+                "G_soft": G_soft,
+                "M_hard": M_hard,
+                "haze_mask": haze_mask,
+                "g_fog": g_fog,
+                "attn_deg": attn_deg,
+                "disc": disc,
+                "disc_refined": disc_refined,
+            }
+        return P_fail, P_pseudo, tau, G_dec, P_support, G_soft, M_hard, haze_mask
 
 
 # ---------------------------------------------------------------------------
@@ -426,10 +473,13 @@ if __name__ == "__main__":
     m = CMDN().to(device)
     x = torch.randn(1, 3, 256, 256).to(device)
     y = torch.randn(1, 3, 256, 256).to(device)
-    M, p = m(x, y)
-    print(f"M_vis: {M.shape}, disc_pseudo: {p.shape}")
-    M2, p2, gf, ad, dc, dr = m(x, y, return_debug=True)
-    print(f"Debug: g_fog={gf.shape}, attn_deg={ad.shape}, disc={dc.shape}, disc_refined={dr.shape}")
+    P_fail, P_pseudo, tau, G_dec, P_support, G_soft, M_hard, haze_mask = m(x, y)
+    print(f"P_fail: {P_fail.shape}, P_pseudo: {P_pseudo.shape}, tau: {tau.shape}")
+    dbg = m(x, y, return_debug=True)
+    print(
+        f"Debug: g_fog={dbg['g_fog'].shape}, attn_deg={dbg['attn_deg'].shape}, "
+        f"disc={dbg['disc'].shape}, disc_refined={dbg['disc_refined'].shape}"
+    )
     trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
     frozen   = sum(p.numel() for p in m.parameters() if not p.requires_grad)
     print(f"Trainable: {trainable:,}  Frozen: {frozen:,}")
