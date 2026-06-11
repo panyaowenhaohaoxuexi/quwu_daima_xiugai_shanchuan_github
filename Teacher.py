@@ -872,9 +872,9 @@ if __name__ == "__main__":
     if test_set:
         loader_test = DataLoader(
             dataset=test_set,
-            batch_size=1,  # 测试时通常 batch_size=1
+            batch_size=8,  # 测试时通常 batch_size=1
             shuffle=False,
-            num_workers=8,  # 测试时 worker 少一些通常没问题
+            num_workers=16,  # 测试时 worker 少一些通常没问题
             collate_fn=collate_fn_skip_none
         )
 
