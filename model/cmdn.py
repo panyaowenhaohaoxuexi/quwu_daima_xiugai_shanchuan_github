@@ -367,7 +367,7 @@ class CMDN(nn.Module):
             return_debug:   if True, also return g_fog, attn_deg, disc, disc_refined
 
         Returns:
-            M_vis:      (B, 1, H, W) soft haze mask
+            P_fail:     (B, 1, H, W) visible failure probability
             disc_pseudo:(B, 1, H, W) pseudo-label (detached)
         """
         B, _, H, W = x_vis_clipnorm.shape

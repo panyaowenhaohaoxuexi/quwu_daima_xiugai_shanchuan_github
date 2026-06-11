@@ -59,9 +59,7 @@ parser.add_argument('--boundary_lambda_edge', default=10.0, type=float, help='ed
 
 # --- [新增] CMDN 掩码损失权重 ---
 parser.add_argument('--w_loss_Disc', default=0.15, type=float, help='weight of CMDN pseudo-label BCE loss')
-parser.add_argument('--w_loss_Bimodal', default=0.05, type=float, help='weight of CMDN bimodal push penalty')
-parser.add_argument('--w_loss_Sparse', default=0.05, type=float, help='weight of CMDN sparse ratio target loss')
-parser.add_argument('--target_haze_ratio', default=0.35, type=float, help='target mean haze ratio for M_vis')
+# w_loss_Bimodal / w_loss_Sparse / target_haze_ratio 已废弃，对应 loss 在训练代码中恒为 zero，勿使用
 parser.add_argument('--w_loss_Gate', default=0.10, type=float, help='weight of conservative gate supervision loss')
 parser.add_argument('--w_loss_Margin', default=0.03, type=float, help='weight of adaptive threshold margin loss')
 parser.add_argument('--w_loss_Area', default=0.05, type=float, help='weight of one-sided completion area upper-bound loss')

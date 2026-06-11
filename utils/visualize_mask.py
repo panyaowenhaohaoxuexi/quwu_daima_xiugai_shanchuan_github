@@ -8,9 +8,13 @@ saves a multi-column comparison image:
   Col2: Infrared image (normalized to [0,1])
   Col3: g_fog — CLIP sliding-window fog density
   Col4: attn_deg — DINOv2 local structure variance
-  Col5: disc_refined — fused pseudo-label
-  Col6: M_vis — CMDN soft density map
-  Col7: Binary haze mask (threshold 0.5)
+  Col5: P_pseudo - fused pseudo-label
+  Col6: P_fail - CMDN visible failure probability map
+  Col7: tau - image-adaptive threshold
+  Col8: G_dec - adaptive decision gate
+  Col9: P_support - detached conservative support
+  Col10: G_soft - final conservative soft gate
+  Col11: M_hard - binary region mask from G_soft
 
 Saved to {save_dir}/mask_vis/epoch_{epoch:03d}.png each epoch.
 Fixed first N samples ensure cross-epoch comparability.

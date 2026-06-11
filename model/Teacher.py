@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
@@ -1246,7 +1246,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
     # --- [重写] forward 方法 ---
     def forward(self, x_vis, x_ir, haze_mask=None, disc_alpha=0.0):
         m_hard_out = None  # 仅在 haze_mask is None 分支赋值，用于边界平滑损失
-        M_vis = None
+        P_fail = None
         disc_pseudo = None
         tau = None
         G_dec = None
@@ -1255,7 +1255,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
 
         if haze_mask is None:
             # --- CMDN: Cross-Modal Decision Network mask estimation ---
-            M_vis, disc_pseudo, tau, G_dec, P_support, G_soft, m_hard, haze_mask = self.cmdn(
+            P_fail, disc_pseudo, tau, G_dec, P_support, G_soft, m_hard, haze_mask = self.cmdn(
                 x_vis, x_ir, disc_alpha=disc_alpha
             )
             m_hard_out = m_hard  # 暴露给调用方用于 L_boundary
@@ -1445,7 +1445,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
             vis_features,
             ir_features,
             m_hard_out,
-            M_vis,
+            P_fail,
             disc_pseudo,
             tau,
             G_dec,
@@ -1463,12 +1463,12 @@ if __name__ == "__main__":
     dummy_input_ir = torch.randn(1, 3, 256, 256).to(device)
 
     # [修改] 接收 11 个输出
-    output_tensor, intermediate_features, vis_features_out, ir_features_out, m_hard_out, M_vis, disc_pseudo, tau, G_dec, P_support, G_soft = net(dummy_input_vis, dummy_input_ir)
+    output_tensor, intermediate_features, vis_features_out, ir_features_out, m_hard_out, P_fail, disc_pseudo, tau, G_dec, P_support, G_soft = net(dummy_input_vis, dummy_input_ir)
 
     print("Output shape:", output_tensor.shape)
     print("Vis Features (Decoder Output) shape:", vis_features_out.shape)
     print("IR Features (Decoder Output) shape:", ir_features_out.shape)
-    print("M_vis shape:", M_vis.shape if M_vis is not None else "None")
+    print("P_fail shape:", P_fail.shape if P_fail is not None else "None")
     print("disc_pseudo shape:", disc_pseudo.shape if disc_pseudo is not None else "None")
     print("tau shape:", tau.shape if tau is not None else "None")
     print("Intermediate features shapes:")

@@ -334,7 +334,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         disc_alpha = 0.0
         if epoch_idx >= 5:
             disc_alpha = min(1.0, (epoch_idx - 5) / 10.0)  # 5→15, linear 0→1
-        pred_image, vis_h_features, vis_features, ir_features, m_hard, M_vis, disc_pseudo, tau, G_dec, P_support, G_soft = \
+        pred_image, vis_h_features, vis_features, ir_features, m_hard, P_fail, disc_pseudo, tau, G_dec, P_support, G_soft = \
             teacher_net(hazy_vis, infrared, haze_mask=None, disc_alpha=disc_alpha)
         # --- [修改结束] ---
 
@@ -388,7 +388,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
 
         # --- [新增] CMDN 自适应区域决策损失 ---
         region_ready = (
-            M_vis is not None and
+            P_fail is not None and
             disc_pseudo is not None and
             tau is not None and
             G_dec is not None and
@@ -398,17 +398,17 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         zero = torch.tensor(0.0, device=opt.device)
         if region_ready:
             loss_Disc = F.binary_cross_entropy(
-                M_vis.clamp(1e-6, 1 - 1e-6),
+                P_fail.clamp(1e-6, 1 - 1e-6),
                 disc_pseudo.detach().clamp(1e-6, 1 - 1e-6)
             )
             loss_Gate = F.binary_cross_entropy(
                 G_dec.clamp(1e-6, 1 - 1e-6),
                 P_support.detach().clamp(1e-6, 1 - 1e-6)
             )
-            loss_Margin = F.relu(opt.margin_delta - torch.abs(M_vis - tau)).mean()
-            area_pred = G_soft.flatten(1).mean(dim=1)
-            area_target = P_support.flatten(1).mean(dim=1).detach()
-            loss_Area = F.relu(area_pred - area_target - opt.area_epsilon).pow(2).mean()
+            loss_Margin = F.relu(opt.margin_delta - torch.abs(P_fail - tau)).mean()
+            area_dec = G_dec.flatten(1).mean(dim=1)
+            area_pseudo = disc_pseudo.flatten(1).mean(dim=1).detach()
+            loss_Area = F.relu(area_dec - area_pseudo - opt.area_epsilon).pow(2).mean()
         else:
             loss_Disc = loss_Gate = loss_Margin = loss_Area = zero
         loss_Bimodal = zero
