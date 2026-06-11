@@ -13,6 +13,14 @@ g_fog is kept only as a CLIP sliding-window diagnostic signal. It does not
 enter P_pseudo, P_support, or loss_Disc. CLIP patch tokens still enter the
 decoder as feat_clip for trainable P_fail prediction.
 
+SAM sky suppression semantics:
+  P_pseudo_raw = haze_app * fixed evidence
+  P_pseudo     = P_pseudo_raw * non_sky_mask
+
+non_sky_mask can come from an externally supplied SAM sky_mask. SAM sky_mask
+only suppresses sky regions, does not judge fog regions, and does not
+participate in training. g_fog remains diagnostic only.
+
 Probe-verified design decisions (see probe_hooks.py):
   - CLIP per-patch tokens CANNOT encode fog/sky semantics (all cos-sim ~0).
     g_fog uses sliding-window CLS token (7×7 overlapping crops at 448px).
@@ -425,13 +433,14 @@ class CMDN(nn.Module):
     # Forward
     # ------------------------------------------------------------------
     def forward(self, x_vis_clipnorm, x_ir,
-                disc_alpha=0.0, return_debug=False):
+                disc_alpha=0.0, return_debug=False, sky_mask=None):
         """
         Args:
             x_vis_clipnorm: (B, 3, H, W) visible in CLIP normalisation
             x_ir:           (B, 3, H, W) infrared
             disc_alpha:     kept for interface compatibility; does not affect P_pseudo
             return_debug:   if True, also return pseudo-label diagnostics
+            sky_mask:       optional sky mask; sky=1 suppresses P_pseudo_raw
 
         Returns:
             P_fail:    (B, 1, H, W) visible failure probability
@@ -519,8 +528,50 @@ class CMDN(nn.Module):
                 (0.7 * edge_adv + 0.3 * contrast_adv).clamp(0.0, 1.0))
 
             evidence = 0.4 * struct_deg + 0.6 * ir_adv
-            P_pseudo = self._smooth01(haze_app * evidence)
-            P_pseudo = P_pseudo.clamp(0.0, 1.0) ** self.gamma
+            P_pseudo_raw = self._smooth01(haze_app * evidence)
+            P_pseudo_raw = P_pseudo_raw.clamp(0.0, 1.0) ** self.gamma
+            P_pseudo_raw = P_pseudo_raw.detach()
+
+            if sky_mask is not None:
+                sky_mask_debug = sky_mask
+                if sky_mask_debug.dim() == 2:
+                    sky_mask_debug = sky_mask_debug.unsqueeze(0).unsqueeze(0)
+                elif sky_mask_debug.dim() == 3:
+                    if sky_mask_debug.shape[0] == B:
+                        sky_mask_debug = sky_mask_debug.unsqueeze(1)
+                    elif sky_mask_debug.shape[0] == 1:
+                        sky_mask_debug = sky_mask_debug.unsqueeze(0)
+                    else:
+                        raise ValueError(
+                            "sky_mask with 3 dims must have shape (B,H,W) or (1,H,W)")
+                elif sky_mask_debug.dim() == 4:
+                    pass
+                else:
+                    raise ValueError(
+                        "sky_mask must have shape (B,1,H,W), (B,H,W), (1,H,W), or (H,W)")
+
+                if sky_mask_debug.shape[0] == 1 and B != 1:
+                    sky_mask_debug = sky_mask_debug.expand(B, -1, -1, -1)
+                if sky_mask_debug.shape[0] != B or sky_mask_debug.shape[1] != 1:
+                    raise ValueError(
+                        f"sky_mask normalized shape must be (B,1,H,W), got {tuple(sky_mask_debug.shape)}")
+
+                sky_mask_debug = sky_mask_debug.to(
+                    device=P_pseudo_raw.device, dtype=P_pseudo_raw.dtype)
+                sky_mask_debug = F.interpolate(
+                    sky_mask_debug,
+                    size=P_pseudo_raw.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False)
+                sky_mask_debug = sky_mask_debug.clamp(0.0, 1.0)
+                sky_mask_debug = (sky_mask_debug >= 0.5).to(dtype=P_pseudo_raw.dtype)
+                non_sky_mask = 1.0 - sky_mask_debug
+                P_pseudo = P_pseudo_raw * non_sky_mask
+            else:
+                sky_mask_debug = torch.zeros_like(P_pseudo_raw)
+                non_sky_mask = torch.ones_like(P_pseudo_raw)
+                P_pseudo = P_pseudo_raw
+
             P_pseudo = P_pseudo.detach()
 
         # ================================================================
@@ -541,6 +592,9 @@ class CMDN(nn.Module):
         if return_debug:
             return {
                 "P_fail": P_fail,
+                "P_pseudo_raw": P_pseudo_raw,
+                "sky_mask": sky_mask_debug,
+                "non_sky_mask": non_sky_mask,
                 "P_pseudo": P_pseudo,
                 "tau": tau,
                 "G_dec": G_dec,
