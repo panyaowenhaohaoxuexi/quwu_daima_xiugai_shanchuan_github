@@ -551,7 +551,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
                             vis_tensors.append(vis_tensor)
                             # 找对应的红外图
                             base_name = os.path.basename(img_path)
-                            ir_path = os.path.join(opt.real_test_ir_path, base_name)
+                            ir_path = os.path.join(opt.real_test_specific_ir_dir, base_name)
                             if os.path.exists(ir_path):
                                 ir_tensor = transform(mask_vis_resize(Image.open(ir_path).convert("RGB")))
                             else:

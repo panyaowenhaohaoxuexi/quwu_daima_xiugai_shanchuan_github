@@ -112,6 +112,8 @@ parser.add_argument('--real_test_mask_path', type=str, default='/root/autodl-tmp
 # 指定要进行推理的图像文件夹 (替换 real_test_hazy_path，留空则使用默认)
 parser.add_argument('--real_test_specific_hazy_dir', type=str, default='',
                     help='指定要推理的图像文件夹，替换 real_test_hazy_path（留空则使用默认）')
+parser.add_argument('--real_test_specific_ir_dir', type=str, default='',
+                    help='与 real_test_specific_hazy_dir 配对的红外图像目录，文件名需与可见光一一对应，用于中间过程可视化')
 
 # =========================================
 # 【训练中真实世界推理 — 输出路径】
