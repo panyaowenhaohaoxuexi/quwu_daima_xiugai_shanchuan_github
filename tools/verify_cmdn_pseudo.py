@@ -32,9 +32,9 @@ import matplotlib.pyplot as plt
 # User-editable configuration
 # ---------------------------------------------------------------------------
 
-HAZY_DIR = r"F:/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/hazy/00960.png"
-IR_DIR = r"F:/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/ir/00960.png"
-OUT_DIR = r"D:/liu_lan_qi_xia_zai/quwu_daima_xiugai_shanchuan_github/cmdn_verify_results/00960_pseudo.png"
+HAZY_DIR = r"F:/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/hazy/01435.png"
+IR_DIR = r"F:/Dehaze_Paper/2_Dataset/1_main_benchmark/REAL_FOGGY/ir/01435.png"
+OUT_DIR = r"D:/liu_lan_qi_xia_zai/quwu_daima_xiugai_shanchuan_github/cmdn_verify_results/01435_pseudo.png"
 
 SIZE = 512
 MAX_IMAGES = 20

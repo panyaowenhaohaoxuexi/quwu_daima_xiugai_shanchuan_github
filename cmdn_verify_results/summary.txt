@@ -1,5 +1,5 @@
 num_images=1
-mean_pseudo_mean=0.1100171655
-mean_pseudo_max=0.5194070935
+mean_pseudo_mean=0.0688677952
+mean_pseudo_max=0.4770843089
 mean_m_hard_mean=0.0000000000
 mean_alpha_diff=0.0000000000
