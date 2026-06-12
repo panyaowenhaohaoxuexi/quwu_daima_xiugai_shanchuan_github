@@ -35,9 +35,9 @@ import matplotlib.pyplot as plt
 # User-editable configuration
 # ---------------------------------------------------------------------------
 
-HAZY_DIR = r"F:/Dehaze_Paper/2_Dataset/1_main_benchmark/FLIR/train/hazy/FLIR_00002.jpg"
-IR_DIR = r"F:/Dehaze_Paper/2_Dataset/1_main_benchmark/FLIR/train/ir/FLIR_00002.jpg"
-OUT_DIR = r"D:/liu_lan_qi_xia_zai/quwu_daima_xiugai_shanchuan_github/cmdn_verify_results/FLIR_00002.jpg"
+HAZY_DIR = r"F:/Dehaze_Paper/2_Dataset/2_additional_benchmark/Target/hazy/dense_hazy_01.jpg"
+IR_DIR = r"F:/Dehaze_Paper/2_Dataset/2_additional_benchmark/Target/ir/dense_hazy_01.jpg"
+OUT_DIR = r"D:/liu_lan_qi_xia_zai/quwu_daima_xiugai_shanchuan_github/cmdn_verify_results/dense_hazy_01.jpg"
 
 SIZE = 512
 MAX_IMAGES = 20
