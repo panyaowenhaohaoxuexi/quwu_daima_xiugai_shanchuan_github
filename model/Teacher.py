@@ -3,11 +3,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import os
+import sys
 import torchvision.transforms.functional as TF
 # --- [修改] 使用绝对导入（因为我们添加了项目根目录到 sys.path） ---
-from .vifnet_basic_modules import Encoder_B, Decoder_B, Conv_B, CPAB
-from .dsfe import DSFE
-from .cmdn import CMDN
+if __package__:
+    from .vifnet_basic_modules import Encoder_B, Decoder_B, Conv_B, CPAB
+    from .dsfe import DSFE
+    from .cmdn import CMDN
+else:
+    CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+    for path in (CURRENT_DIR, PROJECT_ROOT):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    from vifnet_basic_modules import Encoder_B, Decoder_B, Conv_B, CPAB
+    from dsfe import DSFE
+    from cmdn import CMDN
 # [已移除] CLIP 导入 — 颜色恢复改为纯图内 Cross-Attention
 
 
@@ -408,12 +419,23 @@ class Res2Net(nn.Module):
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
 
-        # --- [新增] 注入权重适配器 (用于 Pass 2 注入) ---
-        # 匹配 ir_feat (DSFE) 输出 -> Res2Net layer 输出通道
-        # ir_feat [64(H/4), 128(H/8), 256(H/16)] -> [256, 512, 1024]
-        self.inject_conv1 = nn.Conv2d(64, 256, kernel_size=1, bias=False)  # H/4
-        self.inject_conv2 = nn.Conv2d(128, 512, kernel_size=1, bias=False)  # H/8
-        self.inject_conv3 = nn.Conv2d(256, 1024, kernel_size=1, bias=False)  # H/16
+        # --- Pass 2 injection adapters for full IR content features ---
+        # ir_feat_list order: [H/16(1024ch), H/8(512ch), H/4(256ch)]
+        self.inject_conv1 = nn.Sequential(  # H/4: 256 -> 256
+            nn.Conv2d(256, 256, kernel_size=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+        self.inject_conv2 = nn.Sequential(  # H/8: 512 -> 512
+            nn.Conv2d(512, 512, kernel_size=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
+        self.inject_conv3 = nn.Sequential(  # H/16: 1024 -> 1024
+            nn.Conv2d(1024, 1024, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1024),
+            nn.ReLU(inplace=True),
+        )
 
         # 初始化权重
         for m in self.modules():
@@ -446,12 +468,16 @@ class Res2Net(nn.Module):
     def forward(self, x, ir_feat_list=None, beta_list=None, haze_mask=None):
         """
         [区域补全范式] Res2Net forward，按 HAPM 掩码严格分流：
-          - M=1（补全区）：beta_eff=1，纯 IR 填充，VIS 特征完全丢弃
-          - M=0（融合区）：beta_eff=beta，可见光与红外自适应凸组合
+          - M=1（补全区）：beta_eff=1，完整 IR 内容特征替代 VIS 特征
+          - M=0（融合区）：beta_eff=beta，可见光与红外内容特征自适应凸组合
 
-        ir_feat_list: 纯 IR 结构特征 [H/16(256ch), H/8(128ch), H/4(64ch)]
-        beta_list:    逐像素 IR 融合权重 [H/16(1ch), H/8(1ch), H/4(1ch)]
-        haze_mask:    (B,1,H,W) 二值掩码，None 时 mask=0 退化为纯自适应融合
+        ir_feat_list: 纯 IR 内容特征，来自 encoder_ir 的完整多尺度编码特征。
+                      顺序为 [H/16, H/8, H/4]，通道分别为 [1024, 512, 256]。
+        beta_list:    来自 vis_structure 和 ir_structure 的逐像素融合权重。
+                      顺序为 [H/16, H/8, H/4]，每个尺度为单通道 beta map。
+        haze_mask:    (B,1,H,W) 掩码，M=1 表示补全区域，M=0 表示融合区域。
+                      外部传入时应已为二值或 straight-through binary-like；
+                      严格替代只在 mask 值恰为 1 的位置保证。
 
         ir_feat_list=None 时为纯特征提取模式（IR 并行编码器使用，不做注入）
         """
@@ -472,27 +498,34 @@ class Res2Net(nn.Module):
             original_outputs = [x_layer3_orig, x_layer2_orig, x_layer1_orig, x_layer0]
             return fused_outputs, original_outputs
 
+        assert ir_feat_list[0].shape[1] == 1024, \
+            f"H/16 IR content feature should have 1024 channels, got {ir_feat_list[0].shape[1]}"
+        assert ir_feat_list[1].shape[1] == 512, \
+            f"H/8 IR content feature should have 512 channels, got {ir_feat_list[1].shape[1]}"
+        assert ir_feat_list[2].shape[1] == 256, \
+            f"H/4 IR content feature should have 256 channels, got {ir_feat_list[2].shape[1]}"
+
         # --- H/4 尺度 (layer1, 256ch) ---
         x_layer1_orig = self.layer1(x_maxpool)  # (B, 256, H/4, W/4)
         F_vis_1 = x_layer1_orig
-        F_ir_1 = self.inject_conv1(ir_feat_list[2])  # 64→256, 纯IR
+        F_ir_1 = self.inject_conv1(ir_feat_list[2])  # H/4, 256->256, IR content
         F_ir_1 = F.interpolate(F_ir_1, size=F_vis_1.shape[2:], mode='bilinear', align_corners=False)
         beta_1 = F.interpolate(beta_list[2], size=F_vis_1.shape[2:], mode='bilinear', align_corners=False)
         if haze_mask is not None:
-            mask_1 = F.interpolate(haze_mask, size=F_vis_1.shape[2:], mode='bilinear', align_corners=False)
+            mask_1 = F.interpolate(haze_mask, size=F_vis_1.shape[2:], mode='nearest')
         else:
             mask_1 = torch.zeros_like(beta_1)
-        beta_eff_1 = mask_1 + (1.0 - mask_1) * beta_1  # M=1→1(纯IR), M=0→β
+        beta_eff_1 = mask_1 + (1.0 - mask_1) * beta_1  # M=1->IR content, M=0->beta fusion
         x_layer1_fused = (1.0 - beta_eff_1) * F_vis_1 + beta_eff_1 * F_ir_1
 
         # --- H/8 尺度 (layer2, 512ch) ---
         x_layer2_orig = self.layer2(x_layer1_fused)  # (B, 512, H/8, W/8)
         F_vis_2 = x_layer2_orig
-        F_ir_2 = self.inject_conv2(ir_feat_list[1])  # 128→512, 纯IR
+        F_ir_2 = self.inject_conv2(ir_feat_list[1])  # H/8, 512->512, IR content
         F_ir_2 = F.interpolate(F_ir_2, size=F_vis_2.shape[2:], mode='bilinear', align_corners=False)
         beta_2 = F.interpolate(beta_list[1], size=F_vis_2.shape[2:], mode='bilinear', align_corners=False)
         if haze_mask is not None:
-            mask_2 = F.interpolate(haze_mask, size=F_vis_2.shape[2:], mode='bilinear', align_corners=False)
+            mask_2 = F.interpolate(haze_mask, size=F_vis_2.shape[2:], mode='nearest')
         else:
             mask_2 = torch.zeros_like(beta_2)
         beta_eff_2 = mask_2 + (1.0 - mask_2) * beta_2
@@ -501,11 +534,11 @@ class Res2Net(nn.Module):
         # --- H/16 尺度 (layer3, 1024ch) ---
         x_layer3_orig = self.layer3(x_layer2_fused)  # (B, 1024, H/16, W/16)
         F_vis_3 = x_layer3_orig
-        F_ir_3 = self.inject_conv3(ir_feat_list[0])  # 256→1024, 纯IR
+        F_ir_3 = self.inject_conv3(ir_feat_list[0])  # H/16, 1024->1024, IR content
         F_ir_3 = F.interpolate(F_ir_3, size=F_vis_3.shape[2:], mode='bilinear', align_corners=False)
         beta_3 = F.interpolate(beta_list[0], size=F_vis_3.shape[2:], mode='bilinear', align_corners=False)
         if haze_mask is not None:
-            mask_3 = F.interpolate(haze_mask, size=F_vis_3.shape[2:], mode='bilinear', align_corners=False)
+            mask_3 = F.interpolate(haze_mask, size=F_vis_3.shape[2:], mode='nearest')
         else:
             mask_3 = torch.zeros_like(beta_3)
         beta_eff_3 = mask_3 + (1.0 - mask_3) * beta_3
@@ -1283,12 +1316,17 @@ class VIFNetInconsistencyTeacher(nn.Module):
         ir_structure = self.dsfe_ir(ir_b_enc_features, ir_b_dec_features)  # [64, 128, 256]
 
         # --- 阶段三：构建 Pass 2 注入源 (区域补全范式) ---
-        # ir_feat_list: 纯 IR 结构特征，索引 [H/16, H/8, H/4]
-        ir_feat_list = [ir_structure[2], ir_structure[1], ir_structure[0]]
+        # ir_structure 只用于估计 beta；实际补全/注入源来自 encoder_ir 的完整 IR 内容特征。
+        ir_content_outputs, _ = self.encoder_ir(x_ir)
+        ir_content_feat_list = [
+            ir_content_outputs[0],  # H/16, 1024 channels
+            ir_content_outputs[1],  # H/8,  512 channels
+            ir_content_outputs[2],  # H/4,  256 channels
+        ]
 
         # beta_list: 逐像素 IR 融合权重 β∈[0,1]
         # β = ir_structure * (1 - vis_structure)，channel-mean 到单通道
-        # 物理含义：可见光结构丢失(vis_s↓) 且 红外有结构(ir_s↑) → β↑ → 该处更信 IR
+        # 物理含义：可见光结构丢失(vis_s↓) 且 红外结构可靠(ir_s↑) → β↑ → 该处更信 IR 内容特征
         beta_list = []
         for i in range(3):  # i=0:H/4, 1:H/8, 2:H/16
             beta = (ir_structure[i] * (1.0 - vis_structure[i])).mean(dim=1, keepdim=True)
@@ -1296,7 +1334,13 @@ class VIFNetInconsistencyTeacher(nn.Module):
         beta_list = [beta_list[2], beta_list[1], beta_list[0]]  # 重排为 [H/16, H/8, H/4]
 
         # --- 阶段四：精炼编码与注入（Pass 2 - A 模块）---
-        fused_outputs, original_outputs = self.encoder_vis(x_vis, ir_feat_list, beta_list, haze_mask)
+        # M=1: 完整 IR 内容特征替代；M=0: beta-based VIS/IR 内容特征融合。
+        fused_outputs, original_outputs = self.encoder_vis(
+            x_vis,
+            ir_content_feat_list,
+            beta_list,
+            haze_mask
+        )
 
         # (fused_outputs)  [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0]
         # (original_outputs) [x_layer3_orig, x_layer2_orig, x_layer1_orig, x_layer0]
@@ -1379,7 +1423,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
         # --- [修改] 保留 IR 流解码器 (用于跨模态损失) ---
         # 5c. [运行 IR 流 (Pass 2)]
         # (这部分用于获取最终融合所需的 ir_features)
-        ir_fused_outputs, _ = self.encoder_ir(x_ir, haze_mask=None)  # (IR 流不注入)
+        ir_fused_outputs = ir_content_outputs  # 复用完整 IR 内容编码，避免重复计算 encoder_ir
         ir_layer3, ir_layer2, ir_layer1, ir_layer0 = ir_fused_outputs
 
         res16x_ir = self.CRA1_ir(ir_layer3)
