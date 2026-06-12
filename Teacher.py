@@ -101,7 +101,7 @@ def lr_schedule_cosdecay(t, T, init_lr=opt.start_lr, end_lr=opt.end_lr):
 def collate_fn_skip_none(batch):
     """
     DataLoader 的 collate_fn，用于过滤掉批次中值为 None 的样本。
-    修改: 使其能处理 TestDataset 返回的4个值。
+    支持训练/测试返回的 3-item / 4-item / 5-item batch。
     """
     # 过滤掉 batch 中第一个元素为 None 的项
     batch = list(filter(lambda x: x is not None and x[0] is not None, batch))
@@ -785,6 +785,18 @@ def pad_img(x, patch_size):
     return x
 
 
+def pad_mask(x, patch_size):
+    """
+    对二值 mask 做常数 0 padding，使高度和宽度成为 patch_size 的整数倍。
+    mask 不使用 reflect padding，避免把天空区域反射到边界外。
+    """
+    _, _, h, w = x.size()
+    mod_pad_h = (patch_size - h % patch_size) % patch_size
+    mod_pad_w = (patch_size - w % patch_size) % patch_size
+    x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), mode='constant', value=0)
+    return x
+
+
 # 定义函数 test：在测试集上评估模型性能
 def test(net, loader_test):
     """
@@ -806,9 +818,15 @@ def test(net, loader_test):
             print(f"警告: 在测试加载器中跳过索引 {i} 的空批次 (collate_fn 返回空)。")
             continue
 
-        # --- [修改] 解包4个返回值 ---
-        # 确保返回的是4项
-        if len(batch_test) == 4:
+        sky_mask = None
+        if len(batch_test) == 5:
+            inputs_vis, inputs_ir, targets, sky_mask, hazy_name_list = batch_test
+            if not inputs_vis.numel():
+                print(f"警告: 在测试加载器索引 {i} 遇到空数据。跳过。")
+                continue
+            hazy_name = hazy_name_list[0] if isinstance(hazy_name_list,
+                                                        (list, tuple)) and hazy_name_list else f"Unknown_Index_{i}"
+        elif len(batch_test) == 4:
             inputs_vis, inputs_ir, targets, hazy_name_list = batch_test
             # 处理可能的空 batch 情况（如果 collate_fn 返回了带空 tensor 的元组）
             if not inputs_vis.numel():
@@ -825,6 +843,8 @@ def test(net, loader_test):
         inputs_vis = inputs_vis.to(opt.device, non_blocking=True)
         inputs_ir = inputs_ir.to(opt.device, non_blocking=True)  # --- [修改] 添加红外输入到设备 ---
         targets = targets.to(opt.device, non_blocking=True)
+        if sky_mask is not None:
+            sky_mask = sky_mask.to(opt.device, non_blocking=True)
 
         with torch.no_grad():
             H, W = inputs_vis.shape[2:]  # 使用可见光尺寸作为基准
@@ -832,6 +852,11 @@ def test(net, loader_test):
                 # --- [修改] 填充两个输入 (假设需要16的倍数) ---
                 inputs_vis_padded = pad_img(inputs_vis, 16)
                 inputs_ir_padded = pad_img(inputs_ir, 16)
+                if sky_mask is not None:
+                    sky_mask_padded = pad_mask(sky_mask, 16)
+                    sky_mask_padded = (sky_mask_padded >= 0.5).float()
+                else:
+                    sky_mask_padded = None
                 # --- [修改结束] ---
             except Exception as e:
                 print(f"\n错误: 测试时填充图像 {hazy_name} 失败: {e}。跳过。")
@@ -839,7 +864,12 @@ def test(net, loader_test):
 
             try:
                 # --- [修改] 正确调用双流模型 (测试时不用掩码, haze_mask=None) ---
-                pred_output = net(inputs_vis_padded, inputs_ir_padded, haze_mask=None)[0]
+                pred_output = net(
+                    inputs_vis_padded,
+                    inputs_ir_padded,
+                    haze_mask=None,
+                    sky_mask=sky_mask_padded
+                )[0]
                 # --- [修改结束] ---
 
                 pred = pred_output  # pred_output 已经是图像
@@ -943,13 +973,23 @@ if __name__ == "__main__":
     test_hazy_vis_folder = os.path.join(test_base_dir, 'hazy')
     test_ir_folder = os.path.join(test_base_dir, 'ir')
     test_clear_vis_folder = os.path.join(test_base_dir, 'clear')
+    print("[SkyMask][Test] use_test_sky_mask=", opt.use_test_sky_mask)
+    print("[SkyMask][Test] test_sky_mask_dir=", opt.test_sky_mask_dir)
+    print("[SkyMask][Test] sky_mask_suffix=", opt.sky_mask_suffix)
+    print("[SkyMask][Test] sky_mask_ext=", opt.sky_mask_ext)
+    print("[SkyMask][Test] require_test_sky_mask=", opt.require_test_sky_mask)
     try:
         test_set = TestDataset(
             hazy_visible_path=test_hazy_vis_folder,
             infrared_path=test_ir_folder,
             clear_visible_path=test_clear_vis_folder,
             size=256,  # 测试时使用中心裁剪或缩放
-            format='.jpg'  # 确认测试集格式
+            format='.jpg',  # 确认测试集格式
+            sky_mask_path=opt.test_sky_mask_dir,
+            use_sky_mask=opt.use_test_sky_mask,
+            sky_mask_suffix=opt.sky_mask_suffix,
+            sky_mask_ext=opt.sky_mask_ext,
+            require_sky_mask=opt.require_test_sky_mask
         )
         print(f"成功加载测试数据集，共 {len(test_set)} 个样本。")
     except Exception as e:

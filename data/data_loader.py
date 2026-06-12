@@ -164,7 +164,19 @@ class TestDataset(data.Dataset):
     假设三个文件夹下的文件名一一对应。 (基于用户提供的版本修改)
     """
     # 定义方法 __init__：初始化 TestDataset 实例
-    def __init__(self, hazy_visible_path, infrared_path, clear_visible_path, size=256, format='.jpg'):
+    def __init__(
+        self,
+        hazy_visible_path,
+        infrared_path,
+        clear_visible_path,
+        size=256,
+        format='.jpg',
+        sky_mask_path=None,
+        use_sky_mask=False,
+        sky_mask_suffix='_sky',
+        sky_mask_ext='.png',
+        require_sky_mask=False
+    ):
         """
         初始化测试数据集实例。
 
@@ -180,6 +192,13 @@ class TestDataset(data.Dataset):
         """
         super(TestDataset, self).__init__()
         self.hazy_visible_path = hazy_visible_path
+        self.clear_visible_path = clear_visible_path
+        self.size = size
+        self.sky_mask_path = sky_mask_path
+        self.use_sky_mask = use_sky_mask
+        self.sky_mask_suffix = sky_mask_suffix
+        self.sky_mask_ext = sky_mask_ext
+        self.require_sky_mask = require_sky_mask
         self.infrared_path = infrared_path # <--- 新增红外路径属性
         self.clear_visible_path = clear_visible_path # <--- 使用清晰可见光路径属性
         self.size = size
@@ -205,6 +224,39 @@ class TestDataset(data.Dataset):
             self.image_list = []
 
     # 定义方法 __getitem__：根据索引获取一个测试数据样本
+        if self.use_sky_mask:
+            print("[SkyMask][Test] enabled")
+            print(f"[SkyMask][Test] sky_mask_path={self.sky_mask_path}")
+            print(f"[SkyMask][Test] suffix={self.sky_mask_suffix}")
+            print(f"[SkyMask][Test] ext={self.sky_mask_ext}")
+            print(f"[SkyMask][Test] require={self.require_sky_mask}")
+            if not self.sky_mask_path or not os.path.isdir(self.sky_mask_path):
+                msg = f"[SkyMask][Test] sky mask directory not found: {self.sky_mask_path}"
+                if self.require_sky_mask:
+                    raise RuntimeError(msg)
+                print(f"WARNING: {msg}. Missing masks will fall back to all-zero masks.")
+
+    def find_sky_mask_path(self, image_name):
+        if not self.sky_mask_path:
+            return None
+
+        stem, original_ext = os.path.splitext(image_name)
+        ext_or_original = self.sky_mask_ext if self.sky_mask_ext else original_ext
+        candidates = [
+            os.path.join(self.sky_mask_path, stem + self.sky_mask_suffix + ext_or_original),
+            os.path.join(self.sky_mask_path, image_name),
+            os.path.join(self.sky_mask_path, stem + ".png"),
+            os.path.join(self.sky_mask_path, stem + ".jpg"),
+            os.path.join(self.sky_mask_path, stem + ".jpeg"),
+            os.path.join(self.sky_mask_path, stem + "_sky.png"),
+            os.path.join(self.sky_mask_path, stem + "_sky.jpg"),
+            os.path.join(self.sky_mask_path, stem + "_sky.jpeg"),
+        ]
+        for path in candidates:
+            if path and os.path.exists(path):
+                return path
+        return None
+
     def __getitem__(self, index):
         """
         根据索引加载含雾可见光、红外和清晰可见光图像用于测试。
@@ -218,6 +270,67 @@ class TestDataset(data.Dataset):
                    如果加载失败则返回 (None, None, None, None)。
         """
         image_name = self.image_list[index] # 使用 image_list
+
+        try:
+            hazy_vis_img_path = os.path.join(self.hazy_visible_path, image_name)
+            infrared_img_path = os.path.join(self.infrared_path, image_name)
+            clear_vis_img_path = os.path.join(self.clear_visible_path, image_name)
+
+            hazy_vis = Image.open(hazy_vis_img_path).convert('RGB')
+            infrared = Image.open(infrared_img_path).convert('RGB')
+            clear_vis = Image.open(clear_vis_img_path).convert('RGB')
+
+            sky_mask = None
+            if self.use_sky_mask:
+                mask_path = self.find_sky_mask_path(image_name)
+                if mask_path is not None:
+                    sky_mask = Image.open(mask_path).convert("L")
+                elif self.require_sky_mask:
+                    raise FileNotFoundError(f"Sky mask not found for {image_name} in {self.sky_mask_path}")
+                else:
+                    sky_mask = Image.new("L", hazy_vis.size, 0)
+
+            if isinstance(self.size, int):
+                w, h = hazy_vis.size
+                if w >= self.size and h >= self.size:
+                    crop_size = (self.size, self.size)
+                    hazy_vis = FF.center_crop(hazy_vis, crop_size)
+                    infrared = FF.center_crop(infrared, crop_size)
+                    clear_vis = FF.center_crop(clear_vis, crop_size)
+                    if sky_mask is not None:
+                        sky_mask = FF.center_crop(sky_mask, crop_size)
+                else:
+                    resize_size = [self.size, self.size]
+                    hazy_vis = FF.resize(hazy_vis, resize_size, interpolation=FF.InterpolationMode.BILINEAR)
+                    infrared = FF.resize(infrared, resize_size, interpolation=FF.InterpolationMode.BILINEAR)
+                    clear_vis = FF.resize(clear_vis, resize_size, interpolation=FF.InterpolationMode.BILINEAR)
+                    if sky_mask is not None:
+                        sky_mask = FF.resize(sky_mask, resize_size, interpolation=FF.InterpolationMode.NEAREST)
+                    print(f"警告: 图像 {image_name} 尺寸小于 {self.size}x{self.size}，已强制缩放。")
+
+            hazy_vis_tensor, infrared_tensor, clear_vis_tensor = self.preprocess_test(hazy_vis, infrared, clear_vis)
+
+            if self.use_sky_mask:
+                sky_mask_tensor = ToTensor()(sky_mask)
+                sky_mask_tensor = (sky_mask_tensor >= 0.5).float()
+                return hazy_vis_tensor, infrared_tensor, clear_vis_tensor, sky_mask_tensor, image_name
+
+            return hazy_vis_tensor, infrared_tensor, clear_vis_tensor, image_name
+
+        except FileNotFoundError as e:
+            print(f"错误: 加载图像失败: {e}. 跳过索引 {index}.")
+            if self.use_sky_mask and self.require_sky_mask:
+                raise
+            if self.use_sky_mask:
+                return None, None, None, None, None
+            return None, None, None, None
+        except Exception as e:
+            print(f"处理索引 {index} ({image_name}) 时发生未知错误: {e}")
+            if self.use_sky_mask and self.require_sky_mask:
+                raise
+            if self.use_sky_mask:
+                return None, None, None, None, None
+            return None, None, None, None
 
         # 构建三个图像的完整路径
         hazy_vis_img_path = os.path.join(self.hazy_visible_path, image_name)

@@ -146,8 +146,38 @@ parser.add_argument('--require_train_sky_mask', type=str2bool, nargs='?', const=
 # 【验证/测试数据集路径】 (有雾图 + 红外图 + 清晰图GT)
 #   子目录结构: test_data_dir/hazy/, ir/, clear/
 # =========================================
+# =========================================
+# 【测试/验证阶段天空掩码开关】
+#   这里控制验证/测试时是否读取预先生成好的 SAM 天空掩码。
+#   改完后直接运行 python Teacher.py 即可。
+#
+#   USE_TEST_SKY_MASK:
+#       True  = 测试/验证时读取 sky mask，并传给 CMDN 抑制天空区域 P_pseudo
+#       False = 测试/验证时不读取 sky mask，行为兼容旧版
+#
+#   TEST_SKY_MASK_DIR:
+#       测试集 sky mask 输出目录
+#       默认: /root/autodl-tmp/FLIR_zengqiang/test/sky_mask
+#
+#   REQUIRE_TEST_SKY_MASK:
+#       True  = 某张测试图找不到 sky mask 时直接报错
+#       False = 找不到时 fallback 为全黑 mask，测试继续
+# =========================================
+USE_TEST_SKY_MASK = True
+TEST_SKY_MASK_DIR = '/root/autodl-tmp/FLIR_zengqiang/test/sky_mask'
+REQUIRE_TEST_SKY_MASK = False
+
 parser.add_argument('--test_data_dir', type=str, default='/root/autodl-tmp/FLIR_zengqiang/test',
                     help='测试集根目录，内含 hazy/ ir/ clear/ 三个子文件夹')
+parser.add_argument('--use_test_sky_mask', type=str2bool, nargs='?', const=True,
+                    default=USE_TEST_SKY_MASK,
+                    help='测试/验证时是否读取预生成的 SAM 天空掩码；默认值直接在 option/Teacher.py 的 USE_TEST_SKY_MASK 中设置')
+parser.add_argument('--test_sky_mask_dir', type=str,
+                    default=TEST_SKY_MASK_DIR,
+                    help='测试/验证时读取的预生成 SAM 天空掩码目录')
+parser.add_argument('--require_test_sky_mask', type=str2bool, nargs='?', const=True,
+                    default=REQUIRE_TEST_SKY_MASK,
+                    help='是否强制要求每张测试图都有 sky mask；False 时缺失 mask 会 fallback 为全黑 mask')
 
 # =========================================
 # 【训练中真实世界推理 — 输入路径】
