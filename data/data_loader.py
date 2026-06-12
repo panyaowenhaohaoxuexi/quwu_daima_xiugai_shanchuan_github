@@ -192,17 +192,15 @@ class TestDataset(data.Dataset):
         """
         super(TestDataset, self).__init__()
         self.hazy_visible_path = hazy_visible_path
+        self.infrared_path = infrared_path
         self.clear_visible_path = clear_visible_path
         self.size = size
+        self.format = format
         self.sky_mask_path = sky_mask_path
         self.use_sky_mask = use_sky_mask
         self.sky_mask_suffix = sky_mask_suffix
         self.sky_mask_ext = sky_mask_ext
         self.require_sky_mask = require_sky_mask
-        self.infrared_path = infrared_path # <--- 新增红外路径属性
-        self.clear_visible_path = clear_visible_path # <--- 使用清晰可见光路径属性
-        self.size = size
-        self.format = format # <--- 新增格式属性
 
         # 以含雾可见光文件夹为基准列出文件
         try:
@@ -223,7 +221,6 @@ class TestDataset(data.Dataset):
             print(f"列出文件时发生未知错误: {e}")
             self.image_list = []
 
-    # 定义方法 __getitem__：根据索引获取一个测试数据样本
         if self.use_sky_mask:
             print("[SkyMask][Test] enabled")
             print(f"[SkyMask][Test] sky_mask_path={self.sky_mask_path}")
@@ -257,6 +254,7 @@ class TestDataset(data.Dataset):
                 return path
         return None
 
+    # 定义方法 __getitem__：根据索引获取一个测试数据样本
     def __getitem__(self, index):
         """
         根据索引加载含雾可见光、红外和清晰可见光图像用于测试。
@@ -330,45 +328,6 @@ class TestDataset(data.Dataset):
                 raise
             if self.use_sky_mask:
                 return None, None, None, None, None
-            return None, None, None, None
-
-        # 构建三个图像的完整路径
-        hazy_vis_img_path = os.path.join(self.hazy_visible_path, image_name)
-        infrared_img_path = os.path.join(self.infrared_path, image_name) # <--- 新增红外路径
-        clear_vis_img_path = os.path.join(self.clear_visible_path, image_name) # <--- 使用清晰可见光路径
-
-        try:
-            # 加载三个图像
-            hazy_vis = Image.open(hazy_vis_img_path).convert('RGB')
-            infrared = Image.open(infrared_img_path).convert('RGB') # <--- 加载红外图像
-            clear_vis = Image.open(clear_vis_img_path).convert('RGB')
-            # --- 测试时的尺寸处理 ---
-            if isinstance(self.size, int):
-                # 选择: 中心裁剪 或 缩放
-                # 方案 A: 中心裁剪 (如果图像尺寸大于等于 self.size)
-                w, h = hazy_vis.size # 假设所有图像尺寸相同
-                if w >= self.size and h >= self.size:
-                    hazy_vis = FF.center_crop(hazy_vis, (self.size, self.size))
-                    infrared = FF.center_crop(infrared, (self.size, self.size)) # <--- 对红外应用
-                    clear_vis = FF.center_crop(clear_vis, (self.size, self.size))
-                else:
-                    # 方案 B: 如果图像尺寸小于要求，强制缩放到 self.size x self.size
-                    hazy_vis = FF.resize(hazy_vis, [self.size, self.size], interpolation=FF.InterpolationMode.BILINEAR)
-                    infrared = FF.resize(infrared, [self.size, self.size], interpolation=FF.InterpolationMode.BILINEAR) # <--- 对红外应用
-                    clear_vis = FF.resize(clear_vis, [self.size, self.size], interpolation=FF.InterpolationMode.BILINEAR)
-                    print(f"警告: 图像 {image_name} 尺寸小于 {self.size}x{self.size}，已强制缩放。")
-
-            # --- 调用新的预处理方法 ---
-            hazy_vis_tensor, infrared_tensor, clear_vis_tensor = self.preprocess_test(hazy_vis, infrared, clear_vis)
-
-            # --- 返回四个值 ---
-            return hazy_vis_tensor, infrared_tensor, clear_vis_tensor, image_name
-
-        except FileNotFoundError as e:
-            print(f"错误: 加载图像失败: {e}. 跳过索引 {index}.")
-            return None, None, None, None # 返回 None 让 collate_fn 处理
-        except Exception as e:
-            print(f"处理索引 {index} ({image_name}) 时发生未知错误: {e}")
             return None, None, None, None
 
     # 定义方法 preprocess_test：对测试数据进行预处理
