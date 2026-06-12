@@ -1090,7 +1090,10 @@ class VIFNetInconsistencyTeacher(nn.Module):
                  tau_max=0.85,
                  gate_temperature=0.10,
                  support_gamma=1.0,
-                 hard_gate_threshold=0.5):
+                 support_floor=0.0,
+                 support_threshold=0.25,
+                 support_temperature=0.05,
+                 hard_gate_threshold=0.25):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
         self.cmdn = CMDN(
@@ -1098,6 +1101,9 @@ class VIFNetInconsistencyTeacher(nn.Module):
             tau_max=tau_max,
             gate_temperature=gate_temperature,
             support_gamma=support_gamma,
+            support_floor=support_floor,
+            support_threshold=support_threshold,
+            support_temperature=support_temperature,
             hard_gate_threshold=hard_gate_threshold,
         )
 

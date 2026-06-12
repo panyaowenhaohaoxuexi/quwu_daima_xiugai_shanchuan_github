@@ -332,9 +332,9 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
     losses = []
     # --- [修改] 增加 Edge, Style, CrossModal 日志 ---
     loss_log = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'Boundary': [],
-                'Disc': [], 'Gate': [], 'Margin': [], 'Area': [], 'Bimodal': [], 'Sparse': [], 'total': []}
+                'Disc': [], 'Gate': [], 'Margin': [], 'Area': [], 'Outside': [], 'Bimodal': [], 'Sparse': [], 'total': []}
     loss_log_tmp = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'Boundary': [],
-                    'Disc': [], 'Gate': [], 'Margin': [], 'Area': [], 'Bimodal': [], 'Sparse': [], 'total': []}
+                    'Disc': [], 'Gate': [], 'Margin': [], 'Area': [], 'Outside': [], 'Bimodal': [], 'Sparse': [], 'total': []}
     # --- [修改结束] ---
     psnr_log = []
 
@@ -487,8 +487,11 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             area_dec = G_dec.flatten(1).mean(dim=1)
             area_pseudo = disc_pseudo.flatten(1).mean(dim=1).detach()
             loss_Area = F.relu(area_dec - area_pseudo - opt.area_epsilon).pow(2).mean()
+            outside = (P_support.detach() < opt.support_threshold).float()
+            loss_Outside = (P_fail * outside).sum() / (outside.sum() + 1e-6)
         else:
             loss_Disc = loss_Gate = loss_Margin = loss_Area = zero
+            loss_Outside = torch.tensor(0.0, device=hazy_vis.device)
         loss_Bimodal = zero
         loss_Sparse = zero
         # --- [新增结束] ---
@@ -504,7 +507,8 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
                 opt.w_loss_Disc * loss_Disc +           # CMDN 新增
                 opt.w_loss_Gate * loss_Gate +
                 opt.w_loss_Margin * loss_Margin +
-                opt.w_loss_Area * loss_Area)
+                opt.w_loss_Area * loss_Area +
+                opt.w_loss_outside * loss_Outside)
         # --- [修改结束] ---
 
         # --- 反向传播和优化 ---
@@ -534,6 +538,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         loss_log_tmp['Gate'].append(loss_Gate.item() if isinstance(loss_Gate, torch.Tensor) else loss_Gate)
         loss_log_tmp['Margin'].append(loss_Margin.item() if isinstance(loss_Margin, torch.Tensor) else loss_Margin)
         loss_log_tmp['Area'].append(loss_Area.item() if isinstance(loss_Area, torch.Tensor) else loss_Area)
+        loss_log_tmp['Outside'].append(loss_Outside.item() if isinstance(loss_Outside, torch.Tensor) else loss_Outside)
         loss_log_tmp['Bimodal'].append(loss_Bimodal.item() if isinstance(loss_Bimodal, torch.Tensor) else loss_Bimodal)
         loss_log_tmp['Sparse'].append(loss_Sparse.item() if isinstance(loss_Sparse, torch.Tensor) else loss_Sparse)
         # --- [新增结束] ---
@@ -565,6 +570,8 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
                                                                             torch.Tensor) and opt.w_loss_Margin > 0 else 0.0
         area_val = (opt.w_loss_Area * loss_Area.item()) if isinstance(loss_Area,
                                                                       torch.Tensor) and opt.w_loss_Area > 0 else 0.0
+        outside_val = (opt.w_loss_outside * loss_Outside.item()) if isinstance(loss_Outside,
+                                                                               torch.Tensor) and opt.w_loss_outside > 0 else 0.0
         bimodal_val = 0.0
         sparse_val = 0.0
         tau_mean = tau.mean().item() if tau is not None else 0.0
@@ -572,6 +579,16 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         G_soft_mean = G_soft.mean().item() if G_soft is not None else 0.0
         support_mean = P_support.mean().item() if P_support is not None else 0.0
         M_hard_mean = m_hard.mean().item() if m_hard is not None else 0.0
+        G_dec_max = G_dec.max().item() if G_dec is not None else 0.0
+        if G_soft is not None:
+            G_soft_max = G_soft.max().item()
+            G_soft_p95 = torch.quantile(G_soft.detach().flatten(), 0.95).item()
+        else:
+            G_soft_max = 0.0
+            G_soft_p95 = 0.0
+        support_max = P_support.max().item() if P_support is not None else 0.0
+        support_area = (P_support >= opt.support_threshold).float().mean().item() if P_support is not None else 0.0
+        M_hard_ratio = m_hard.mean().item() if m_hard is not None else 0.0
         # --- [新增结束] ---
 
         # AAA
@@ -582,10 +599,12 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             f'\rloss:{loss.item():.5f} | L1:{l1_val:.5f} | SSIM:{ssim_val:.5f} | Cr:{cr_val:.5f} | Edge:{edge_val:.5f} '
             f'| Style:{style_val:.5f} | CrossM:{crossmodal_val:.5f} '  # <-- 新增
             f'| Bnd:{bnd_val:.5f} '
-            f'| Disc:{disc_val:.5f} | Gate:{gate_val:.5f} | Margin:{margin_val:.5f} | Area:{area_val:.5f} '
+            f'| Disc:{disc_val:.5f} | Gate:{gate_val:.5f} | Margin:{margin_val:.5f} | Area:{area_val:.5f} | Out:{outside_val:.5f} '
             f'| Bim:{bimodal_val:.5f} | Spar:{sparse_val:.5f} '
             f'| tau:{tau_mean:.4f} | G_dec:{G_dec_mean:.4f} | G_soft:{G_soft_mean:.4f} '
             f'| support:{support_mean:.4f} | M_hard:{M_hard_mean:.4f} '
+            f'| Gd_max:{G_dec_max:.3f} | Gs_max:{G_soft_max:.3f} | Gs_p95:{G_soft_p95:.3f} '
+            f'| sup_max:{support_max:.3f} | sup_area:{support_area:.4f} | M_ratio:{M_hard_ratio:.4f} '
             f'| step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}',
             end='', flush=True)
         # --- [修改结束] ---
@@ -1033,6 +1052,9 @@ if __name__ == "__main__":
         tau_max=opt.tau_max,
         gate_temperature=opt.gate_temperature,
         support_gamma=opt.support_gamma,
+        support_floor=opt.support_floor,
+        support_threshold=opt.support_threshold,
+        support_temperature=opt.support_temperature,
         hard_gate_threshold=opt.hard_gate_threshold,
     ).to(opt.device)  # 实例化新的模型
     teacher_net = teacher_net.to(opt.device)

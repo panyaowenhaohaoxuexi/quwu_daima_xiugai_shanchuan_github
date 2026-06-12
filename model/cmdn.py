@@ -89,13 +89,19 @@ class CMDN(nn.Module):
                  tau_max=0.85,
                  gate_temperature=0.10,
                  support_gamma=1.0,
-                 hard_gate_threshold=0.5):
+                 support_floor=0.0,
+                 support_threshold=0.25,
+                 support_temperature=0.05,
+                 hard_gate_threshold=0.25):
         super().__init__()
         self.gamma = gamma
         self.tau_min = tau_min
         self.tau_max = tau_max
         self.gate_temperature = gate_temperature
         self.support_gamma = support_gamma
+        self.support_floor = max(0.0, min(1.0, float(support_floor)))
+        self.support_threshold = float(support_threshold)
+        self.support_temperature = max(1e-4, float(support_temperature))
         self.hard_gate_threshold = hard_gate_threshold
 
         # ------------------------------------------------------------------
@@ -583,10 +589,17 @@ class CMDN(nn.Module):
         tau_raw = self.thr_head(dec_input)
         tau = self.tau_min + (self.tau_max - self.tau_min) * tau_raw
 
-        G_dec = torch.sigmoid((P_fail - tau) / self.gate_temperature)
         P_support = torch.clamp(P_pseudo.detach(), 0.0, 1.0) ** self.support_gamma
-        G_soft = torch.clamp(G_dec * P_support, 0.0, 1.0)
-        M_hard = (G_soft >= self.hard_gate_threshold).float()
+        P_support = torch.clamp(P_support, 0.0, 1.0)
+
+        C_soft = torch.sigmoid((P_support - self.support_threshold) / self.support_temperature)
+        R_soft = torch.sigmoid((P_fail - tau) / self.gate_temperature)
+        G_dec = R_soft
+
+        G_soft = torch.clamp(C_soft * R_soft, 0.0, 1.0)
+        support_binary = P_support >= self.support_threshold
+        gate_binary = G_soft >= self.hard_gate_threshold
+        M_hard = (support_binary & gate_binary).float()
         haze_mask = M_hard.detach() + G_soft - G_soft.detach()
 
         if return_debug:
@@ -599,6 +612,11 @@ class CMDN(nn.Module):
                 "tau": tau,
                 "G_dec": G_dec,
                 "P_support": P_support,
+                "support_eff": torch.ones_like(P_support),
+                "C_soft": C_soft,
+                "R_soft": R_soft,
+                "support_threshold": torch.full_like(P_support, float(self.support_threshold)),
+                "support_temperature": torch.full_like(P_support, float(self.support_temperature)),
                 "G_soft": G_soft,
                 "M_hard": M_hard,
                 "haze_mask": haze_mask,
