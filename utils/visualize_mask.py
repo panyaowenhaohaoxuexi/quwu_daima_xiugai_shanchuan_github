@@ -81,7 +81,8 @@ def visualize_epoch_mask(
     save_dir,
     n_samples=4,
     device='cpu',
-    disc_alpha=0.0
+    disc_alpha=0.0,
+    sky_mask_batch=None
 ):
     """
     Visualize the CMDN haze mask for current epoch.
@@ -98,6 +99,9 @@ def visualize_epoch_mask(
     n = min(n_samples, vis_batch.shape[0])
     vis = vis_batch[:n].to(device)
     ir  = ir_batch[:n].to(device)
+    sky_mask = None
+    if sky_mask_batch is not None:
+        sky_mask = sky_mask_batch[:n].to(device)
 
     training_before = model.training
     model.eval()
@@ -106,7 +110,7 @@ def visualize_epoch_mask(
     _model = model.module if hasattr(model, 'module') else model
 
     try:
-        debug = _model.cmdn(vis, ir, disc_alpha=disc_alpha, return_debug=True)
+        debug = _model.cmdn(vis, ir, disc_alpha=disc_alpha, return_debug=True, sky_mask=sky_mask)
     except Exception as e:
         print(f"[visualize_mask] CMDN forward failed: {e}")
         if training_before:

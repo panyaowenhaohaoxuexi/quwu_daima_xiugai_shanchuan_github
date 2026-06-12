@@ -1,4 +1,4 @@
-"""
+﻿"""
 这段Python代码是一个实验配置和初始化脚本。
 它使用 argparse 库来定义和解析一系列用于深度学习训练的命令行参数，如训练轮数、学习率、损失权重和保存路径等。
 在解析参数后，它会自动检测PyTorch是否可以使用CUDA（GPU），并相应地设置 opt.device。
@@ -88,6 +88,17 @@ parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/Sup3
 # =========================================
 parser.add_argument('--train_data_dir', type=str, default='/root/autodl-tmp/FLIR_zengqiang/train',
                     help='训练集根目录，内含 hazy/ ir/ clear/ 三个子文件夹')
+parser.add_argument('--use_train_sky_mask', action='store_true',
+                    help='enable precomputed SAM sky mask during training')
+parser.add_argument('--train_sky_mask_dir', type=str,
+                    default='/root/autodl-tmp/FLIR_zengqiang/train/sky_mask',
+                    help='directory of precomputed SAM sky masks used during training')
+parser.add_argument('--sky_mask_suffix', type=str, default='_sky',
+                    help='suffix for sky mask filename, e.g. 00344.png -> 00344_sky.png')
+parser.add_argument('--sky_mask_ext', type=str, default='.png',
+                    help='extension for sky mask filename')
+parser.add_argument('--require_train_sky_mask', action='store_true',
+                    help='if enabled, missing sky mask raises error; otherwise missing mask falls back to all-zero mask')
 
 # =========================================
 # 【验证/测试数据集路径】 (有雾图 + 红外图 + 清晰图GT)
@@ -109,11 +120,15 @@ parser.add_argument('--real_test_ir_path', type=str, default='/root/autodl-tmp/d
 # 掩码图 (可选，同名灰度图，标注雾区。留空则不使用掩码)
 parser.add_argument('--real_test_mask_path', type=str, default='/root/autodl-tmp/dense_haze/mask',
                     help='真实测试用掩码图像文件夹（可选，留空则模型自动估计雾区）')
+parser.add_argument('--real_test_sky_mask_dir', type=str, default='',
+                    help='真实测试默认天空掩码目录，与 real_test_hazy_path 配对；留空则不使用 sky mask')
 # 指定要进行推理的图像文件夹 (替换 real_test_hazy_path，留空则使用默认)
 parser.add_argument('--real_test_specific_hazy_dir', type=str, default='',
                     help='指定要推理的图像文件夹，替换 real_test_hazy_path（留空则使用默认）')
 parser.add_argument('--real_test_specific_ir_dir', type=str, default='',
                     help='与 real_test_specific_hazy_dir 配对的红外图像目录，文件名需与可见光一一对应，用于中间过程可视化')
+parser.add_argument('--real_test_specific_sky_mask_dir', type=str, default='',
+                    help='与 real_test_specific_hazy_dir 配对的天空掩码目录，文件名需与可见光一一对应，用于中间过程可视化')
 
 # =========================================
 # 【训练中真实世界推理 — 输出路径】

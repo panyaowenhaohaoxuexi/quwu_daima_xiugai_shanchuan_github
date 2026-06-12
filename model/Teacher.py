@@ -1244,7 +1244,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
     # (这两个函数的功能将被内联并重构到新的 forward 方法中)
 
     # --- [重写] forward 方法 ---
-    def forward(self, x_vis, x_ir, haze_mask=None, disc_alpha=0.0):
+    def forward(self, x_vis, x_ir, haze_mask=None, disc_alpha=0.0, sky_mask=None):
         m_hard_out = None  # 仅在 haze_mask is None 分支赋值，用于边界平滑损失
         P_fail = None
         disc_pseudo = None
@@ -1256,7 +1256,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
         if haze_mask is None:
             # --- CMDN: Cross-Modal Decision Network mask estimation ---
             P_fail, disc_pseudo, tau, G_dec, P_support, G_soft, m_hard, haze_mask = self.cmdn(
-                x_vis, x_ir, disc_alpha=disc_alpha
+                x_vis, x_ir, disc_alpha=disc_alpha, sky_mask=sky_mask
             )
             m_hard_out = m_hard  # 暴露给调用方用于 L_boundary
         else:
