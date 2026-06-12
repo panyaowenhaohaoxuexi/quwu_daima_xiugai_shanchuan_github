@@ -11,6 +11,19 @@ import json  # 导入用于处理 JSON 数据的库
 import os  # 导入用于操作系统交互（如文件路径、创建目录）的库
 import torch  # 导入 PyTorch 库
 
+
+def str2bool(value):
+    """把命令行里输入的 true/false/1/0 等字符串转成布尔值。"""
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in ('true', '1', 'yes', 'y', 'on'):
+        return True
+    if value in ('false', '0', 'no', 'n', 'off'):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got: {value}")
+
+
 # --- 1. 初始化参数解析器 ---
 parser = argparse.ArgumentParser()  # 创建一个 ArgumentParser 对象
 
@@ -86,19 +99,48 @@ parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/Sup3
 # 【训练数据集路径】 (有雾图 + 红外图 + 清晰图GT)
 #   子目录结构: train_data_dir/hazy/, ir/, clear/
 # =========================================
+# =========================================
+# 【训练阶段天空掩码开关】
+#   这里是你日常训练时直接改的地方。
+#   改完后直接运行 python Teacher.py 即可，不需要在命令行额外加参数。
+#
+#   USE_TRAIN_SKY_MASK:
+#       True  = 训练时读取预先离线生成好的 SAM 天空掩码，并传给 CMDN 抑制天空区域 P_pseudo
+#       False = 不读取天空掩码，Dataset 返回旧的 3 项，训练行为等价于旧版
+#
+#   TRAIN_SKY_MASK_DIR:
+#       离线脚本 tools/generate_sam_sky_masks.py 生成的 sky_mask 输出目录
+#
+#   SKY_MASK_SUFFIX / SKY_MASK_EXT:
+#       控制 mask 文件名匹配规则。
+#       默认: hazy/00344.jpg -> sky_mask/00344_sky.png
+#       如果你的 mask 和原图同名，可把 SKY_MASK_SUFFIX = ''，并设置合适的 SKY_MASK_EXT
+#
+#   REQUIRE_TRAIN_SKY_MASK:
+#       True  = 某张训练图找不到 sky mask 时直接报错停止，适合严格检查 mask 是否齐全
+#       False = 找不到时 fallback 为全黑 mask，表示该图不做天空抑制，训练继续
+# =========================================
+USE_TRAIN_SKY_MASK = True
+TRAIN_SKY_MASK_DIR = '/root/autodl-tmp/FLIR_zengqiang/train/sky_mask'
+SKY_MASK_SUFFIX = '_sky'
+SKY_MASK_EXT = '.png'
+REQUIRE_TRAIN_SKY_MASK = False
+
 parser.add_argument('--train_data_dir', type=str, default='/root/autodl-tmp/FLIR_zengqiang/train',
                     help='训练集根目录，内含 hazy/ ir/ clear/ 三个子文件夹')
-parser.add_argument('--use_train_sky_mask', action='store_true',
-                    help='enable precomputed SAM sky mask during training')
+parser.add_argument('--use_train_sky_mask', type=str2bool, nargs='?', const=True,
+                    default=USE_TRAIN_SKY_MASK,
+                    help='训练时是否读取预生成的 SAM 天空掩码；默认值直接在 option/Teacher.py 的 USE_TRAIN_SKY_MASK 中设置')
 parser.add_argument('--train_sky_mask_dir', type=str,
-                    default='/root/autodl-tmp/FLIR_zengqiang/train/sky_mask',
-                    help='directory of precomputed SAM sky masks used during training')
-parser.add_argument('--sky_mask_suffix', type=str, default='_sky',
-                    help='suffix for sky mask filename, e.g. 00344.png -> 00344_sky.png')
-parser.add_argument('--sky_mask_ext', type=str, default='.png',
-                    help='extension for sky mask filename')
-parser.add_argument('--require_train_sky_mask', action='store_true',
-                    help='if enabled, missing sky mask raises error; otherwise missing mask falls back to all-zero mask')
+                    default=TRAIN_SKY_MASK_DIR,
+                    help='训练时读取的预生成 SAM 天空掩码目录')
+parser.add_argument('--sky_mask_suffix', type=str, default=SKY_MASK_SUFFIX,
+                    help='天空掩码文件名后缀，例如 00344.jpg -> 00344_sky.png')
+parser.add_argument('--sky_mask_ext', type=str, default=SKY_MASK_EXT,
+                    help='天空掩码文件扩展名，例如 .png')
+parser.add_argument('--require_train_sky_mask', type=str2bool, nargs='?', const=True,
+                    default=REQUIRE_TRAIN_SKY_MASK,
+                    help='是否强制要求每张训练图都有 sky mask；False 时缺失 mask 会 fallback 为全黑 mask')
 
 # =========================================
 # 【验证/测试数据集路径】 (有雾图 + 红外图 + 清晰图GT)

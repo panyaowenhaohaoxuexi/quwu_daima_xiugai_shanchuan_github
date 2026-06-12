@@ -190,7 +190,7 @@ def dehaze(model, vis_image_path, ir_image_path, mask_image_path, sky_mask_image
         # 5. 模型推理 (传入三个输入)
         #    - [核心] 传入 haze_mask_resized (它要么是掩码张量，要么是 None)
         if sky_mask_resized is not None and haze_mask_resized is not None:
-            print("提示: sky_mask is used only when haze_mask is None.")
+            print("提示: sky_mask 只在 haze_mask=None 时生效；当前传入了 haze_mask，因此会跳过 CMDN，sky_mask 不参与本次推理。")
         pred_output = model(
             haze_vis_resized,
             haze_ir_resized,
@@ -261,10 +261,10 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir):
 
     use_sky_mask_if_available = False
     if sky_mask_folder and os.path.isdir(sky_mask_folder):
-        print(f"Sky mask mode: ON. Loading sky masks from: {sky_mask_folder}")
+        print(f"天空掩码模式: ON。将从以下路径读取 sky mask: {sky_mask_folder}")
         use_sky_mask_if_available = True
     else:
-        print("Sky mask mode: OFF. No sky mask folder provided or found.")
+        print("天空掩码模式: OFF。未提供 sky mask 目录，或目录不存在。")
 
     # 1. 设置输出目录
     output_folder = os.path.join(opt.real_test_output_dir, f'epoch_{epoch}')
@@ -309,7 +309,7 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir):
                     ext=opt.sky_mask_ext
                 )
                 if sky_mask_path is None:
-                    print(f"\nWARNING: sky mask not found for {base_filename}; fallback to sky_mask=None.")
+                    print(f"\n警告: 未找到 {base_filename} 对应的 sky mask；回退为 sky_mask=None。")
 
             if os.path.exists(ir_path):
                 # [修改] 调用 dehaze，传入 mask_path (可能是路径字符串，也可能是 None)
@@ -651,7 +651,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
                                     sky_tensor = transform_mask(mask_vis_resize(Image.open(sky_path).convert("L")))
                                     sky_tensor = (sky_tensor >= 0.5).float()
                                 else:
-                                    print(f"\n[mask_vis] sky mask not found for {base_name}; using all-zero mask.")
+                                    print(f"\n[mask_vis] 未找到 {base_name} 对应的 sky mask；使用全黑 mask。")
                                     sky_tensor = torch.zeros(1, 512, 512)
                                 sky_tensors.append(sky_tensor)
 
