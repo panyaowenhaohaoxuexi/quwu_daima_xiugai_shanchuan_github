@@ -975,7 +975,7 @@ if __name__ == "__main__":
             clear_visible_path=clear_vis_folder,
             train=True,
             size=256,  # 训练时使用随机裁剪
-            format='.jpg',  # 确认训练集格式
+            format='auto',  # 自动兼容 jpg/png/multi-level 数据集
             sky_mask_path=opt.train_sky_mask_dir,
             use_sky_mask=opt.use_train_sky_mask,
             sky_mask_suffix=opt.sky_mask_suffix,
@@ -1003,7 +1003,7 @@ if __name__ == "__main__":
             infrared_path=test_ir_folder,
             clear_visible_path=test_clear_vis_folder,
             size=256,  # 测试时使用中心裁剪或缩放
-            format='.jpg',  # 确认测试集格式
+            format='auto',  # 自动兼容 jpg/png/multi-level 数据集
             sky_mask_path=opt.test_sky_mask_dir,
             use_sky_mask=opt.use_test_sky_mask,
             sky_mask_suffix=opt.sky_mask_suffix,

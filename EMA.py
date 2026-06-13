@@ -721,7 +721,7 @@ if __name__ == "__main__":
         infrared_path=ir_hazy_folder,
         train=True,
         size=256,
-        format='.png'
+        format='auto'
     )
 
     # ======== 测试数据：三模态 (vis, ir, clear)，均为 .jpg ========
@@ -735,7 +735,7 @@ if __name__ == "__main__":
             infrared_path=test_ir_folder,
             clear_visible_path=test_clear_vis_folder,
             size=256,
-            format='.jpg'
+            format='auto'
         )
     except Exception as e:
         print(f"错误: 初始化 TestDataset 失败: {e}。测试将跳过。")
