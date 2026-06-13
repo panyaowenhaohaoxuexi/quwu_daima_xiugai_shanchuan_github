@@ -724,7 +724,7 @@ if __name__ == "__main__":
         format='auto'
     )
 
-    # ======== 测试数据：三模态 (vis, ir, clear)，均为 .jpg ========
+    # 测试数据：三模态 (vis, ir, clear)，支持 jpg/png/auto
     test_dir = '/root/autodl-tmp/FLIR_zengqiang/test'
     test_hazy_vis_folder = os.path.join(test_dir, 'hazy')
     test_ir_folder = os.path.join(test_dir, 'ir')
