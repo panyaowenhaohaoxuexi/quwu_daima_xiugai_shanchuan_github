@@ -60,20 +60,6 @@ parser.add_argument('--w_loss_Cr', default=0.05, type=float, help='weight of los
 parser.add_argument('--w_loss_Edge', default=0.0, type=float,
                     help='deprecated for current Teacher reconstruction loss; kept for compatibility')
 
-parser.add_argument('--tau_min', default=0.25, type=float, help='minimum adaptive threshold')
-parser.add_argument('--tau_max', default=0.85, type=float, help='maximum adaptive threshold')
-parser.add_argument('--gate_temperature', default=0.10, type=float, help='temperature for soft adaptive binarization')
-parser.add_argument('--support_gamma', default=1.0, type=float,
-                    help='gamma for pseudo support; 1.0 keeps conservative pseudo support')
-parser.add_argument('--support_floor', default=0.0, type=float,
-                    help='deprecated; kept for backward compatibility and not used in constrained routing')
-parser.add_argument('--support_threshold', default=0.25, type=float,
-                    help='minimum pseudo-support required for completion candidate routing')
-parser.add_argument('--support_temperature', default=0.05, type=float,
-                    help='temperature for soft candidate routing from P_support')
-parser.add_argument('--hard_gate_threshold', default=0.25, type=float,
-                    help='threshold for hardening final constrained G_soft')
-
 parser.add_argument('--gumbel_tau_start', default=1.0, type=float, help='initial Gumbel-Sigmoid temperature')
 parser.add_argument('--gumbel_tau_end', default=0.1, type=float, help='final Gumbel-Sigmoid temperature')
 parser.add_argument('--run_real_infer_in_teacher', type=str2bool, nargs='?', const=True, default=False,
@@ -93,85 +79,15 @@ parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/Sup3
 # 【训练数据集路径】 (有雾图 + 红外图 + 清晰图GT)
 #   子目录结构: train_data_dir/hazy/, ir/, clear/
 # =========================================
-# =========================================
-# 【训练阶段天空掩码开关】
-#   这里是你日常训练时直接改的地方。
-#   改完后直接运行 python Teacher.py 即可，不需要在命令行额外加参数。
-#
-#   USE_TRAIN_SKY_MASK:
-#       True  = 训练时读取预先离线生成好的 SAM 天空掩码，并传给 CMDN 抑制天空区域 P_pseudo
-#       False = 不读取天空掩码，Dataset 返回旧的 3 项，训练行为等价于旧版
-#
-#   TRAIN_SKY_MASK_DIR:
-#       离线脚本 tools/generate_sam_sky_masks.py 生成的 sky_mask 输出目录
-#
-#   SKY_MASK_SUFFIX / SKY_MASK_EXT:
-#       控制 mask 文件名匹配规则。
-#       默认: hazy/00344.jpg -> sky_mask/00344_sky.png
-#       如果你的 mask 和原图同名，可把 SKY_MASK_SUFFIX = ''，并设置合适的 SKY_MASK_EXT
-#
-#   REQUIRE_TRAIN_SKY_MASK:
-#       True  = 某张训练图找不到 sky mask 时直接报错停止，适合严格检查 mask 是否齐全
-#       False = 找不到时 fallback 为全黑 mask，表示该图不做天空抑制，训练继续
-# =========================================
-USE_TRAIN_SKY_MASK = True
-TRAIN_SKY_MASK_DIR = '/root/autodl-tmp/FLIR_zengqiang/train/sky_mask'
-SKY_MASK_SUFFIX = '_sky'
-SKY_MASK_EXT = '.png'
-REQUIRE_TRAIN_SKY_MASK = False
-
 parser.add_argument('--train_data_dir', type=str, default='/root/autodl-tmp/FLIR_zengqiang/train',
                     help='训练集根目录，内含 hazy/ ir/ clear/ 三个子文件夹')
-parser.add_argument('--use_train_sky_mask', type=str2bool, nargs='?', const=True,
-                    default=USE_TRAIN_SKY_MASK,
-                    help='训练时是否读取预生成的 SAM 天空掩码；默认值直接在 option/Teacher.py 的 USE_TRAIN_SKY_MASK 中设置')
-parser.add_argument('--train_sky_mask_dir', type=str,
-                    default=TRAIN_SKY_MASK_DIR,
-                    help='训练时读取的预生成 SAM 天空掩码目录')
-parser.add_argument('--sky_mask_suffix', type=str, default=SKY_MASK_SUFFIX,
-                    help='天空掩码文件名后缀，例如 00344.jpg -> 00344_sky.png')
-parser.add_argument('--sky_mask_ext', type=str, default=SKY_MASK_EXT,
-                    help='天空掩码文件扩展名，例如 .png')
-parser.add_argument('--require_train_sky_mask', type=str2bool, nargs='?', const=True,
-                    default=REQUIRE_TRAIN_SKY_MASK,
-                    help='是否强制要求每张训练图都有 sky mask；False 时缺失 mask 会 fallback 为全黑 mask')
 
 # =========================================
 # 【验证/测试数据集路径】 (有雾图 + 红外图 + 清晰图GT)
 #   子目录结构: test_data_dir/hazy/, ir/, clear/
 # =========================================
-# =========================================
-# 【测试/验证阶段天空掩码开关】
-#   这里控制验证/测试时是否读取预先生成好的 SAM 天空掩码。
-#   改完后直接运行 python Teacher.py 即可。
-#
-#   USE_TEST_SKY_MASK:
-#       True  = 测试/验证时读取 sky mask，并传给 CMDN 抑制天空区域 P_pseudo
-#       False = 测试/验证时不读取 sky mask，行为兼容旧版
-#
-#   TEST_SKY_MASK_DIR:
-#       测试集 sky mask 输出目录
-#       默认: /root/autodl-tmp/FLIR_zengqiang/test/sky_mask
-#
-#   REQUIRE_TEST_SKY_MASK:
-#       True  = 某张测试图找不到 sky mask 时直接报错
-#       False = 找不到时 fallback 为全黑 mask，测试继续
-# =========================================
-USE_TEST_SKY_MASK = True
-TEST_SKY_MASK_DIR = '/root/autodl-tmp/FLIR_zengqiang/test/sky_mask'
-REQUIRE_TEST_SKY_MASK = False
-
 parser.add_argument('--test_data_dir', type=str, default='/root/autodl-tmp/FLIR_zengqiang/test',
                     help='测试集根目录，内含 hazy/ ir/ clear/ 三个子文件夹')
-parser.add_argument('--use_test_sky_mask', type=str2bool, nargs='?', const=True,
-                    default=USE_TEST_SKY_MASK,
-                    help='测试/验证时是否读取预生成的 SAM 天空掩码；默认值直接在 option/Teacher.py 的 USE_TEST_SKY_MASK 中设置')
-parser.add_argument('--test_sky_mask_dir', type=str,
-                    default=TEST_SKY_MASK_DIR,
-                    help='测试/验证时读取的预生成 SAM 天空掩码目录')
-parser.add_argument('--require_test_sky_mask', type=str2bool, nargs='?', const=True,
-                    default=REQUIRE_TEST_SKY_MASK,
-                    help='是否强制要求每张测试图都有 sky mask；False 时缺失 mask 会 fallback 为全黑 mask')
 
 # =========================================
 # 【训练中真实世界推理 — 输入路径】
@@ -186,15 +102,11 @@ parser.add_argument('--real_test_ir_path', type=str, default='/root/autodl-tmp/d
 # 掩码图 (可选，同名灰度图，标注雾区。留空则不使用掩码)
 parser.add_argument('--real_test_mask_path', type=str, default='/root/autodl-tmp/dense_haze/mask',
                     help='真实测试用掩码图像文件夹（可选，留空则模型自动估计雾区）')
-parser.add_argument('--real_test_sky_mask_dir', type=str, default='',
-                    help='真实测试默认天空掩码目录，与 real_test_hazy_path 配对；留空则不使用 sky mask')
 # 指定要进行推理的图像文件夹 (替换 real_test_hazy_path，留空则使用默认)
 parser.add_argument('--real_test_specific_hazy_dir', type=str, default='',
                     help='指定要推理的图像文件夹，替换 real_test_hazy_path（留空则使用默认）')
 parser.add_argument('--real_test_specific_ir_dir', type=str, default='',
                     help='与 real_test_specific_hazy_dir 配对的红外图像目录，文件名需与可见光一一对应，用于中间过程可视化')
-parser.add_argument('--real_test_specific_sky_mask_dir', type=str, default='',
-                    help='与 real_test_specific_hazy_dir 配对的天空掩码目录，文件名需与可见光一一对应，用于中间过程可视化')
 
 # =========================================
 # 【训练中真实世界推理 — 输出路径】

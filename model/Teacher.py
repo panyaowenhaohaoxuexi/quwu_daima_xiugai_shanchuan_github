@@ -1186,15 +1186,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
       - Color restoration: in-image Cross-Attention, K/V from M=0 reliable regions only
     """
 
-    def __init__(self, res_blocks=18,
-                 tau_min=0.25,
-                 tau_max=0.85,
-                 gate_temperature=0.10,
-                 support_gamma=1.0,
-                 support_floor=0.0,
-                 support_threshold=0.25,
-                 support_temperature=0.05,
-                 hard_gate_threshold=0.25):
+    def __init__(self, res_blocks=18):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
         # Kept only as an attribute name for legacy checkpoints/introspection.

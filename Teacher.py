@@ -31,7 +31,7 @@ from loss.teacher_region_loss import compute_teacher_region_loss
 from data import MultiModalHazeDataset, TestDataset, SynthMultiModalDataset, collate_synth  # TestDataset 现在也支持三模态
 from metric import psnr, ssim
 # from model import DualStreamTeacher # <--- 不再使用原始模型
-from model import VIFNetInconsistencyTeacher, CannyEdgeDetector  # <--- 使用新的融合模型
+from model import VIFNetInconsistencyTeacher  # <--- 使用新的融合模型
 # --- [修改结束] ---
 from option.Teacher import opt  # 导入配置选项
 
@@ -59,28 +59,6 @@ transform_mask = Compose([
     ToTensor()
 ])
 # --- [新增结束] ---
-
-
-def find_sky_mask_path(sky_mask_dir, image_name, suffix='', ext=''):
-    if not sky_mask_dir:
-        return None
-
-    stem, original_ext = os.path.splitext(image_name)
-    ext_or_original = ext if ext else original_ext
-    candidates = [
-        os.path.join(sky_mask_dir, stem + suffix + ext_or_original),
-        os.path.join(sky_mask_dir, image_name),
-        os.path.join(sky_mask_dir, stem + ".png"),
-        os.path.join(sky_mask_dir, stem + ".jpg"),
-        os.path.join(sky_mask_dir, stem + ".jpeg"),
-        os.path.join(sky_mask_dir, stem + "_sky.png"),
-        os.path.join(sky_mask_dir, stem + "_sky.jpg"),
-        os.path.join(sky_mask_dir, stem + "_sky.jpeg"),
-    ]
-    for path in candidates:
-        if path and os.path.exists(path):
-            return path
-    return None
 
 # 训练轮次
 start_time = time.time()
@@ -121,7 +99,7 @@ def collate_fn_skip_none(batch):
 # --- [新增] 从 Eval.py 复制的 dehaze 函数 ---
 # (它依赖于全局定义的 device 和 transform)
 # --- [修改] dehaze 函数现在接受 mask_image_path=None ---
-def dehaze(model, vis_image_path, ir_image_path, mask_image_path, sky_mask_image_path, folder):
+def dehaze(model, vis_image_path, ir_image_path, mask_image_path, folder):
     """
     使用加载的双流模型对指定路径的可见光、红外和可选的掩码进行去雾处理，
     并将结果保存到指定文件夹。
@@ -134,7 +112,6 @@ def dehaze(model, vis_image_path, ir_image_path, mask_image_path, sky_mask_image
         haze_ir = transform(Image.open(ir_image_path).convert("RGB")).unsqueeze(0).to(device)  # 假设红外也用相同 transform
 
         haze_mask_tensor = None  # 默认掩码为 None
-        sky_mask_tensor = None
 
         # --- [新增] 掩码加载逻辑 (参考 Eval_EMA.py) ---
         if mask_image_path:  # 检查路径是否非空
@@ -147,13 +124,6 @@ def dehaze(model, vis_image_path, ir_image_path, mask_image_path, sky_mask_image
                 print(f"\n警告: 提供了掩码路径但文件未找到: {mask_image_path}。将回退到基础注入模式。")
                 # haze_mask_tensor 保持为 None
         # --- [新增结束] ---
-
-        if sky_mask_image_path:
-            if os.path.exists(sky_mask_image_path):
-                sky_mask_tensor = transform_mask(Image.open(sky_mask_image_path).convert("L")).unsqueeze(0).to(device)
-                sky_mask_tensor = (sky_mask_tensor >= 0.5).float()
-            else:
-                print(f"\n警告: 提供了 sky mask 路径但文件未找到: {sky_mask_image_path}。将回退到 sky_mask=None。")
 
         # 3. 获取原始图像尺寸 (以可见光为准)
         h, w = haze_vis.shape[2], haze_vis.shape[3]
@@ -182,22 +152,12 @@ def dehaze(model, vis_image_path, ir_image_path, mask_image_path, sky_mask_image
                     h != target_h or w != target_w) else haze_mask_tensor
         # --- [新增结束] ---
 
-        sky_mask_resized = None
-        if sky_mask_tensor is not None:
-            resize_mask_fn = Resize((target_h, target_w), interpolation=InterpolationMode.BILINEAR, antialias=False)
-            sky_mask_resized = resize_mask_fn(sky_mask_tensor) if (
-                    h != target_h or w != target_w) else sky_mask_tensor
-            sky_mask_resized = (sky_mask_resized >= 0.5).float()
-
         # 5. 模型推理 (传入三个输入)
         #    - [核心] 传入 haze_mask_resized (它要么是掩码张量，要么是 None)
-        if sky_mask_resized is not None and haze_mask_resized is not None:
-            print("提示: sky_mask 只在 haze_mask=None 时生效；当前传入了 haze_mask，因此会跳过 CMDN，sky_mask 不参与本次推理。")
         pred_output = model(
             haze_vis_resized,
             haze_ir_resized,
-            haze_mask=haze_mask_resized,
-            sky_mask=sky_mask_resized
+            haze_mask=haze_mask_resized
         )
 
         if isinstance(pred_output, tuple):
@@ -254,20 +214,6 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir):
         print("所有图像将使用模型的基础注入模式 (base_weight) 运行。")
     # --- [新增结束] ---
 
-    using_specific = bool(opt.real_test_specific_hazy_dir) and (
-        os.path.abspath(hazy_dir) == os.path.abspath(opt.real_test_specific_hazy_dir)
-    )
-    sky_mask_folder = opt.real_test_sky_mask_dir
-    if using_specific and opt.real_test_specific_sky_mask_dir:
-        sky_mask_folder = opt.real_test_specific_sky_mask_dir
-
-    use_sky_mask_if_available = False
-    if sky_mask_folder and os.path.isdir(sky_mask_folder):
-        print(f"天空掩码模式: ON。将从以下路径读取 sky mask: {sky_mask_folder}")
-        use_sky_mask_if_available = True
-    else:
-        print("天空掩码模式: OFF。未提供 sky mask 目录，或目录不存在。")
-
     # 1. 设置输出目录
     output_folder = os.path.join(opt.real_test_output_dir, f'epoch_{epoch}')
     os.makedirs(output_folder, exist_ok=True)
@@ -302,20 +248,9 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir):
                 # dehaze 函数内部会处理 "文件不存在" 的情况 (即视为"无掩码")
             # --- [修改结束] ---
 
-            sky_mask_path = None
-            if use_sky_mask_if_available:
-                sky_mask_path = find_sky_mask_path(
-                    sky_mask_folder,
-                    base_filename,
-                    suffix=opt.sky_mask_suffix,
-                    ext=opt.sky_mask_ext
-                )
-                if sky_mask_path is None:
-                    print(f"\n警告: 未找到 {base_filename} 对应的 sky mask；回退为 sky_mask=None。")
-
             if os.path.exists(ir_path):
                 # [修改] 调用 dehaze，传入 mask_path (可能是路径字符串，也可能是 None)
-                dehaze(model, vis_path, ir_path, mask_path, sky_mask_path, output_folder)
+                dehaze(model, vis_path, ir_path, mask_path, output_folder)
             else:
                 print(f"\n警告: 找不到 {base_filename} 对应的红外图像: {ir_path}。跳过。")
 
@@ -327,7 +262,7 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir):
 
 
 # 定义函数 train：执行模型训练的主要逻辑
-def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detector):
+def train(teacher_net, loader_train, loader_test, optim, criterion):
     """
     执行合成域 Teacher 区域补全监督训练。
     """
@@ -632,15 +567,7 @@ def test(net, loader_test):
             print(f"警告: 在测试加载器中跳过索引 {i} 的空批次 (collate_fn 返回空)。")
             continue
 
-        sky_mask = None
-        if len(batch_test) == 5:
-            inputs_vis, inputs_ir, targets, sky_mask, hazy_name_list = batch_test
-            if not inputs_vis.numel():
-                print(f"警告: 在测试加载器索引 {i} 遇到空数据。跳过。")
-                continue
-            hazy_name = hazy_name_list[0] if isinstance(hazy_name_list,
-                                                        (list, tuple)) and hazy_name_list else f"Unknown_Index_{i}"
-        elif len(batch_test) == 4:
+        if len(batch_test) == 4:
             inputs_vis, inputs_ir, targets, hazy_name_list = batch_test
             # 处理可能的空 batch 情况（如果 collate_fn 返回了带空 tensor 的元组）
             if not inputs_vis.numel():
@@ -657,8 +584,6 @@ def test(net, loader_test):
         inputs_vis = inputs_vis.to(opt.device, non_blocking=True)
         inputs_ir = inputs_ir.to(opt.device, non_blocking=True)  # --- [修改] 添加红外输入到设备 ---
         targets = targets.to(opt.device, non_blocking=True)
-        if sky_mask is not None:
-            sky_mask = sky_mask.to(opt.device, non_blocking=True)
 
         with torch.no_grad():
             H, W = inputs_vis.shape[2:]  # 使用可见光尺寸作为基准
@@ -666,11 +591,6 @@ def test(net, loader_test):
                 # --- [修改] 填充两个输入 (假设需要16的倍数) ---
                 inputs_vis_padded = pad_img(inputs_vis, 16)
                 inputs_ir_padded = pad_img(inputs_ir, 16)
-                if sky_mask is not None:
-                    sky_mask_padded = pad_mask(sky_mask, 16)
-                    sky_mask_padded = (sky_mask_padded >= 0.5).float()
-                else:
-                    sky_mask_padded = None
                 # --- [修改结束] ---
             except Exception as e:
                 print(f"\n错误: 测试时填充图像 {hazy_name} 失败: {e}。跳过。")
@@ -681,8 +601,7 @@ def test(net, loader_test):
                 pred_output = net(
                     inputs_vis_padded,
                     inputs_ir_padded,
-                    haze_mask=None,
-                    sky_mask=sky_mask_padded
+                    haze_mask=None
                 )[0]
                 # --- [修改结束] ---
 
@@ -771,23 +690,13 @@ if __name__ == "__main__":
     test_hazy_vis_folder = os.path.join(test_base_dir, 'hazy')
     test_ir_folder = os.path.join(test_base_dir, 'ir')
     test_clear_vis_folder = os.path.join(test_base_dir, 'clear')
-    print("[SkyMask][Test] use_test_sky_mask=", opt.use_test_sky_mask)
-    print("[SkyMask][Test] test_sky_mask_dir=", opt.test_sky_mask_dir)
-    print("[SkyMask][Test] sky_mask_suffix=", opt.sky_mask_suffix)
-    print("[SkyMask][Test] sky_mask_ext=", opt.sky_mask_ext)
-    print("[SkyMask][Test] require_test_sky_mask=", opt.require_test_sky_mask)
     try:
         test_set = TestDataset(
             hazy_visible_path=test_hazy_vis_folder,
             infrared_path=test_ir_folder,
             clear_visible_path=test_clear_vis_folder,
             size=256,  # 测试时使用中心裁剪或缩放
-            format='auto',  # 自动兼容 jpg/png/multi-level 数据集
-            sky_mask_path=opt.test_sky_mask_dir,
-            use_sky_mask=opt.use_test_sky_mask,
-            sky_mask_suffix=opt.sky_mask_suffix,
-            sky_mask_ext=opt.sky_mask_ext,
-            require_sky_mask=opt.require_test_sky_mask
+            format='auto'  # 自动兼容 jpg/png/multi-level 数据集
         )
         print(f"成功加载测试数据集，共 {len(test_set)} 个样本。")
     except Exception as e:
@@ -826,21 +735,9 @@ if __name__ == "__main__":
         )
 
     # --- [修改] 模型初始化 ---
-    teacher_net = VIFNetInconsistencyTeacher(
-        tau_min=opt.tau_min,
-        tau_max=opt.tau_max,
-        gate_temperature=opt.gate_temperature,
-        support_gamma=opt.support_gamma,
-        support_floor=opt.support_floor,
-        support_threshold=opt.support_threshold,
-        support_temperature=opt.support_temperature,
-        hard_gate_threshold=opt.hard_gate_threshold,
-    ).to(opt.device)  # 实例化新的模型
+    teacher_net = VIFNetInconsistencyTeacher().to(opt.device)  # 实例化新的模型
     teacher_net = teacher_net.to(opt.device)
     # --- [修改结束] ---
-
-    # 新区域 loss 内部使用 Sobel edge；不再初始化旧 Canny/Boundary/CrossModal 链路。
-    edge_detector = None
 
     epoch_size = len(loader_train) if loader_train else 0
     if epoch_size == 0:
@@ -881,8 +778,7 @@ if __name__ == "__main__":
     # 开始训练
     print("开始训练...")
     # AAA
-    # --- [修改] 传入 edge_detector ---
-    train(teacher_net, loader_train, loader_test, optimizer, criterion, edge_detector)
+    train(teacher_net, loader_train, loader_test, optimizer, criterion)
     # --- [修改结束] ---
     # AAA
     print("训练完成。")
