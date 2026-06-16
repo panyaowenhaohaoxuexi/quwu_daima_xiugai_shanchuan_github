@@ -408,7 +408,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         ).view(1, 3, 1, 1)
         hazy_vis_01 = (hazy_vis * clip_std + clip_mean).clamp(0.0, 1.0)
 
-        lambda_rec = getattr(opt, "w_loss_rec", getattr(opt, "w_loss_L1", 1.0))
+        lambda_rec = getattr(opt, "w_loss_rec", 1.0)
         lambda_density = getattr(opt, "w_loss_density", 1.0)
         lambda_mask = getattr(opt, "w_loss_mask", 1.0)
         lambda_ssim = getattr(opt, "w_loss_SSIM", 0.0)

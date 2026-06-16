@@ -50,7 +50,6 @@ parser.add_argument('--end_lr', default=0.000001, type=float, help='end learning
 # 定义一个动作参数，如果命令行中包含此参数，则不使用余弦学习率调度
 parser.add_argument('--no_lr_sche', action='store_true', help='no lr cos schedule')
 # 当前最终清晰图重建监督: L_dehaze = L1 + SSIM + Cr
-parser.add_argument('--w_loss_L1', default=0.8, type=float, help='weight of loss L1')
 parser.add_argument('--w_loss_rec', default=0.8, type=float, help='weight of supervised clear RGB reconstruction loss')
 parser.add_argument('--w_loss_density', default=1.0, type=float, help='weight of haze density L1 loss')
 parser.add_argument('--w_loss_mask', default=1.0, type=float, help='weight of IR completion mask BCE+Dice loss')
@@ -60,24 +59,7 @@ parser.add_argument('--w_loss_Cr', default=0.05, type=float, help='weight of los
 # Edge loss is kept only as a compatibility entry for older experiments.
 parser.add_argument('--w_loss_Edge', default=0.0, type=float,
                     help='deprecated for current Teacher reconstruction loss; kept for compatibility')
-# --- [新增] 风格损失 和 跨模态一致性损失 ---
-parser.add_argument('--w_loss_Style', default=0.1, type=float, help='weight of Style loss (Perceptual)')
-parser.add_argument('--w_loss_CrossModal', default=0.1, type=float, help='weight of Cross-Modal Consistency loss (L1 between vis/ir features)')
-# --- [新增结束] ---
-# --- [新增] 边界平滑损失 ---
-parser.add_argument('--w_loss_Boundary', default=0.02, type=float, help='weight of Boundary Smoothness loss')
-parser.add_argument('--boundary_band_k', default=5, type=int, help='kernel size for boundary band dilation/erosion')
-parser.add_argument('--boundary_lambda_edge', default=10.0, type=float, help='edge-aware weight decay factor')
-# --- [新增结束] ---
 
-# --- [新增] CMDN 掩码损失权重 ---
-parser.add_argument('--w_loss_Disc', default=0.15, type=float, help='weight of CMDN pseudo-label BCE loss')
-# w_loss_Bimodal / w_loss_Sparse / target_haze_ratio 已废弃，对应 loss 在训练代码中恒为 zero，勿使用
-parser.add_argument('--w_loss_Gate', default=0.10, type=float, help='weight of conservative gate supervision loss')
-parser.add_argument('--w_loss_Margin', default=0.03, type=float, help='weight of adaptive threshold margin loss')
-parser.add_argument('--w_loss_Area', default=0.05, type=float, help='weight of one-sided completion area upper-bound loss')
-parser.add_argument('--w_loss_outside', default=0.05, type=float,
-                    help='weight for suppressing P_fail outside pseudo-supported regions')
 parser.add_argument('--tau_min', default=0.25, type=float, help='minimum adaptive threshold')
 parser.add_argument('--tau_max', default=0.85, type=float, help='maximum adaptive threshold')
 parser.add_argument('--gate_temperature', default=0.10, type=float, help='temperature for soft adaptive binarization')
@@ -91,9 +73,6 @@ parser.add_argument('--support_temperature', default=0.05, type=float,
                     help='temperature for soft candidate routing from P_support')
 parser.add_argument('--hard_gate_threshold', default=0.25, type=float,
                     help='threshold for hardening final constrained G_soft')
-parser.add_argument('--margin_delta', default=0.10, type=float, help='minimum distance between P_fail and tau')
-parser.add_argument('--area_epsilon', default=0.03, type=float, help='tolerance for one-sided area upper-bound loss')
-# --- [新增结束] ---
 
 parser.add_argument('--gumbel_tau_start', default=1.0, type=float, help='initial Gumbel-Sigmoid temperature')
 parser.add_argument('--gumbel_tau_end', default=0.1, type=float, help='final Gumbel-Sigmoid temperature')
