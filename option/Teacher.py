@@ -95,30 +95,33 @@ parser.add_argument('--test_data_dir', type=str, default='/root/autodl-tmp/FLIR_
                     help='测试集根目录，内含 hazy/ ir/ clear/ 三个子文件夹')
 
 # =========================================
-# 【训练中真实世界推理 — 输入路径】
-#   推理时，对 hazy 文件夹里每张图，按文件名去 ir/ 和 mask/ 找对应文件
+# 【真实域普通测试 — 输入路径】
+#   使用训练得到的 Teacher 模型，对 real_test_hazy_path / real_test_ir_path 下的数据进行去雾。
+#   输出最终 pred_clear 去雾图，保存到 real_test_output_dir/epoch_N/。
 # =========================================
-# 有雾可见光图像 (主要输入)
 parser.add_argument('--real_test_hazy_path', type=str, default='/root/autodl-tmp/dense_haze/hazy',
-                    help='真实测试用有雾可见光图像文件夹')
-# 红外图像 (辅助输入，与 hazy 图像同名)
+                    help='真实域普通测试用有雾可见光图像文件夹')
 parser.add_argument('--real_test_ir_path', type=str, default='/root/autodl-tmp/dense_haze/ir',
-                    help='真实测试用红外图像文件夹')
-# 掩码图 (可选，同名灰度图，标注雾区。留空则不使用掩码)
-parser.add_argument('--real_test_mask_path', type=str, default='/root/autodl-tmp/dense_haze/mask',
-                    help='真实测试用掩码图像文件夹（可选，留空则模型自动估计雾区）')
-# 指定要进行推理的图像文件夹 (替换 real_test_hazy_path，留空则使用默认)
-parser.add_argument('--real_test_specific_hazy_dir', type=str, default='',
-                    help='指定要推理的图像文件夹，替换 real_test_hazy_path（留空则使用默认）')
-parser.add_argument('--real_test_specific_ir_dir', type=str, default='',
-                    help='与 real_test_specific_hazy_dir 配对的红外图像目录，文件名需与可见光一一对应，用于中间过程可视化')
+                    help='真实域普通测试用红外图像文件夹，文件名需与可见光一一对应')
 
 # =========================================
-# 【训练中真实世界推理 — 输出路径】
+# 【训练中真实域中间过程可视化 — 输入路径】
+#   使用当前训练中的 Teacher 模型，对 specific 路径下的数据进行前向推理。
+#   只保存 overview 图到 saved_data_dir/real_vis/epoch_N/。
+# =========================================
+parser.add_argument('--real_test_specific_hazy_dir', type=str, default='',
+                    help='训练中真实域中间过程可视化用有雾可见光目录；留空则跳过中间可视化')
+parser.add_argument('--real_test_specific_ir_dir', type=str, default='',
+                    help='训练中真实域中间过程可视化用红外图像目录，文件名需与可见光一一对应；留空则跳过中间可视化')
+parser.add_argument('--real_vis_max_images', default=8, type=int,
+                    help='训练中真实域中间过程 overview 每个 epoch 最多保存的样本数；<=0 表示全部保存，不影响普通真实域测试')
+
+# =========================================
+# 【真实域普通测试 — 输出路径】
 # =========================================
 parser.add_argument('--real_test_output_dir', type=str,
                     default='/root/autodl-tmp/Sup3_canny/train_test/Teacher_guocheng_test',
-                    help='真实测试去雾结果输出根目录，结果保存在 epoch_N/ 子文件夹下')
+                    help='真实域普通测试去雾结果输出根目录，结果保存在 epoch_N/ 子文件夹下')
 
 # =========================================
 # 【实验记录路径】 (args.txt 配置存档，与训练无关)
@@ -131,6 +134,8 @@ parser.add_argument('--dataset', type=str, default='Teacher',
                     help='数据集名称，用于构建实验子目录')
 
 # --- 4. 解析参数并设置设备 ---
+
+
 
 opt = parser.parse_args()  # 解析命令行传入的参数
 # 自动检测设备：如果 CUDA 可用，则使用 'cuda'，否则使用 'cpu'

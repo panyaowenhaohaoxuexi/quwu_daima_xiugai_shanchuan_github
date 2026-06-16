@@ -54,11 +54,7 @@ transform = Compose([
 ])
 # --- [新增结束] ---
 
-# --- [新增] 定义掩码的预处理流程 (仅 ToTensor) ---
-transform_mask = Compose([
-    ToTensor()
-])
-# --- [新增结束] ---
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
 
 # 训练轮次
 start_time = time.time()
@@ -96,83 +92,80 @@ def collate_fn_skip_none(batch):
     return torch.utils.data.dataloader.default_collate(batch)
 
 
-# --- [新增] 从 Eval.py 复制的 dehaze 函数 ---
-# (它依赖于全局定义的 device 和 transform)
-# --- [修改] dehaze 函数现在接受 mask_image_path=None ---
-def dehaze(model, vis_image_path, ir_image_path, mask_image_path, folder):
+def find_paired_image(folder, stem):
+    for ext in IMAGE_EXTS:
+        path = os.path.join(folder, stem + ext)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _list_real_images(folder):
+    files = []
+    for ext in IMAGE_EXTS:
+        files.extend(glob.glob(os.path.join(folder, f"*{ext}")))
+        files.extend(glob.glob(os.path.join(folder, f"*{ext.upper()}")))
+    return sorted(set(files))
+
+
+def _resize_to_model_multiple(haze_vis, haze_ir):
+    h, w = haze_vis.shape[2], haze_vis.shape[3]
+    target_h = max(16, (h // 16) * 16)
+    target_w = max(16, (w // 16) * 16)
+    if h != target_h or w != target_w:
+        resize_fn = Resize((target_h, target_w), interpolation=InterpolationMode.BICUBIC, antialias=True)
+        return resize_fn(haze_vis), resize_fn(haze_ir), h, w
+    return haze_vis, haze_ir, h, w
+
+
+def _denorm_clip(x):
+    mean = torch.tensor(
+        [0.48145466, 0.4578275, 0.40821073],
+        device=x.device,
+        dtype=x.dtype,
+    ).view(1, 3, 1, 1)
+    std = torch.tensor(
+        [0.26862954, 0.26130258, 0.27577711],
+        device=x.device,
+        dtype=x.dtype,
+    ).view(1, 3, 1, 1)
+    return (x * std + mean).clamp(0.0, 1.0)
+
+
+def _panel_3ch(x, size, mode='bilinear'):
+    x = F.interpolate(x, size=size, mode=mode, align_corners=False)
+    x = x.clamp(0.0, 1.0)
+    if x.shape[1] == 1:
+        return x.repeat(1, 3, 1, 1)
+    if x.shape[1] == 3:
+        return x
+    return x[:, :1].repeat(1, 3, 1, 1)
+
+
+def dehaze(model, vis_image_path, ir_image_path, folder):
     """
-    使用加载的双流模型对指定路径的可见光、红外和可选的掩码进行去雾处理，
-    并将结果保存到指定文件夹。
-    (此版本已更新，支持掩码加载)
+    使用加载的双流模型对单张可见光/红外图像进行去雾，并保存 pred_clear。
+    模型 eval/train 状态由调用方管理。
     """
     try:
-        # 1. 加载并预处理可见光图像
         haze_vis = transform(Image.open(vis_image_path).convert("RGB")).unsqueeze(0).to(device)
-        # 2. 加载并预处理红外图像
-        haze_ir = transform(Image.open(ir_image_path).convert("RGB")).unsqueeze(0).to(device)  # 假设红外也用相同 transform
+        haze_ir = transform(Image.open(ir_image_path).convert("RGB")).unsqueeze(0).to(device)
+        haze_vis_resized, haze_ir_resized, h, w = _resize_to_model_multiple(haze_vis, haze_ir)
 
-        haze_mask_tensor = None  # 默认掩码为 None
-
-        # --- [新增] 掩码加载逻辑 (参考 Eval_EMA.py) ---
-        if mask_image_path:  # 检查路径是否非空
-            if os.path.exists(mask_image_path):
-                # 掩码存在，加载它 (使用 "L" 模式加载单通道灰度图)
-                haze_mask_tensor = transform_mask(Image.open(mask_image_path).convert("L")).unsqueeze(0).to(device)
-                # 确保掩码是 0-1 范围 (ToTensor() 已经做到了)
-            else:
-                # 提供了掩码路径但文件丢失 (对应"无掩码"情况)
-                print(f"\n警告: 提供了掩码路径但文件未找到: {mask_image_path}。将回退到基础注入模式。")
-                # haze_mask_tensor 保持为 None
-        # --- [新增结束] ---
-
-        # 3. 获取原始图像尺寸 (以可见光为准)
-        h, w = haze_vis.shape[2], haze_vis.shape[3]
-
-        # 4. 调整尺寸
-        target_h = (h // 16) * 16
-        target_w = (w // 16) * 16
-        if target_h == 0: target_h = 16
-        if target_w == 0: target_w = 16
-
-        if h != target_h or w != target_w:
-            haze_vis_resized = Resize((target_h, target_w), interpolation=InterpolationMode.BICUBIC, antialias=True)(
-                haze_vis)
-            haze_ir_resized = Resize((target_h, target_w), interpolation=InterpolationMode.BICUBIC, antialias=True)(
-                haze_ir)
-        else:
-            haze_vis_resized = haze_vis
-            haze_ir_resized = haze_ir
-
-        # --- [新增] 仅当掩码张量存在时才调整其尺寸 ---
-        haze_mask_resized = None  # 默认 resized 掩码为 None
-        if haze_mask_tensor is not None:
-            # 掩码使用 BILINEAR (最近邻也行，但 BILINEAR 更平滑)
-            resize_mask_fn = Resize((target_h, target_w), interpolation=InterpolationMode.BILINEAR, antialias=False)
-            haze_mask_resized = resize_mask_fn(haze_mask_tensor) if (
-                    h != target_h or w != target_w) else haze_mask_tensor
-        # --- [新增结束] ---
-
-        # 5. 模型推理 (传入三个输入)
-        #    - [核心] 传入 haze_mask_resized (它要么是掩码张量，要么是 None)
-        pred_output = model(
-            haze_vis_resized,
-            haze_ir_resized,
-            haze_mask=haze_mask_resized
-        )
+        pred_output = model(haze_vis_resized, haze_ir_resized)
 
         if isinstance(pred_output, tuple):
             out_tensor = pred_output[0]
         else:
             out_tensor = pred_output
 
-        out = out_tensor.squeeze(0)  # 移除批次维度
-        out = out.clamp(0, 1)
+        out = F.interpolate(
+            out_tensor,
+            size=(h, w),
+            mode='bicubic',
+            align_corners=False,
+        ).clamp(0.0, 1.0).squeeze(0)
 
-        # 6. 将输出图像尺寸恢复到原始尺寸
-        if h != target_h or w != target_w:
-            out = Resize((h, w), interpolation=InterpolationMode.BICUBIC, antialias=True)(out)
-
-        # 7. 保存
         output_filename = os.path.basename(vis_image_path)
         torchvision.utils.save_image(out, os.path.join(folder, output_filename))
 
@@ -183,79 +176,107 @@ def dehaze(model, vis_image_path, ir_image_path, mask_image_path, folder):
         print(f"\n处理图像 {base_name} 时发生错误: {e}。跳过。")
 
 
-# --- [新增结束] ---
-# --- [修改] run_real_world_test 函数，使其查找并传递掩码 ---
 def run_real_world_test(model, epoch, hazy_dir, ir_dir):
     """
-    在指定的真实（无标签）数据集上运行推理。
-    (此版本已更新，支持掩码加载)
+    在指定的真实（无标签）数据集上运行普通推理，只保存最终 pred_clear。
     """
     if not hazy_dir or not ir_dir:
-        print(f"\n跳过真实世界测试：未指定 'real_test_hazy_path' 或 'real_test_ir_path'。")
+        print("[RealTest] hazy_dir or ir_dir is empty, skip real-domain final inference.")
         return
 
-    if not os.path.isdir(hazy_dir):
-        print(f"\n警告: 真实测试 hazy 目录不存在: {hazy_dir}。跳过。")
+    if not os.path.isdir(hazy_dir) or not os.path.isdir(ir_dir):
+        print(f"[RealTest] invalid dirs: hazy_dir={hazy_dir}, ir_dir={ir_dir}, skip.")
         return
 
-    if not os.path.isdir(ir_dir):
-        print(f"\n警告: 真实测试 ir 目录不存在: {ir_dir}。跳过。")
-        return
-
-    # --- [新增] 检查掩码文件夹是否有效 (参考 Eval_EMA.py) ---
-    use_mask_if_available = False
-    mask_folder = opt.real_test_mask_path  # 从 opt 读取新路径
-
-    if mask_folder and os.path.isdir(mask_folder):
-        print(f"掩码模式: ON。将从以下路径加载掩码 (如果存在): {mask_folder}")
-        use_mask_if_available = True
-    else:
-        print(f"掩码模式: OFF。未提供或未找到掩码文件夹: '{mask_folder}'。")
-        print("所有图像将使用模型的基础注入模式 (base_weight) 运行。")
-    # --- [新增结束] ---
-
-    # 1. 设置输出目录
     output_folder = os.path.join(opt.real_test_output_dir, f'epoch_{epoch}')
     os.makedirs(output_folder, exist_ok=True)
     print(f"\n正在对真实世界图像运行推理 (Epoch {epoch}) -> 保存至 {output_folder}")
 
-    # 2. 查找图像
-    vis_images = sorted(glob.glob(os.path.join(hazy_dir, '*.jpg')) + \
-                        glob.glob(os.path.join(hazy_dir, '*.png')) + \
-                        glob.glob(os.path.join(hazy_dir, '*.jpeg')))
+    vis_images = _list_real_images(hazy_dir)
 
     if not vis_images:
         print(f"警告: 在 {hazy_dir} 中未找到图像文件。")
         return
 
-    # 3. 设置模型为评估模式
+    was_training = model.training
     model.eval()
+    try:
+        with torch.no_grad():
+            bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} | {rate_fmt}"
+            for vis_path in tqdm(vis_images, bar_format=bar_format, desc=f"Epoch {epoch} 真实测试"):
+                base_filename = os.path.basename(vis_path)
+                stem = os.path.splitext(base_filename)[0]
+                ir_path = find_paired_image(ir_dir, stem)
+                if ir_path is None:
+                    print(f"\n[RealTest] warning: no paired IR image for {base_filename}; skip.")
+                    continue
+                dehaze(model, vis_path, ir_path, output_folder)
+    finally:
+        if was_training:
+            model.train()
 
-    # 4. 禁用梯度并开始推理
-    with torch.no_grad():
-        bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} | {rate_fmt}"
-        for vis_path in tqdm(vis_images, bar_format=bar_format, desc=f"Epoch {epoch} 真实测试"):
-            base_filename = os.path.basename(vis_path)
-            ir_path = os.path.join(ir_dir, base_filename)
 
-            # --- [修改] 动态构造掩码路径 ---
-            mask_path = None  # 默认为 None (无掩码模式)
-            if use_mask_if_available:
-                # 仅当掩码文件夹有效时，才构造路径
-                mask_path = os.path.join(mask_folder, base_filename)
-                # 注意: 我们不在这里检查 os.path.exists(mask_path)
-                # 我们把 mask_path (可能存在也可能不存在) 传递给 dehaze 函数
-                # dehaze 函数内部会处理 "文件不存在" 的情况 (即视为"无掩码")
-            # --- [修改结束] ---
+def run_real_world_visualization(model, epoch, hazy_dir, ir_dir):
+    """
+    在真实域 specific 数据上保存训练中间过程 overview。
+    """
+    if not hazy_dir or not ir_dir:
+        print("[RealVis] hazy_dir or ir_dir is empty, skip real-domain overview visualization.")
+        return
 
-            if os.path.exists(ir_path):
-                # [修改] 调用 dehaze，传入 mask_path (可能是路径字符串，也可能是 None)
-                dehaze(model, vis_path, ir_path, mask_path, output_folder)
-            else:
-                print(f"\n警告: 找不到 {base_filename} 对应的红外图像: {ir_path}。跳过。")
+    if not os.path.isdir(hazy_dir) or not os.path.isdir(ir_dir):
+        print(f"[RealVis] invalid dirs: hazy_dir={hazy_dir}, ir_dir={ir_dir}, skip.")
+        return
 
-    # 5. （可选）恢复训练模式
-    model.train()
+    output_folder = os.path.join(opt.saved_data_dir, "real_vis", f"epoch_{epoch}")
+    os.makedirs(output_folder, exist_ok=True)
+    vis_images = _list_real_images(hazy_dir)
+    max_images = getattr(opt, "real_vis_max_images", 8)
+    if max_images > 0:
+        vis_images = vis_images[:max_images]
+
+    if not vis_images:
+        print(f"[RealVis] warning: no supported images found in {hazy_dir}.")
+        return
+
+    print(f"\n[RealVis] Epoch {epoch} overview -> {output_folder}")
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} | {rate_fmt}"
+            for vis_path in tqdm(vis_images, bar_format=bar_format, desc=f"Epoch {epoch} 真实可视化"):
+                base_filename = os.path.basename(vis_path)
+                stem = os.path.splitext(base_filename)[0]
+                ir_path = find_paired_image(ir_dir, stem)
+                if ir_path is None:
+                    print(f"\n[RealVis] warning: no paired IR image for {base_filename}; skip.")
+                    continue
+
+                try:
+                    haze_vis = transform(Image.open(vis_path).convert("RGB")).unsqueeze(0).to(device)
+                    haze_ir = transform(Image.open(ir_path).convert("RGB")).unsqueeze(0).to(device)
+                    haze_vis_resized, haze_ir_resized, h, w = _resize_to_model_multiple(haze_vis, haze_ir)
+                    out = model(haze_vis_resized, haze_ir_resized, return_dict=True)
+
+                    panels = [
+                        _panel_3ch(_denorm_clip(haze_vis), (h, w)),
+                        _panel_3ch(_denorm_clip(haze_ir), (h, w)),
+                        _panel_3ch(out["pred_clear"], (h, w), mode='bicubic'),
+                        _panel_3ch(out["density_map"], (h, w)),
+                        _panel_3ch(out["mask_prob"], (h, w)),
+                        _panel_3ch(out["binary_mask"], (h, w)),
+                    ]
+                    overview = torch.cat(panels, dim=3)
+                    save_path = os.path.join(output_folder, f"{stem}_overview.png")
+                    torchvision.utils.save_image(overview, save_path)
+                except FileNotFoundError as e:
+                    print(f"\n[RealVis] error: missing image file {e}; skip.")
+                except Exception as e:
+                    print(f"\n[RealVis] error processing {base_filename}: {e}; skip.")
+    finally:
+        if was_training:
+            model.train()
 
 
 # --- [新增结束] ---
@@ -499,14 +520,19 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
                 print(f"\n错误: 保存模型权重失败 (epoch {current_epoch}): {e}")
 
             if getattr(opt, "run_real_infer_in_teacher", False):
-                hazy_source = opt.real_test_specific_hazy_dir if opt.real_test_specific_hazy_dir else opt.real_test_hazy_path
-                ir_source = opt.real_test_specific_ir_dir if opt.real_test_specific_ir_dir else opt.real_test_ir_path
                 run_real_world_test(
                     teacher_net,
                     current_epoch,
-                    hazy_source,
-                    ir_source
+                    opt.real_test_hazy_path,
+                    opt.real_test_ir_path
                 )
+                if opt.real_test_specific_hazy_dir and opt.real_test_specific_ir_dir:
+                    run_real_world_visualization(
+                        teacher_net,
+                        current_epoch,
+                        opt.real_test_specific_hazy_dir,
+                        opt.real_test_specific_ir_dir
+                    )
 
             os.makedirs(opt.saved_data_dir, exist_ok=True)
             try:
