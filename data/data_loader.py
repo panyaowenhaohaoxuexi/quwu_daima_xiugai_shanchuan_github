@@ -11,7 +11,9 @@ RESIDE_Dataset 和 RESIDE_Dataset_2 都是为加载成对的（有雾图像, 清
 
 import os
 import random
+import torch
 import torch.utils.data as data
+from torch.utils.data.dataloader import default_collate
 from PIL import Image
 from torchvision.transforms import Normalize, ToTensor, RandomCrop, RandomHorizontalFlip, Resize
 from torchvision.transforms import functional as FF  # 导入 torchvision 的 functional 接口，用于更灵活的变换
@@ -706,6 +708,221 @@ class MultiModalHazeDataset(data.Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+
+SYNTH_IMAGE_EXTS = (".png", ".jpg", ".jpeg")
+
+
+def _find_synth_file_by_stem(directory, stem):
+    """Find one file by stem using .png > .jpg > .jpeg priority."""
+    found = []
+    lower_stem = stem.lower()
+    try:
+        for filename in os.listdir(directory):
+            candidate_stem, candidate_ext = os.path.splitext(filename)
+            if candidate_stem.lower() == lower_stem and candidate_ext.lower() in SYNTH_IMAGE_EXTS:
+                found.append(filename)
+    except FileNotFoundError:
+        return None, False
+
+    if not found:
+        return None, False
+
+    priority = {ext: index for index, ext in enumerate(SYNTH_IMAGE_EXTS)}
+    found.sort(key=lambda name: (priority[os.path.splitext(name)[1].lower()], name.lower()))
+    return os.path.join(directory, found[0]), len(found) > 1
+
+
+def _build_synth_stem_index(directory):
+    """Build a stem -> sorted candidate path list index for fast pairing."""
+    index = {}
+    priority = {ext: rank for rank, ext in enumerate(SYNTH_IMAGE_EXTS)}
+    try:
+        for filename in os.listdir(directory):
+            stem, ext = os.path.splitext(filename)
+            ext = ext.lower()
+            if ext not in SYNTH_IMAGE_EXTS:
+                continue
+            key = stem.lower()
+            index.setdefault(key, []).append(os.path.join(directory, filename))
+    except FileNotFoundError:
+        return index
+
+    for key, paths in index.items():
+        paths.sort(key=lambda path: (priority[os.path.splitext(path)[1].lower()], os.path.basename(path).lower()))
+    return index
+
+
+def _lookup_synth_stem(index, stem):
+    paths = index.get(stem.lower(), [])
+    if not paths:
+        return None, False
+    return paths[0], len(paths) > 1
+
+
+class SynthMultiModalDataset(data.Dataset):
+    """Synthetic-domain five-piece dataset for supervised CMDN Teacher training."""
+
+    def __init__(self, root, train=True, size=256, haze_levels=None):
+        super(SynthMultiModalDataset, self).__init__()
+        self.root = root
+        self.train = train
+        self.size = size
+        self.haze_levels = tuple(haze_levels or DEFAULT_HAZE_LEVELS)
+
+        self.clear_dir = os.path.join(root, "clear")
+        self.hazy_root = os.path.join(root, "hazy")
+        self.ir_dir = os.path.join(root, "ir")
+        self.density_root = os.path.join(root, "Transmission_Map_GT")
+        self.mask_root = os.path.join(root, "IR_Completion_Mask_GT")
+
+        self.samples = []
+        self.level_counts = {level: 0 for level in self.haze_levels}
+        self.missing_counts = {"clear": 0, "ir": 0, "density": 0, "mask": 0}
+        self.ambiguous_counts = {"clear": 0, "ir": 0, "density": 0, "mask": 0}
+        self._build_samples()
+
+    def _build_samples(self):
+        clear_index = _build_synth_stem_index(self.clear_dir)
+        ir_index = _build_synth_stem_index(self.ir_dir)
+        density_indexes = {
+            level: _build_synth_stem_index(os.path.join(self.density_root, level))
+            for level in self.haze_levels
+        }
+        mask_indexes = {
+            level: _build_synth_stem_index(os.path.join(self.mask_root, level))
+            for level in self.haze_levels
+        }
+
+        for level in self.haze_levels:
+            hazy_dir = os.path.join(self.hazy_root, level)
+
+            for filename in _list_hazy_files(hazy_dir, "auto"):
+                ext = os.path.splitext(filename)[1].lower()
+                if ext not in SYNTH_IMAGE_EXTS:
+                    continue
+
+                stem = os.path.splitext(filename)[0]
+                hazy_path = os.path.join(hazy_dir, filename)
+
+                clear_path, clear_ambiguous = _lookup_synth_stem(clear_index, stem)
+                if clear_path is None:
+                    self.missing_counts["clear"] += 1
+                    continue
+
+                ir_path, ir_ambiguous = _lookup_synth_stem(ir_index, stem)
+                if ir_path is None:
+                    self.missing_counts["ir"] += 1
+                    continue
+
+                density_path, density_ambiguous = _lookup_synth_stem(density_indexes[level], stem)
+                if density_path is None:
+                    self.missing_counts["density"] += 1
+                    continue
+
+                mask_path, mask_ambiguous = _lookup_synth_stem(mask_indexes[level], stem)
+                if mask_path is None:
+                    self.missing_counts["mask"] += 1
+                    continue
+
+                self.ambiguous_counts["clear"] += int(clear_ambiguous)
+                self.ambiguous_counts["ir"] += int(ir_ambiguous)
+                self.ambiguous_counts["density"] += int(density_ambiguous)
+                self.ambiguous_counts["mask"] += int(mask_ambiguous)
+
+                self.samples.append({
+                    "stem": stem,
+                    "image_name": filename,
+                    "haze_level": level,
+                    "hazy_path": hazy_path,
+                    "clear_path": clear_path,
+                    "ir_path": ir_path,
+                    "density_path": density_path,
+                    "mask_path": mask_path,
+                })
+                self.level_counts[level] += 1
+
+        counts = ", ".join(f"{level}={self.level_counts.get(level, 0)}" for level in self.haze_levels)
+        print(f"[SynthMultiModalDataset] samples: {len(self.samples)} ({counts})")
+        if any(self.missing_counts.values()):
+            print(f"[SynthMultiModalDataset] skipped missing pairs: {self.missing_counts}")
+        if any(self.ambiguous_counts.values()):
+            print(
+                "[SynthMultiModalDataset] WARNING: duplicate stem with multiple extensions; "
+                f"using priority .png > .jpg > .jpeg. counts={self.ambiguous_counts}"
+            )
+
+    def _resize_all(self, hazy_vis, clear_vis, infrared, density_gt, mask_gt):
+        resize_size = [self.size, self.size]
+        hazy_vis = FF.resize(hazy_vis, resize_size, interpolation=FF.InterpolationMode.BILINEAR)
+        clear_vis = FF.resize(clear_vis, resize_size, interpolation=FF.InterpolationMode.BILINEAR)
+        infrared = FF.resize(infrared, resize_size, interpolation=FF.InterpolationMode.BILINEAR)
+        density_gt = FF.resize(density_gt, resize_size, interpolation=FF.InterpolationMode.BILINEAR)
+        mask_gt = FF.resize(mask_gt, resize_size, interpolation=FF.InterpolationMode.NEAREST)
+        return hazy_vis, clear_vis, infrared, density_gt, mask_gt
+
+    def _augment_all(self, hazy_vis, clear_vis, infrared, density_gt, mask_gt):
+        if not self.train:
+            return hazy_vis, clear_vis, infrared, density_gt, mask_gt
+
+        rand_hor = random.randint(0, 1)
+        if rand_hor == 1:
+            hazy_vis = FF.hflip(hazy_vis)
+            clear_vis = FF.hflip(clear_vis)
+            infrared = FF.hflip(infrared)
+            density_gt = FF.hflip(density_gt)
+            mask_gt = FF.hflip(mask_gt)
+
+        rand_rot = random.randint(0, 3)
+        if rand_rot > 0:
+            angle = 90 * rand_rot
+            hazy_vis = FF.rotate(hazy_vis, angle, interpolation=FF.InterpolationMode.BILINEAR)
+            clear_vis = FF.rotate(clear_vis, angle, interpolation=FF.InterpolationMode.BILINEAR)
+            infrared = FF.rotate(infrared, angle, interpolation=FF.InterpolationMode.BILINEAR)
+            density_gt = FF.rotate(density_gt, angle, interpolation=FF.InterpolationMode.BILINEAR)
+            mask_gt = FF.rotate(mask_gt, angle, interpolation=FF.InterpolationMode.NEAREST)
+
+        return hazy_vis, clear_vis, infrared, density_gt, mask_gt
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        sample_name = f"{sample['haze_level']}/{sample['image_name']}"
+
+        try:
+            hazy_vis = Image.open(sample["hazy_path"]).convert("RGB")
+            clear_vis = Image.open(sample["clear_path"]).convert("RGB")
+            infrared = Image.open(sample["ir_path"]).convert("RGB")
+            density_gt = Image.open(sample["density_path"]).convert("L")
+            mask_gt = Image.open(sample["mask_path"]).convert("L")
+
+            hazy_vis, clear_vis, infrared, density_gt, mask_gt = self._resize_all(
+                hazy_vis, clear_vis, infrared, density_gt, mask_gt
+            )
+            hazy_vis, clear_vis, infrared, density_gt, mask_gt = self._augment_all(
+                hazy_vis, clear_vis, infrared, density_gt, mask_gt
+            )
+
+            hazy_vis = preprocess_feature(hazy_vis)
+            clear_vis = ToTensor()(clear_vis)
+            infrared = preprocess_feature(infrared)
+            density_gt = ToTensor()(density_gt).clamp(0.0, 1.0)
+            mask_gt = (ToTensor()(mask_gt) >= 0.5).float()
+
+            return hazy_vis, clear_vis, infrared, density_gt, mask_gt
+
+        except Exception as e:
+            print(f"[SynthMultiModalDataset] failed to load sample {sample_name}: {e}")
+            return None, None, None, None, None
+
+    def __len__(self):
+        return len(self.samples)
+
+
+def collate_synth(batch):
+    batch = [item for item in batch if item is not None and item[0] is not None]
+    if not batch:
+        return torch.tensor([]), torch.tensor([]), torch.tensor([]), torch.tensor([]), torch.tensor([])
+    return default_collate(batch)
 
 
 class MultiModalCLIPLoader(data.Dataset):

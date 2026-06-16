@@ -1,45 +1,22 @@
 """
-model/cmdn.py — Cross-Modal Decision Network
+model/cmdn.py - Cross-Modal Diagnostic Network
 
-Replaces HDE+differentiable_otsu for haze mask estimation.
-Stable pseudo-label: haze_app × (DINOv2 structure degradation + fixed VIS-IR
-structure advantage), where:
-  haze_app   : fixed visible fog-white appearance prior
-  attn_deg   : DINOv2 local structure variance (high=clear, low=degraded)
-  struct_deg : 1 - attn_deg
-  ir_adv     : fixed Sobel/local-contrast IR advantage over visible
+Supervised CMDN for infrared-guided dehazing diagnostics.
 
-g_fog is kept only as a CLIP sliding-window diagnostic signal. It does not
-enter P_pseudo, P_support, or loss_Disc. CLIP patch tokens still enter the
-decoder as feat_clip for trainable P_fail prediction.
-
-SAM sky suppression semantics:
-  P_pseudo_raw = haze_app * fixed evidence
-  P_pseudo     = P_pseudo_raw * non_sky_mask
-
-non_sky_mask can come from an externally supplied SAM sky_mask. SAM sky_mask
-only suppresses sky regions, does not judge fog regions, and does not
-participate in training. g_fog remains diagnostic only.
-
-Probe-verified design decisions (see probe_hooks.py):
-  - CLIP per-patch tokens CANNOT encode fog/sky semantics (all cos-sim ~0).
-    g_fog uses sliding-window CLS token (7×7 overlapping crops at 448px).
-  - DINOv2 constructed with img_size=518, block_chunks=0, init_values=1.0,
-    FlatBlock (strict match, 175/175 keys). 448 input via pos_embed interpolation.
-  - attn_deg uses x_prenorm with 3×3 local structure variance
-    (not x_norm_patchtokens nor global L2 norm — 5× better margin in probe).
-  - CLIP feat_clip (decoder input) still uses per-patch tokens via hook.
-
-Current region decision:
-  P_fail -> tau -> G_dec, then conservative support P_support gates G_soft.
-  The forward value uses binary M_hard, while gradients flow through G_soft.
+NOTE:
+    forward return values changed from the old 8-tuple to
+    (C, M, mask_logits). model/Teacher.py still contains the old CMDN
+    constructor arguments and 8-tuple unpacking; those call sites must be
+    updated in the second integration step.
 """
 
-import sys
 import os
+import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
@@ -68,45 +45,72 @@ def _conv3x3_bn_relu(in_ch, out_ch):
     )
 
 
+def differentiable_otsu(q_complete, num_bins=256, delta=0.02, temperature=0.01):
+    """Differentiable Otsu threshold for a batch of single-channel maps."""
+    b = q_complete.shape[0]
+    q = q_complete.reshape(b, -1)
+    bins = torch.linspace(0, 1, num_bins, device=q_complete.device, dtype=q_complete.dtype)
+
+    diff = q.unsqueeze(-1) - bins.view(1, 1, num_bins)
+    hist = torch.exp(-(diff ** 2) / (2 * delta ** 2)).sum(dim=1)
+    hist = hist / (hist.sum(dim=1, keepdim=True) + 1e-6)
+
+    bin_values = bins.view(1, num_bins)
+    p1 = torch.cumsum(hist, dim=1)
+    mu1 = torch.cumsum(hist * bin_values, dim=1)
+    mu_total = mu1[:, -1:]
+    p2 = 1 - p1
+    mu2 = (mu_total - mu1) / (p2 + 1e-6)
+    sigma_b = p1 * p2 * (mu1 / (p1 + 1e-6) - mu2) ** 2
+
+    weights = torch.softmax(sigma_b / temperature, dim=1)
+    tau = (weights * bin_values).sum(dim=1).view(b, 1, 1, 1)
+    return tau
+
+
+class TextEncoder(nn.Module):
+    """Lightweight wrapper around CLIP text modules for CoA-style prompts."""
+
+    def __init__(self, clip_model):
+        super().__init__()
+        self.transformer = clip_model.transformer
+        self.positional_embedding = clip_model.positional_embedding
+        self.ln_final = clip_model.ln_final
+        self.text_projection = clip_model.text_projection
+        self.dtype = clip_model.dtype
+
+    def forward(self, prompts, tokenized_prompts):
+        x = prompts.type(self.dtype) + self.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.ln_final(x).type(self.dtype)
+
+        if x.shape[0] == tokenized_prompts.shape[0]:
+            x = x[torch.arange(x.shape[0], device=x.device), tokenized_prompts.argmax(dim=-1)]
+        else:
+            x = x[:, -1, :]
+        return x @ self.text_projection
+
+
 # ---------------------------------------------------------------------------
 # CMDN
 # ---------------------------------------------------------------------------
 
 class CMDN(nn.Module):
-    """Cross-Modal Decision Network for haze mask estimation.
+    """Supervised Cross-Modal Diagnostic Network.
 
     Args:
-        dino_source_dir : path to DINOv2 source
-        dino_weight_path: path to dinov2_vitb14_pretrain.pth
-        gamma           : pseudo-label sparsification exponent (default 1.2)
+        haze_prompt_path: path to CoA-style haze/clear prompt embeddings.
+        clip_download_root: local CLIP model cache directory.
     """
 
     def __init__(self,
-                 dino_source_dir="./DINOv2/facebookresearch_dinov2_main",
-                 dino_weight_path="./dinov2_model/dinov2_vitb14_pretrain.pth",
-                 gamma=1.2,
-                 tau_min=0.25,
-                 tau_max=0.85,
-                 gate_temperature=0.10,
-                 support_gamma=1.0,
-                 support_floor=0.0,
-                 support_threshold=0.25,
-                 support_temperature=0.05,
-                 hard_gate_threshold=0.25):
+                 haze_prompt_path="./clip_model/haze_prompt.pth",
+                 clip_download_root="./clip_model/"):
         super().__init__()
-        self.gamma = gamma
-        self.tau_min = tau_min
-        self.tau_max = tau_max
-        self.gate_temperature = gate_temperature
-        self.support_gamma = support_gamma
-        self.support_floor = max(0.0, min(1.0, float(support_floor)))
-        self.support_threshold = float(support_threshold)
-        self.support_temperature = max(1e-4, float(support_temperature))
-        self.hard_gate_threshold = hard_gate_threshold
 
-        # ------------------------------------------------------------------
-        # 1. Trainable VIS / IR encoders (lightweight, no weight sharing)
-        # ------------------------------------------------------------------
+        # 1. Trainable VIS / IR encoders.
         self.vis_enc = nn.Sequential(
             _conv3x3_bn_relu(3, 16),
             _conv3x3_bn_relu(16, 32),
@@ -118,541 +122,182 @@ class CMDN(nn.Module):
             _conv3x3_bn_relu(32, 32),
         )
 
-        # ------------------------------------------------------------------
-        # 2. Normalisation constants (register_buffer for .cuda() safety)
-        # ------------------------------------------------------------------
+        # 2. CLIP normalisation constants.
         self.register_buffer(
             'clip_mean',
             torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1))
         self.register_buffer(
             'clip_std',
             torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1))
-        self.register_buffer(
-            'imagenet_mean',
-            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer(
-            'imagenet_std',
-            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-        self.register_buffer(
-            'sobel_x',
-            torch.tensor([[-1, 0, 1],
-                          [-2, 0, 2],
-                          [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3))
-        self.register_buffer(
-            'sobel_y',
-            torch.tensor([[-1, -2, -1],
-                          [0, 0, 0],
-                          [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3))
 
-        # ------------------------------------------------------------------
-        # 3. CLIP loading (frozen)
-        #    - g_fog:      sliding-window CLS token (image-level, 7x7 grid)
-        #    - feat_clip:  per-patch tokens via hook (decoder input only)
-        # ------------------------------------------------------------------
+        # 3. CLIP loading (frozen) + final-block patch token hook.
         try:
             import CLIP.clip as clip
         except Exception as e:
-            raise RuntimeError(
-                f"[CMDN] Cannot import CLIP.clip: {e}.")
+            raise RuntimeError(f"[CMDN] Cannot import CLIP.clip: {e}.")
+        self._clip_module = clip
 
         self._clip_model, _ = clip.load(
-            "ViT-B/32", device=torch.device("cpu"),
-            download_root="./clip_model/")
+            "ViT-B/32",
+            device="cpu",
+            download_root=clip_download_root,
+        )
         for p in self._clip_model.parameters():
             p.requires_grad = False
         self._clip_model.eval()
 
-        # Hook for per-patch tokens (feat_clip only)
         self.clip_visual = self._clip_model.visual
         self._clip_patch_tokens = None
-        self.clip_visual.transformer.resblocks[-1].register_forward_hook(
-            self._clip_hook)
+        self.clip_visual.transformer.resblocks[-1].register_forward_hook(self._clip_hook)
 
-        # Text anchors (fp32 for downstream matmul)
-        with torch.no_grad():
-            device_for_text = next(self._clip_model.parameters()).device
-            t_fog_raw = self._clip_model.encode_text(clip.tokenize([
-                "dense smoke",
-                "thick fog obscuring objects",
-                "smoke blocking the scene",
-            ]).to(device_for_text)).mean(0)  # (512,)
-            t_sky_raw = self._clip_model.encode_text(clip.tokenize([
-                "clear sky",
-                "overcast sky",
-                "cloudy sky",
-            ]).to(device_for_text)).mean(0)  # (512,)
-        self.register_buffer('t_fog', t_fog_raw.float())
-        self.register_buffer('t_sky', t_sky_raw.float())
+        # 4. CoA-style text prompt anchors for M_d.
+        t_haze, t_clear = self._load_prompt_anchors(haze_prompt_path)
+        self.register_buffer('t_haze', t_haze)
+        self.register_buffer('t_clear', t_clear)
 
-        # ------------------------------------------------------------------
-        # 4. DINOv2 loading (frozen, strict match)
-        # ------------------------------------------------------------------
-        if not os.path.isdir(dino_source_dir):
-            raise RuntimeError(
-                f"[CMDN] DINOv2 source dir not found: {dino_source_dir}")
-        if not os.path.isfile(dino_weight_path):
-            raise RuntimeError(
-                f"[CMDN] DINOv2 weights not found: {dino_weight_path}")
-
-        sys.path.insert(0, dino_source_dir)
-        try:
-            from dinov2.models.vision_transformer import DinoVisionTransformer
-            from dinov2.layers.block import Block as FlatBlock
-            from dinov2.layers import MemEffAttention
-            from functools import partial
-        except ImportError as e:
-            sys.path.pop(0)
-            raise RuntimeError(
-                f"[CMDN] Cannot import DINOv2 modules: {e}.")
-
-        self._dino = DinoVisionTransformer(
-            img_size=518, patch_size=14, embed_dim=768, depth=12,
-            num_heads=12, mlp_ratio=4,
-            block_fn=partial(FlatBlock, attn_class=MemEffAttention),
-            block_chunks=0, init_values=1.0,
+        # 5. Supervised three-way fusion head.
+        self.fuse = nn.Sequential(
+            _conv3x3_bn_relu(65, 64),
+            _conv3x3_bn_relu(64, 32),
         )
+        self.head_density = nn.Sequential(nn.Conv2d(32, 1, 1), nn.Sigmoid())
+        self.head_mask = nn.Conv2d(32, 1, 1)
 
-        state_dict = torch.load(dino_weight_path, map_location='cpu')
-        try:
-            self._dino.load_state_dict(state_dict, strict=True)
-        except RuntimeError as e:
-            sys.path.pop(0)
-            raise RuntimeError(
-                f"[CMDN] DINOv2 strict load failed: {e}")
-        sys.path.pop(0)
-
-        for p in self._dino.parameters():
-            p.requires_grad = False
-        self._dino.eval()
-
-        # ------------------------------------------------------------------
-        # 5. Projection layers (near-zero init)
-        # ------------------------------------------------------------------
-        self.clip_proj = nn.Conv2d(768, 32, 1, bias=False)
-        nn.init.normal_(self.clip_proj.weight, std=1e-4)
-
-        self.dino_proj = nn.Conv2d(768, 32, 1, bias=False)
-        nn.init.normal_(self.dino_proj.weight, std=1e-4)
-
-        # ------------------------------------------------------------------
-        # 6. Decoder: 32(vis)+32(clip)+32(dino)+1(P_pseudo) = 97 → 1
-        # ------------------------------------------------------------------
-        self.decoder = nn.Sequential(
-            nn.Conv2d(97, 64, 3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 1, 3, padding=1),
-            nn.Sigmoid(),
-        )
-
-        self.thr_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(97, 32, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 1, 1),
-            nn.Sigmoid(),
-        )
-        nn.init.zeros_(self.thr_head[-2].weight)
-        nn.init.zeros_(self.thr_head[-2].bias)
-
-        # ------------------------------------------------------------------
-        # 7. Sliding-window g_fog: pre-compute fixed grid positions
-        #    Grid 7×7, each crop 224×224 resized from a 448×448 parent.
-        #    Crop centre spacing = 448/7 = 64 px.
-        # ------------------------------------------------------------------
-        self._gfog_grid = 7
-        self._gfog_step = 448.0 / 7.0  # 64.0
-        self._gfog_half = 112           # half of 224
-
-    # ------------------------------------------------------------------
-    # CLIP hook callback (for per-patch feat_clip, not g_fog)
-    # ------------------------------------------------------------------
     def _clip_hook(self, module, inp, out):
-        self._clip_patch_tokens = out  # (seq, batch, dim) = (50, B, 768)
+        self._clip_patch_tokens = out
 
-    # ------------------------------------------------------------------
-    # Fixed image operators for stable pseudo-label generation
-    # ------------------------------------------------------------------
-    def _rgb_to_gray(self, x):
-        return x[:, 0:1] * 0.299 + x[:, 1:2] * 0.587 + x[:, 2:3] * 0.114
-
-    def _sobel_edge(self, gray, eps=1e-8):
-        sobel_x = self.sobel_x.to(dtype=gray.dtype)
-        sobel_y = self.sobel_y.to(dtype=gray.dtype)
-        gx = F.conv2d(gray, sobel_x, padding=1)
-        gy = F.conv2d(gray, sobel_y, padding=1)
-        return torch.sqrt(gx * gx + gy * gy + eps)
-
-    def _local_std(self, gray, kernel_size=7, eps=1e-8):
-        pad = kernel_size // 2
-        mean = F.avg_pool2d(gray, kernel_size, stride=1, padding=pad)
-        mean_sq = F.avg_pool2d(gray * gray, kernel_size, stride=1, padding=pad)
-        var = (mean_sq - mean * mean).clamp_min(0.0)
-        return torch.sqrt(var + eps)
-
-    def _robust_norm(self, x, low_q=0.02, high_q=0.98, min_range=1e-4):
-        B = x.shape[0]
-        flat = x.reshape(B, -1)
-
+    def _load_prompt_anchors(self, haze_prompt_path):
+        """Load haze/clear text features from an existing CoA prompt file."""
         try:
-            low = torch.quantile(flat, low_q, dim=1, keepdim=True)
-            high = torch.quantile(flat, high_q, dim=1, keepdim=True)
-        except Exception:
-            n = flat.shape[1]
-            low_k = max(1, min(n, int((n - 1) * low_q) + 1))
-            high_k = max(1, min(n, int((n - 1) * high_q) + 1))
-            low = flat.kthvalue(low_k, dim=1, keepdim=True).values
-            high = flat.kthvalue(high_k, dim=1, keepdim=True).values
+            if not os.path.isfile(haze_prompt_path):
+                raise FileNotFoundError(haze_prompt_path)
 
-        tail = [1] * (x.dim() - 1)
-        low = low.view(B, *tail)
-        high = high.view(B, *tail)
-        span = high - low
-        valid = span >= min_range
-        norm = ((x - low) / (span + 1e-8)).clamp(0.0, 1.0)
-        return torch.where(valid, norm, torch.zeros_like(norm))
+            data = torch.load(haze_prompt_path, map_location="cpu")
+            if isinstance(data, dict):
+                data = {k[7:] if k.startswith("module.") else k: v for k, v in data.items()}
+            embedding_prompt = data["embedding_prompt"]
+            embedding_prompt = nn.Parameter(embedding_prompt.float(), requires_grad=False)
 
-    def _smooth01(self, x, kernel_size=5):
-        pad = kernel_size // 2
-        x = F.avg_pool2d(x, kernel_size, stride=1, padding=pad)
-        return x.clamp(0.0, 1.0)
+            B_prompt = embedding_prompt.shape[0]
+            if B_prompt < 2:
+                raise ValueError(f"embedding_prompt must contain haze and clear prompts, got {B_prompt}")
 
-    # ------------------------------------------------------------------
-    # Sliding-window g_fog via CLS token
-    # ------------------------------------------------------------------
-    def _compute_gfog_sliding(self, x_vis_01):
-        """
-        Args:
-            x_vis_01: (B, 3, 448, 448) image in [0, 1], already resized.
-        Returns:
-            g_fog: (B, 1, H, W) fog probability map (high = foggy).
-        """
-        B, _, H, W = x_vis_01.shape
-        clip_dtype = self.clip_visual.conv1.weight.dtype
-        DEV = x_vis_01.device
+            token_str = " ".join(["X"] * 16)
+            tokenized_prompts = torch.cat(
+                [self._clip_module.tokenize(token_str) for _ in range(B_prompt)],
+                dim=0,
+            )
+            text_encoder = TextEncoder(self._clip_model)
+            text_encoder.eval()
 
-        # Build grid centre coordinates
-        step = self._gfog_step
-        half = self._gfog_half
-        G = self._gfog_grid
+            with torch.no_grad():
+                text_features = text_encoder(embedding_prompt, tokenized_prompts).float()
+                mid = B_prompt // 2
+                if mid == 0 or mid == B_prompt:
+                    raise ValueError(f"invalid haze/clear prompt split for B_prompt={B_prompt}")
+                t_haze = text_features[:mid].mean(0).float()
+                t_clear = text_features[mid:].mean(0).float()
+            return t_haze, t_clear
+        except Exception as e:
+            print(f"[CMDN] Warning: failed to load haze prompts from {haze_prompt_path}: {e}. "
+                  "M_d will fall back to constant 0.5.")
+            return None, None
 
-        cy_list = [int(step * i + step / 2) for i in range(G)]  # 32, 96, 160, ...
-        cx_list = [int(step * j + step / 2) for j in range(G)]
-
-        # Collect all crops: (B * G * G, 3, 224, 224)
-        crops = []
-        for cy in cy_list:
-            for cx in cx_list:
-                y1 = max(0, cy - half)
-                x1 = max(0, cx - half)
-                y2 = min(H, y1 + 224)
-                x2 = min(W, x1 + 224)
-                y1 = y2 - 224
-                x1 = x2 - 224
-                # Crop in [0,1] → CLIP normalise
-                crop = x_vis_01[:, :, y1:y2, x1:x2]  # (B, 3, 224, 224)
-                crop_norm = (crop - self.clip_mean) / self.clip_std
-                crops.append(crop_norm)
-
-        # Stack: (B*49, 3, 224, 224)
-        crops_batch = torch.cat(crops, dim=0)
-
-        # Single batched CLIP forward (much faster than 49 sequential calls)
-        with torch.no_grad():
-            cls_feats = self.clip_visual(crops_batch.type(clip_dtype))  # (B*49, 512)
-        cls_feats = cls_feats.float()
-        cls_feats = F.normalize(cls_feats, dim=-1)  # (B*49, 512)
-
-        # Reshape: (B*49, 512) → (B, 49, 512)
-        cls_feats = cls_feats.view(B, G * G, 512)
-
-        # Cosine similarity with text anchors
-        t_fog_n = F.normalize(self.t_fog, dim=0)  # (512,)
-        t_sky_n = F.normalize(self.t_sky, dim=0)  # (512,)
-
-        sim_fog = cls_feats @ t_fog_n  # (B, 49)
-        sim_sky = cls_feats @ t_sky_n  # (B, 49)
-
-        g_fog_raw = (sim_fog - sim_sky).reshape(B, 1, G, G)  # (B, 1, 7, 7)
-
-        # Upsample to H×W, then per-image minmax
-        g_fog = F.interpolate(g_fog_raw, size=(H, W),
-                              mode='bilinear', align_corners=False)
-        g_fog = per_image_minmax(g_fog)  # [0, 1]
-        return g_fog
-
-    # ------------------------------------------------------------------
-    # DINOv2 local structure variance (3×3 neighbourhood)
-    # ------------------------------------------------------------------
-    def _compute_attn_deg(self, x_vis_imagenet_448, target_hw=None):
-        """Returns feat_dino, attn_deg at target_hw (or 448 if None)."""
-        B, _, H448, W448 = x_vis_imagenet_448.shape
-        out_h, out_w = target_hw if target_hw else (H448, W448)
-
-        with torch.no_grad():
-            out = self._dino.forward_features(x_vis_imagenet_448)
-
-        # x_prenorm (probe-verified: 32% better spatial discrimination than
-        # x_norm_patchtokens).  Drop CLS token at index 0.
-        pt_pre = out["x_prenorm"]         # (B, grid^2+1, 768)
-        pt_pre_p = pt_pre[:, 1:, :]       # (B, grid^2, 768)
-
-        grid = int(pt_pre_p.shape[1] ** 0.5)
-        D = pt_pre_p.shape[-1]
-
-        # Feature map for decoder input
-        feat_dino_raw = pt_pre_p.reshape(B, grid, grid, D).permute(0, 3, 1, 2)  # (B,768,grid,grid)
-        feat_dino = self.dino_proj(feat_dino_raw.float())
-        feat_dino = F.interpolate(feat_dino, size=(out_h, out_w),
-                                  mode='bilinear', align_corners=False)
-
-        # Local structure variance (3×3)
-        # Probe-verified: this gives 5× better smoke/clear margin than L2 norm.
-        feat_3d = pt_pre_p.float().reshape(B, grid, grid, D)  # (B,grid,grid,768)
-        feat_padded = F.pad(
-            feat_3d.permute(0, 3, 1, 2),   # (B,768,grid,grid)
-            (1, 1, 1, 1), mode='reflect')
-
-        local_var = feat_3d.new_zeros(B, grid, grid)
-        n_neighbours = 0
-        for di in range(3):
-            for dj in range(3):
-                if di == 1 and dj == 1:
-                    continue
-                neighbour = feat_padded[:, :, di:di+grid, dj:dj+grid]
-                diff = (feat_3d.permute(0, 3, 1, 2) - neighbour).norm(dim=1)
-                local_var += diff
-                n_neighbours += 1
-        local_var = local_var / n_neighbours
-
-        attn_deg = local_var.unsqueeze(1)       # (B, 1, grid, grid)
-        attn_deg = per_image_minmax(attn_deg)   # [0, 1], high = clear
-        attn_deg = F.interpolate(attn_deg, size=(out_h, out_w),
-                                 mode='bilinear', align_corners=False)
-
-        return feat_dino, attn_deg
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-    def forward(self, x_vis_clipnorm, x_ir,
-                disc_alpha=0.0, return_debug=False, sky_mask=None):
-        """
-        Args:
-            x_vis_clipnorm: (B, 3, H, W) visible in CLIP normalisation
-            x_ir:           (B, 3, H, W) infrared
-            disc_alpha:     kept for interface compatibility; does not affect P_pseudo
-            return_debug:   if True, also return pseudo-label diagnostics
-            sky_mask:       optional sky mask; sky=1 suppresses P_pseudo_raw
-
-        Returns:
-            P_fail:    (B, 1, H, W) visible failure probability
-            P_pseudo:  (B, 1, H, W) fixed pseudo-label (detached)
-        """
+    def forward(self, x_vis_clipnorm, x_ir, return_debug=False):
         B, _, H, W = x_vis_clipnorm.shape
 
-        # ================================================================
-        # (a) Trainable visible feature for P_fail prediction
-        # ================================================================
-        f_vis = self.vis_enc(x_vis_clipnorm)
-
-        # ================================================================
-        # (b) Denormalise inputs for fixed image operators and CLIP
-        # ================================================================
+        # 1. CLIP semantic density prior M_d.
         x_vis_01 = (x_vis_clipnorm * self.clip_std + self.clip_mean).clamp(0, 1)
-        x_ir_01 = (x_ir * self.clip_std + self.clip_mean).clamp(0, 1)
+        x_vis_224 = F.interpolate(x_vis_01, size=(224, 224), mode='bilinear', align_corners=False)
 
-        # ================================================================
-        # (c) CLIP features + sliding-window g_fog
-        # ================================================================
-        # --- g_fog: sliding-window CLS (image-level semantics) ---
-        # Diagnostic only: not used in P_pseudo, P_support, or loss_Disc.
-        x_vis_448 = F.interpolate(x_vis_01, size=(448, 448),
-                                  mode='bilinear', align_corners=False)
-        g_fog = self._compute_gfog_sliding(x_vis_448)  # (B, 1, 448, 448)
-        g_fog = F.interpolate(g_fog, size=(H, W),
-                              mode='bilinear', align_corners=False)  # → H×W
-
-        # --- feat_clip: per-patch tokens via hook (decoder input only) ---
-        x_vis_224 = F.interpolate(x_vis_01, size=(224, 224),
-                                  mode='bilinear', align_corners=False)
         clip_dtype = self.clip_visual.conv1.weight.dtype
-        _ = self.clip_visual(x_vis_224.type(clip_dtype))  # trigger hook
+        _ = self.clip_visual(x_vis_224.type(clip_dtype))   # trigger hook
 
-        raw = self._clip_patch_tokens             # (50, B, 768)
-        patch_tokens = raw.permute(1, 0, 2)       # (B, 50, 768)
-        patch_tokens = patch_tokens[:, 1:, :]      # (B, 49, 768)
-        patch_tokens = patch_tokens.float()
+        raw = self._clip_patch_tokens                      # (50, B, 768)
+        patch = raw.to(x_vis_clipnorm.device).permute(1, 0, 2)[:, 1:, :].float()
+        proj = self.clip_visual.proj.to(x_vis_clipnorm.device).float()
+        patch_512 = patch @ proj
 
-        feat_clip = patch_tokens.reshape(B, 7, 7, 768).permute(0, 3, 1, 2)  # (B,768,7,7)
-        feat_clip = self.clip_proj(feat_clip)                                # (B,32,7,7)
-        feat_clip = F.interpolate(feat_clip, size=(H, W),
-                                  mode='bilinear', align_corners=False)      # (B,32,H,W)
+        if self.t_haze is not None and self.t_clear is not None:
+            patch_n = F.normalize(patch_512, dim=-1)
+            t_haze_n = F.normalize(
+                self.t_haze.to(x_vis_clipnorm.device).float().view(1, 1, -1),
+                dim=-1,
+            )
+            t_clear_n = F.normalize(
+                self.t_clear.to(x_vis_clipnorm.device).float().view(1, 1, -1),
+                dim=-1,
+            )
+            sim_haze = (patch_n * t_haze_n).sum(-1)
+            sim_clear = (patch_n * t_clear_n).sum(-1)
+            temperature = 0.01
+            sims = torch.stack([sim_haze, sim_clear], dim=1) / temperature
+            # [FIXED] haze/clear 方向：经真实浓雾图验证，浓度=第1分量
+            M_d_flat = torch.softmax(sims, dim=1)[:, 1, :]
+            M_d_small = M_d_flat.reshape(B, 1, 7, 7)
+        else:
+            M_d_small = torch.full((B, 1, 7, 7), 0.5, device=x_vis_clipnorm.device)
 
-        # ================================================================
-        # (d) DINOv2 degradation
-        # ================================================================
-        x_vis_imagenet = (x_vis_01 - self.imagenet_mean) / self.imagenet_std
-        x_vis_dino = F.interpolate(x_vis_imagenet, size=(448, 448),
-                                   mode='bilinear', align_corners=False)
-        feat_dino, attn_deg = self._compute_attn_deg(x_vis_dino, target_hw=(H, W))
+        M_d = F.interpolate(M_d_small, size=(H, W), mode='bilinear', align_corners=False)
 
-        # ================================================================
-        # (e) Stable fixed pseudo-label generation
-        # ================================================================
-        # P_pseudo is fixed for a given VIS/IR input and does not depend on
-        # trainable encoders, disc_alpha, or epoch schedules.
-        with torch.no_grad():
-            gray_vis = self._rgb_to_gray(x_vis_01)
-            gray_ir = self._rgb_to_gray(x_ir_01)
+        # 2. Trainable VIS / IR features.
+        vis_feat = self.vis_enc(x_vis_clipnorm)
+        ir_feat = self.ir_enc(x_ir)
 
-            brightness = gray_vis
-            saturation = x_vis_01.max(dim=1, keepdim=True).values - \
-                x_vis_01.min(dim=1, keepdim=True).values
-            local_contrast_vis = self._local_std(gray_vis)
-            local_contrast_ir = self._local_std(gray_ir)
+        # 3. Three-way fusion.
+        fuse_input = torch.cat([M_d, vis_feat, ir_feat], dim=1)
+        assert fuse_input.shape[1] == 65
+        fused = self.fuse(fuse_input)
 
-            bright_gate = torch.sigmoid((brightness - 0.60) / 0.10)
-            low_sat_gate = torch.sigmoid((0.35 - saturation) / 0.08)
-            low_contrast_gate = torch.sigmoid((0.08 - local_contrast_vis) / 0.03)
-            haze_app = self._smooth01(
-                bright_gate * low_sat_gate * low_contrast_gate)
+        # 4. Supervised outputs.
+        C = self.head_density(fused)
+        mask_logits = self.head_mask(fused)
+        M_prob = torch.sigmoid(mask_logits)
 
-            struct_deg = self._smooth01((1.0 - attn_deg).clamp(0.0, 1.0))
-
-            edge_vis = self._robust_norm(self._sobel_edge(gray_vis))
-            edge_ir = self._robust_norm(self._sobel_edge(gray_ir))
-            contrast_vis = self._robust_norm(local_contrast_vis)
-            contrast_ir = self._robust_norm(local_contrast_ir)
-
-            edge_adv = F.relu(edge_ir - edge_vis)
-            contrast_adv = F.relu(contrast_ir - contrast_vis)
-            ir_adv = self._smooth01(
-                (0.7 * edge_adv + 0.3 * contrast_adv).clamp(0.0, 1.0))
-
-            evidence = 0.4 * struct_deg + 0.6 * ir_adv
-            P_pseudo_raw = self._smooth01(haze_app * evidence)
-            P_pseudo_raw = P_pseudo_raw.clamp(0.0, 1.0) ** self.gamma
-            P_pseudo_raw = P_pseudo_raw.detach()
-
-            if sky_mask is not None:
-                sky_mask_debug = sky_mask
-                if sky_mask_debug.dim() == 2:
-                    sky_mask_debug = sky_mask_debug.unsqueeze(0).unsqueeze(0)
-                elif sky_mask_debug.dim() == 3:
-                    if sky_mask_debug.shape[0] == B:
-                        sky_mask_debug = sky_mask_debug.unsqueeze(1)
-                    elif sky_mask_debug.shape[0] == 1:
-                        sky_mask_debug = sky_mask_debug.unsqueeze(0)
-                    else:
-                        raise ValueError(
-                            "sky_mask with 3 dims must have shape (B,H,W) or (1,H,W)")
-                elif sky_mask_debug.dim() == 4:
-                    pass
-                else:
-                    raise ValueError(
-                        "sky_mask must have shape (B,1,H,W), (B,H,W), (1,H,W), or (H,W)")
-
-                if sky_mask_debug.shape[0] == 1 and B != 1:
-                    sky_mask_debug = sky_mask_debug.expand(B, -1, -1, -1)
-                if sky_mask_debug.shape[0] != B or sky_mask_debug.shape[1] != 1:
-                    raise ValueError(
-                        f"sky_mask normalized shape must be (B,1,H,W), got {tuple(sky_mask_debug.shape)}")
-
-                sky_mask_debug = sky_mask_debug.to(
-                    device=P_pseudo_raw.device, dtype=P_pseudo_raw.dtype)
-                sky_mask_debug = F.interpolate(
-                    sky_mask_debug,
-                    size=P_pseudo_raw.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False)
-                sky_mask_debug = sky_mask_debug.clamp(0.0, 1.0)
-                sky_mask_debug = (sky_mask_debug >= 0.5).to(dtype=P_pseudo_raw.dtype)
-                non_sky_mask = 1.0 - sky_mask_debug
-                P_pseudo = P_pseudo_raw * non_sky_mask
-            else:
-                sky_mask_debug = torch.zeros_like(P_pseudo_raw)
-                non_sky_mask = torch.ones_like(P_pseudo_raw)
-                P_pseudo = P_pseudo_raw
-
-            P_pseudo = P_pseudo.detach()
-
-        # ================================================================
-        # (f) Decoder
-        # ================================================================
-        dec_input = torch.cat([f_vis, feat_clip, feat_dino, P_pseudo], dim=1)
-        P_fail = self.decoder(dec_input)
-
-        tau_raw = self.thr_head(dec_input)
-        tau = self.tau_min + (self.tau_max - self.tau_min) * tau_raw
-
-        P_support = torch.clamp(P_pseudo.detach(), 0.0, 1.0) ** self.support_gamma
-        P_support = torch.clamp(P_support, 0.0, 1.0)
-
-        C_soft = torch.sigmoid((P_support - self.support_threshold) / self.support_temperature)
-        R_soft = torch.sigmoid((P_fail - tau) / self.gate_temperature)
-        G_dec = R_soft
-
-        G_soft = torch.clamp(C_soft * R_soft, 0.0, 1.0)
-        support_binary = P_support >= self.support_threshold
-        gate_binary = G_soft >= self.hard_gate_threshold
-        M_hard = (support_binary & gate_binary).float()
-        haze_mask = M_hard.detach() + G_soft - G_soft.detach()
+        # 5. Inference-time binary mask with STE gradients.
+        tau = differentiable_otsu(M_prob)
+        m_hard = (M_prob >= tau).float()
+        M = m_hard.detach() + M_prob - M_prob.detach()
 
         if return_debug:
             return {
-                "P_fail": P_fail,
-                "P_pseudo_raw": P_pseudo_raw,
-                "sky_mask": sky_mask_debug,
-                "non_sky_mask": non_sky_mask,
-                "P_pseudo": P_pseudo,
+                "M_d": M_d,
+                "C": C,
+                "mask_logits": mask_logits,
+                "M_prob": M_prob,
                 "tau": tau,
-                "G_dec": G_dec,
-                "P_support": P_support,
-                "support_eff": torch.ones_like(P_support),
-                "C_soft": C_soft,
-                "R_soft": R_soft,
-                "support_threshold": torch.full_like(P_support, float(self.support_threshold)),
-                "support_temperature": torch.full_like(P_support, float(self.support_temperature)),
-                "G_soft": G_soft,
-                "M_hard": M_hard,
-                "haze_mask": haze_mask,
-                "g_fog": g_fog,
-                "attn_deg": attn_deg,
-                "haze_app": haze_app,
-                "struct_deg": struct_deg,
-                "ir_adv": ir_adv,
-                "edge_vis": edge_vis,
-                "edge_ir": edge_ir,
-                "contrast_vis": contrast_vis,
-                "contrast_ir": contrast_ir,
-                "disc": ir_adv,
-                "disc_refined": P_pseudo,
+                "m_hard": m_hard,
+                "M": M,
             }
-        return P_fail, P_pseudo, tau, G_dec, P_support, G_soft, M_hard, haze_mask
+        return C, M, mask_logits
 
 
 # ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    from model.diagnose_loss import density_loss, mask_loss
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[cmdn] Device: {device}")
     m = CMDN().to(device)
-    x = torch.randn(1, 3, 256, 256).to(device)
-    y = torch.randn(1, 3, 256, 256).to(device)
-    P_fail, P_pseudo, tau, G_dec, P_support, G_soft, M_hard, haze_mask = m(x, y)
-    print(f"P_fail: {P_fail.shape}, P_pseudo: {P_pseudo.shape}, tau: {tau.shape}")
-    dbg = m(x, y, return_debug=True)
-    print(
-        f"Debug: g_fog={dbg['g_fog'].shape}, haze_app={dbg['haze_app'].shape}, "
-        f"struct_deg={dbg['struct_deg'].shape}, ir_adv={dbg['ir_adv'].shape}, "
-        f"P_pseudo_requires_grad={dbg['P_pseudo'].requires_grad}"
-    )
-    trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
-    frozen   = sum(p.numel() for p in m.parameters() if not p.requires_grad)
-    print(f"Trainable: {trainable:,}  Frozen: {frozen:,}")
-    print("[cmdn] Smoke test PASSED")
+    xv = torch.randn(2, 3, 256, 256).to(device)
+    xi = torch.randn(2, 3, 256, 256).to(device)
+    C, M, logits = m(xv, xi)
+    assert C.shape == (2, 1, 256, 256) and M.shape == (2, 1, 256, 256)
+    assert C.min() >= 0 and C.max() <= 1
+    density_gt = torch.rand(2, 1, 256, 256).to(device)
+    mask_gt = (torch.rand(2, 1, 256, 256) > 0.5).float().to(device)
+    loss = density_loss(C, density_gt) + mask_loss(logits, mask_gt)
+    loss.backward()
+    n_grad = sum(p.grad is not None for p in m.parameters() if p.requires_grad)
+    clip_frozen = all(not p.requires_grad for p in m._clip_model.parameters())
+    required_modules = [m.vis_enc, m.ir_enc, m.fuse, m.head_density, m.head_mask]
+    assert clip_frozen
+    assert all(any(p.grad is not None for p in module.parameters() if p.requires_grad)
+               for module in required_modules)
+    print(f"[CMDN] forward OK, C{tuple(C.shape)} M{tuple(M.shape)}, params with grad: {n_grad}")
+    print("[CMDN] smoke test PASSED")
