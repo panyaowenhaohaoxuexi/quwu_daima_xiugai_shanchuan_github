@@ -1,4 +1,4 @@
-﻿"""
+﻿﻿"""
 这段Python代码是一个实验配置和初始化脚本。
 它使用 argparse 库来定义和解析一系列用于深度学习训练的命令行参数，如训练轮数、学习率、损失权重和保存路径等。
 在解析参数后，它会自动检测PyTorch是否可以使用CUDA（GPU），并相应地设置 opt.device。
@@ -64,6 +64,7 @@ parser.add_argument('--gumbel_tau_start', default=1.0, type=float, help='initial
 parser.add_argument('--gumbel_tau_end', default=0.1, type=float, help='final Gumbel-Sigmoid temperature')
 parser.add_argument('--run_real_infer_in_teacher', type=str2bool, nargs='?', const=True, default=False,
                     help='run real-domain inference during Teacher training; default off for synthetic Teacher training')
+
 parser.add_argument('--save_train_batch_region_vis', type=str2bool, nargs='?', const=True, default=False,
                     help='是否保存合成训练 batch 的监督可视化 teacher_region_vis；默认关闭，避免和真实域中间可视化混淆')
 
@@ -72,9 +73,9 @@ parser.add_argument('--save_train_batch_region_vis', type=str2bool, nargs='?', c
 # =========================================
 # 【模型与日志保存路径】
 # =========================================
-parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/Sup3_canny/Teacher_xunlian/saved_model',
+parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/quwu_daima_xiugai_shanchuan_github/Teacher_xunlian/saved_model',
                     help='模型权重(.pth)保存目录')
-parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/Sup3_canny/Teacher_xunlian/saved_data',
+parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/quwu_daima_xiugai_shanchuan_github/Teacher_xunlian/saved_data',
                     help='训练日志(log.txt)、损失(losses.npy)、指标(ssims.npy/psnrs.npy)保存目录')
 
 # =========================================
@@ -86,14 +87,14 @@ parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/Sup3
 #   train_data_dir/Transmission_Map_GT/
 #   train_data_dir/IR_Completion_Mask_GT/
 # =========================================
-parser.add_argument('--train_data_dir', type=str, default='/root/autodl-tmp/FLIR_zengqiang/train',
+parser.add_argument('--train_data_dir', type=str, default='/root/autodl-tmp/1_FLIR_M3FD/1_FLIR_autodl/1_train',
                     help='训练集根目录，需包含 clear/ hazy/ ir/ Transmission_Map_GT/ IR_Completion_Mask_GT/')
 
 # =========================================
 # 【验证/测试数据集路径】 (有雾图 + 红外图 + 清晰图GT)
 #   子目录结构: test_data_dir/hazy/, ir/, clear/
 # =========================================
-parser.add_argument('--test_data_dir', type=str, default='/root/autodl-tmp/FLIR_zengqiang/test',
+parser.add_argument('--test_data_dir', type=str, default='/root/autodl-tmp/1_FLIR_M3FD/1_FLIR_autodl/2_test',
                     help='测试集根目录，内含 hazy/ ir/ clear/ 三个子文件夹')
 
 # =========================================
@@ -101,9 +102,9 @@ parser.add_argument('--test_data_dir', type=str, default='/root/autodl-tmp/FLIR_
 #   使用训练得到的 Teacher 模型，对 real_test_hazy_path / real_test_ir_path 下的数据进行去雾。
 #   输出最终 pred_clear 去雾图，保存到 real_test_output_dir/epoch_N/。
 # =========================================
-parser.add_argument('--real_test_hazy_path', type=str, default='/root/autodl-tmp/dense_haze/hazy',
+parser.add_argument('--real_test_hazy_path', type=str, default='/root/autodl-tmp/1_FLIR_M3FD/1_FLIR_autodl/3_train_test/hazy',
                     help='真实域普通测试用有雾可见光图像文件夹')
-parser.add_argument('--real_test_ir_path', type=str, default='/root/autodl-tmp/dense_haze/ir',
+parser.add_argument('--real_test_ir_path', type=str, default='/root/autodl-tmp/1_FLIR_M3FD/1_FLIR_autodl/3_train_test/ir',
                     help='真实域普通测试用红外图像文件夹，文件名需与可见光一一对应')
 
 # =========================================
@@ -111,9 +112,9 @@ parser.add_argument('--real_test_ir_path', type=str, default='/root/autodl-tmp/d
 #   使用当前训练中的 Teacher 模型，对 specific 路径下的数据进行前向推理。
 #   只保存 overview 图到 saved_data_dir/real_vis/epoch_N/。
 # =========================================
-parser.add_argument('--real_test_specific_hazy_dir', type=str, default='',
+parser.add_argument('--real_test_specific_hazy_dir', type=str, default='/root/autodl-tmp/1_FLIR_M3FD/1_FLIR_autodl/3_train_test/hazy',
                     help='训练中真实域中间过程可视化用有雾可见光目录；留空则跳过中间可视化')
-parser.add_argument('--real_test_specific_ir_dir', type=str, default='',
+parser.add_argument('--real_test_specific_ir_dir', type=str, default='/root/autodl-tmp/1_FLIR_M3FD/1_FLIR_autodl/3_train_test/ir',
                     help='训练中真实域中间过程可视化用红外图像目录，文件名需与可见光一一对应；留空则跳过中间可视化')
 parser.add_argument('--real_vis_max_images', default=8, type=int,
                     help='训练中真实域中间过程 overview 每个 epoch 最多保存的样本数；<=0 表示全部保存，不影响普通真实域测试')
@@ -122,7 +123,7 @@ parser.add_argument('--real_vis_max_images', default=8, type=int,
 # 【真实域普通测试 — 输出路径】
 # =========================================
 parser.add_argument('--real_test_output_dir', type=str,
-                    default='/root/autodl-tmp/Sup3_canny/train_test/Teacher_guocheng_test',
+                    default='/root/autodl-tmp/quwu_daima_xiugai_shanchuan_github/train_test/Teacher_guocheng_test',
                     help='真实域普通测试去雾结果输出根目录，结果保存在 epoch_N/ 子文件夹下')
 
 # =========================================
