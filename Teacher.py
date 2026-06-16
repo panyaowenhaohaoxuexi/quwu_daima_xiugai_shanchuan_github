@@ -38,7 +38,7 @@ from option.Teacher import opt  # 导入配置选项
 # --- [新增] 导入 Eval.py 所需的模块 ---
 import glob
 import torchvision
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 from torchvision.transforms import Compose, ToTensor, Normalize, Resize, InterpolationMode
 
@@ -144,6 +144,50 @@ def _panel_3ch(x, size, mode='bilinear'):
     if x.shape[1] == 3:
         return x
     return x[:, :1].repeat(1, 3, 1, 1)
+
+
+def _tensor_to_pil_img(x):
+    x = x.detach().cpu().clamp(0.0, 1.0)
+    x = (x * 255).byte()
+    return Image.fromarray(x.permute(1, 2, 0).numpy())
+
+
+def _text_size(draw, text, font):
+    if hasattr(draw, "textbbox"):
+        box = draw.textbbox((0, 0), text, font=font)
+        return box[2] - box[0], box[3] - box[1]
+    return draw.textsize(text, font=font)
+
+
+def _draw_centered_text(draw, box, text, font, fill=(20, 20, 20)):
+    x0, y0, x1, y1 = box
+    text_w, text_h = _text_size(draw, text, font)
+    x = x0 + max(0, (x1 - x0 - text_w) // 2)
+    y = y0 + max(0, (y1 - y0 - text_h) // 2)
+    draw.text((x, y), text, fill=fill, font=font)
+
+
+def _save_real_overview(panels, save_path):
+    titles = ["Hazy", "IR", "Pred", "Density_pred", "Mask_prob", "Binary_mask"]
+    panel_size = 192
+    title_h = 32
+    padding = 6
+    width = len(titles) * panel_size
+    height = title_h + panel_size
+    canvas = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+
+    for col, title in enumerate(titles):
+        x0 = col * panel_size
+        _draw_centered_text(draw, (x0, 0, x0 + panel_size, title_h), title, font)
+        image = _tensor_to_pil_img(panels[col].squeeze(0))
+        if padding > 0:
+            resample = Image.NEAREST if title == "Binary_mask" else Image.BILINEAR
+            image = image.resize((panel_size - 2 * padding, panel_size - 2 * padding), resample)
+        canvas.paste(image, (x0 + padding, title_h + padding))
+
+    canvas.save(save_path)
 
 
 def dehaze(model, vis_image_path, ir_image_path, folder):
@@ -263,18 +307,17 @@ def run_real_world_visualization(model, epoch, hazy_dir, ir_dir):
                     haze_vis_resized, haze_ir_resized, h, w = _resize_to_model_multiple(haze_vis, haze_ir)
                     out = model(haze_vis_resized, haze_ir_resized, return_dict=True)
 
-                    binary_panel = _panel_3ch((out["binary_mask"] >= 0.5).float(), (h, w), mode="nearest")
+                    binary_panel = _panel_3ch((out["binary_mask"] >= 0.5).float(), (192, 192), mode="nearest")
                     panels = [
-                        _panel_3ch(_denorm_clip(haze_vis), (h, w)),
-                        _panel_3ch(_denorm_clip(haze_ir), (h, w)),
-                        _panel_3ch(out["pred_clear"], (h, w), mode='bicubic'),
-                        _panel_3ch(out["density_map"], (h, w)),
-                        _panel_3ch(out["mask_prob"], (h, w)),
+                        _panel_3ch(_denorm_clip(haze_vis), (192, 192)),
+                        _panel_3ch(_denorm_clip(haze_ir), (192, 192)),
+                        _panel_3ch(out["pred_clear"], (192, 192), mode='bicubic'),
+                        _panel_3ch(out["density_map"], (192, 192)),
+                        _panel_3ch(out["mask_prob"], (192, 192)),
                         binary_panel,
                     ]
-                    overview = torch.cat(panels, dim=3)
                     save_path = os.path.join(output_folder, f"{stem}_overview.png")
-                    torchvision.utils.save_image(overview, save_path)
+                    _save_real_overview(panels, save_path)
                 except FileNotFoundError as e:
                     print(f"\n[RealVis] error: missing image file {e}; skip.")
                 except Exception as e:
