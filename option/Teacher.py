@@ -40,9 +40,9 @@ parser.add_argument('--epochs', type=int, default=20)
 # 原始参数设置
 # parser.add_argument('--iters_per_epoch', type=int, default=5000)
 # 修改参数设置
-parser.add_argument('--iters_per_epoch', type=int, default=1000)
+parser.add_argument('--iters_per_epoch', type=int, default=5000)
 # 定义一个用于更精细评估的步数阈值
-parser.add_argument('--finer_eval_step', type=int, default=20000)
+parser.add_argument('--finer_eval_step', type=int, default=100000)
 # 定义初始学习率
 parser.add_argument('--start_lr', default=0.0001, type=float, help='start learning rate')
 # 定义结束学习率（用于学习率调度）
@@ -62,10 +62,12 @@ parser.add_argument('--w_loss_Edge', default=0.0, type=float,
 
 parser.add_argument('--gumbel_tau_start', default=1.0, type=float, help='initial Gumbel-Sigmoid temperature')
 parser.add_argument('--gumbel_tau_end', default=0.1, type=float, help='final Gumbel-Sigmoid temperature')
-parser.add_argument('--run_real_infer_in_teacher', type=str2bool, nargs='?', const=True, default=False,
+
+##
+parser.add_argument('--run_real_infer_in_teacher', type=str2bool, nargs='?', const=True, default=True,
                     help='run real-domain inference during Teacher training; default off for synthetic Teacher training')
 
-parser.add_argument('--save_train_batch_region_vis', type=str2bool, nargs='?', const=True, default=False,
+parser.add_argument('--save_train_batch_region_vis', type=str2bool, nargs='?', const=True, default=True,
                     help='是否保存合成训练 batch 的监督可视化 teacher_region_vis；默认关闭，避免和真实域中间可视化混淆')
 
 # --- 3. 定义文件和目录相关的参数 ---
@@ -125,7 +127,7 @@ parser.add_argument('--real_test_output_dir', type=str,
 # =========================================
 parser.add_argument('--exp_dir', type=str, default='./experiment',
                     help='实验记录根目录')
-parser.add_argument('--model_name', type=str, default='THaze',
+parser.add_argument('--model_name', type=str, default='1_FLIR_M3FD',
                     help='模型名称，用于构建实验子目录')
 parser.add_argument('--dataset', type=str, default='Teacher',
                     help='数据集名称，用于构建实验子目录')
