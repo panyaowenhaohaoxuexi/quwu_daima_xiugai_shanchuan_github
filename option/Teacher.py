@@ -51,6 +51,9 @@ parser.add_argument('--end_lr', default=0.000001, type=float, help='end learning
 parser.add_argument('--no_lr_sche', action='store_true', help='no lr cos schedule')
 # 定义 L1 损失的权重
 parser.add_argument('--w_loss_L1', default=0.8, type=float, help='weight of loss L1')
+parser.add_argument('--w_loss_rec', default=0.8, type=float, help='weight of supervised clear RGB reconstruction loss')
+parser.add_argument('--w_loss_density', default=1.0, type=float, help='weight of haze density L1 loss')
+parser.add_argument('--w_loss_mask', default=1.0, type=float, help='weight of IR completion mask BCE+Dice loss')
 # 定义 SSIM 损失的权重
 parser.add_argument('--w_loss_SSIM', default=0.2, type=float, help='weight of loss SSIM')
 # 定义 Cr (对比度) 损失的权重
@@ -94,6 +97,11 @@ parser.add_argument('--hard_gate_threshold', default=0.25, type=float,
 parser.add_argument('--margin_delta', default=0.10, type=float, help='minimum distance between P_fail and tau')
 parser.add_argument('--area_epsilon', default=0.03, type=float, help='tolerance for one-sided area upper-bound loss')
 # --- [新增结束] ---
+
+parser.add_argument('--gumbel_tau_start', default=1.0, type=float, help='initial Gumbel-Sigmoid temperature')
+parser.add_argument('--gumbel_tau_end', default=0.1, type=float, help='final Gumbel-Sigmoid temperature')
+parser.add_argument('--run_real_infer_in_teacher', type=str2bool, nargs='?', const=True, default=False,
+                    help='run real-domain inference during Teacher training; default off for synthetic Teacher training')
 
 # --- 3. 定义文件和目录相关的参数 ---
 

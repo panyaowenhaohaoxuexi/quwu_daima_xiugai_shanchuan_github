@@ -10,6 +10,8 @@ if __package__:
     from .vifnet_basic_modules import Encoder_B, Decoder_B, Conv_B, CPAB
     from .dsfe import DSFE
     from .cmdn import CMDN
+    from .hde import HDE
+    from .gumbel_sigmoid import GumbelSigmoidBinarizer
 else:
     CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
@@ -19,6 +21,8 @@ else:
     from vifnet_basic_modules import Encoder_B, Decoder_B, Conv_B, CPAB
     from dsfe import DSFE
     from cmdn import CMDN
+    from hde import HDE
+    from gumbel_sigmoid import GumbelSigmoidBinarizer
 # [已移除] CLIP 导入 — 颜色恢复改为纯图内 Cross-Attention
 
 
@@ -420,7 +424,12 @@ class Res2Net(nn.Module):
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
 
         # --- Pass 2 injection adapters for full IR content features ---
-        # ir_feat_list order: [H/16(1024ch), H/8(512ch), H/4(256ch)]
+        # ir_feat_list order: [H/16(1024ch), H/8(512ch), H/4(256ch), H/2(64ch)]
+        self.inject_conv0 = nn.Sequential(  # H/2: 64 -> 64
+            nn.Conv2d(64, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
         self.inject_conv1 = nn.Sequential(  # H/4: 256 -> 256
             nn.Conv2d(256, 256, kernel_size=1, bias=False),
             nn.BatchNorm2d(256),
@@ -465,7 +474,18 @@ class Res2Net(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x, ir_feat_list=None, beta_list=None, haze_mask=None):
+    def _density_guided_beta(self, vis_feat, ir_used, density_map, fusion_head, expected_channels):
+        density_s = F.interpolate(density_map, size=vis_feat.shape[2:], mode='bilinear', align_corners=False)
+        fusion_input = torch.cat([vis_feat, ir_used, density_s], dim=1)
+        assert fusion_input.shape[1] == expected_channels, (
+            f"fusion head channel mismatch: expected {expected_channels}, got {fusion_input.shape[1]}"
+        )
+        beta = fusion_head(fusion_input)
+        assert beta.shape[1] == 1, f"fusion beta should be single-channel, got {beta.shape[1]}"
+        return beta
+
+    def forward(self, x, ir_feat_list=None, beta_list=None, haze_mask=None,
+                density_map=None, fusion_weight_heads=None, return_region_debug=False):
         """
         [区域补全范式] Res2Net forward，按 HAPM 掩码严格分流：
           - M=1（补全区）：beta_eff=1，完整 IR 内容特征替代 VIS 特征
@@ -473,8 +493,8 @@ class Res2Net(nn.Module):
 
         ir_feat_list: 纯 IR 内容特征，来自 encoder_ir 的完整多尺度编码特征。
                       顺序为 [H/16, H/8, H/4]，通道分别为 [1024, 512, 256]。
-        beta_list:    来自 vis_structure 和 ir_structure 的逐像素融合权重。
-                      顺序为 [H/16, H/8, H/4]，每个尺度为单通道 beta map。
+        beta_list:    backward-compatible fallback. New Teacher passes density_map
+                      and fusion_weight_heads instead.
         haze_mask:    (B,1,H,W) 掩码，M=1 表示补全区域，M=0 表示融合区域。
                       外部传入时应已为二值或 straight-through binary-like；
                       严格替代只在 mask 值恰为 1 的位置保证。
@@ -505,12 +525,44 @@ class Res2Net(nn.Module):
         assert ir_feat_list[2].shape[1] == 256, \
             f"H/4 IR content feature should have 256 channels, got {ir_feat_list[2].shape[1]}"
 
+        if fusion_weight_heads is None and beta_list is None:
+            raise ValueError("Res2Net injection requires fusion_weight_heads+density_map or beta_list.")
+
+        fused_debug = {}
+
+        # --- H/2 shallow feature protection (conv1 output, 64ch) ---
+        if len(ir_feat_list) >= 4:
+            F_ir_0 = self.inject_conv0(ir_feat_list[3])
+            F_ir_0 = F.interpolate(F_ir_0, size=x_layer0.shape[2:], mode='bilinear', align_corners=False)
+            if fusion_weight_heads is not None:
+                if density_map is None:
+                    raise ValueError("density_map is required when using fusion_weight_heads.")
+                beta_0 = self._density_guided_beta(
+                    x_layer0, F_ir_0, density_map, fusion_weight_heads[3], 129
+                )
+            else:
+                beta_0 = F.interpolate(beta_list[3], size=x_layer0.shape[2:], mode='bilinear', align_corners=False)
+            if haze_mask is not None:
+                mask_0 = F.interpolate(haze_mask, size=x_layer0.shape[2:], mode='nearest')
+            else:
+                mask_0 = torch.zeros_like(beta_0)
+            fusion_0 = (1.0 - beta_0) * x_layer0 + beta_0 * F_ir_0
+            x_layer0_safe = mask_0 * F_ir_0 + (1.0 - mask_0) * fusion_0
+        else:
+            F_ir_0 = x_layer0
+            beta_0 = torch.zeros(x_layer0.shape[0], 1, x_layer0.shape[2], x_layer0.shape[3],
+                                 device=x_layer0.device, dtype=x_layer0.dtype)
+            x_layer0_safe = x_layer0
+
         # --- H/4 尺度 (layer1, 256ch) ---
         x_layer1_orig = self.layer1(x_maxpool)  # (B, 256, H/4, W/4)
         F_vis_1 = x_layer1_orig
         F_ir_1 = self.inject_conv1(ir_feat_list[2])  # H/4, 256->256, IR content
         F_ir_1 = F.interpolate(F_ir_1, size=F_vis_1.shape[2:], mode='bilinear', align_corners=False)
-        beta_1 = F.interpolate(beta_list[2], size=F_vis_1.shape[2:], mode='bilinear', align_corners=False)
+        if fusion_weight_heads is not None:
+            beta_1 = self._density_guided_beta(F_vis_1, F_ir_1, density_map, fusion_weight_heads[2], 513)
+        else:
+            beta_1 = F.interpolate(beta_list[2], size=F_vis_1.shape[2:], mode='bilinear', align_corners=False)
         if haze_mask is not None:
             mask_1 = F.interpolate(haze_mask, size=F_vis_1.shape[2:], mode='nearest')
         else:
@@ -523,7 +575,10 @@ class Res2Net(nn.Module):
         F_vis_2 = x_layer2_orig
         F_ir_2 = self.inject_conv2(ir_feat_list[1])  # H/8, 512->512, IR content
         F_ir_2 = F.interpolate(F_ir_2, size=F_vis_2.shape[2:], mode='bilinear', align_corners=False)
-        beta_2 = F.interpolate(beta_list[1], size=F_vis_2.shape[2:], mode='bilinear', align_corners=False)
+        if fusion_weight_heads is not None:
+            beta_2 = self._density_guided_beta(F_vis_2, F_ir_2, density_map, fusion_weight_heads[1], 1025)
+        else:
+            beta_2 = F.interpolate(beta_list[1], size=F_vis_2.shape[2:], mode='bilinear', align_corners=False)
         if haze_mask is not None:
             mask_2 = F.interpolate(haze_mask, size=F_vis_2.shape[2:], mode='nearest')
         else:
@@ -536,7 +591,10 @@ class Res2Net(nn.Module):
         F_vis_3 = x_layer3_orig
         F_ir_3 = self.inject_conv3(ir_feat_list[0])  # H/16, 1024->1024, IR content
         F_ir_3 = F.interpolate(F_ir_3, size=F_vis_3.shape[2:], mode='bilinear', align_corners=False)
-        beta_3 = F.interpolate(beta_list[0], size=F_vis_3.shape[2:], mode='bilinear', align_corners=False)
+        if fusion_weight_heads is not None:
+            beta_3 = self._density_guided_beta(F_vis_3, F_ir_3, density_map, fusion_weight_heads[0], 2049)
+        else:
+            beta_3 = F.interpolate(beta_list[0], size=F_vis_3.shape[2:], mode='bilinear', align_corners=False)
         if haze_mask is not None:
             mask_3 = F.interpolate(haze_mask, size=F_vis_3.shape[2:], mode='nearest')
         else:
@@ -545,8 +603,18 @@ class Res2Net(nn.Module):
         x_layer3_fused = (1.0 - beta_eff_3) * F_vis_3 + beta_eff_3 * F_ir_3
 
         # 返回 注入后(fused)的特征（解码用）和 注入前(orig)的特征（蒸馏用）
-        fused_outputs = [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0]
+        # H/2 uses x_layer0_safe to prevent visible shallow-feature leakage in completion regions.
+        fused_outputs = [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0_safe]
         original_outputs = [x_layer3_orig, x_layer2_orig, x_layer1_orig, x_layer0]
+
+        if return_region_debug:
+            fused_debug = {
+                "fused_feats": [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0_safe],
+                "ir_feats": [F_ir_3, F_ir_2, F_ir_1, F_ir_0],
+                "vis_feats": [F_vis_3, F_vis_2, F_vis_1, x_layer0],
+                "fusion_weights": [beta_3, beta_2, beta_1, beta_0],
+            }
+            return fused_outputs, original_outputs, fused_debug
 
         return fused_outputs, original_outputs
 
@@ -1129,16 +1197,23 @@ class VIFNetInconsistencyTeacher(nn.Module):
                  hard_gate_threshold=0.25):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
-        self.cmdn = CMDN(
-            tau_min=tau_min,
-            tau_max=tau_max,
-            gate_temperature=gate_temperature,
-            support_gamma=support_gamma,
-            support_floor=support_floor,
-            support_threshold=support_threshold,
-            support_temperature=support_temperature,
-            hard_gate_threshold=hard_gate_threshold,
+        # Kept only as an attribute name for legacy checkpoints/introspection.
+        # The new synthetic-domain Teacher forward never calls CMDN/Otsu/sky-mask routing.
+        self.cmdn = None
+
+        self.hde = HDE()
+        self.gumbel_binarizer = GumbelSigmoidBinarizer(tau=1.0, hard=True, threshold=0.5)
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(96, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1),
         )
+        self.fusion_weight_heads = nn.ModuleList([
+            nn.Sequential(nn.Conv2d(2049, 1, kernel_size=3, padding=1), nn.Sigmoid()),  # H/16
+            nn.Sequential(nn.Conv2d(1025, 1, kernel_size=3, padding=1), nn.Sigmoid()),  # H/8
+            nn.Sequential(nn.Conv2d(513, 1, kernel_size=3, padding=1), nn.Sigmoid()),   # H/4
+            nn.Sequential(nn.Conv2d(129, 1, kernel_size=3, padding=1), nn.Sigmoid()),   # H/2
+        ])
 
 
         # --- [新增] 阶段一 (Pass 1) 模块 (来自代码库 B) ---
@@ -1282,105 +1357,56 @@ class VIFNetInconsistencyTeacher(nn.Module):
     # --- [删除] _process_vis_decoder 和 _process_ir_stream ---
     # (这两个函数的功能将被内联并重构到新的 forward 方法中)
 
-    # --- [重写] forward 方法 ---
-    def forward(self, x_vis, x_ir, haze_mask=None, disc_alpha=0.0, sky_mask=None):
-        m_hard_out = None  # 仅在 haze_mask is None 分支赋值，用于边界平滑损失
-        P_fail = None
-        disc_pseudo = None
-        tau = None
-        G_dec = None
-        P_support = None
-        G_soft = None
+    def set_gumbel_tau(self, tau):
+        self.gumbel_binarizer.set_tau(tau)
 
-        if haze_mask is None:
-            # --- CMDN: Cross-Modal Decision Network mask estimation ---
-            P_fail, disc_pseudo, tau, G_dec, P_support, G_soft, m_hard, haze_mask = self.cmdn(
-                x_vis, x_ir, disc_alpha=disc_alpha, sky_mask=sky_mask
-            )
-            m_hard_out = m_hard  # 暴露给调用方用于 L_boundary
-        else:
-            m_hard_out = (haze_mask >= 0.5).float()
+    def _override_binary_mask(self, binary_mask, override_mask):
+        override_mask = override_mask.to(device=binary_mask.device, dtype=binary_mask.dtype)
+        if override_mask.dim() == 3:
+            override_mask = override_mask.unsqueeze(1)
+        override_mask = F.interpolate(override_mask, size=binary_mask.shape[2:], mode='nearest')
+        return (override_mask >= 0.5).float()
 
-        # --- 阶段一 & 二：并行结构提取 (Pass 1 - B 模块) ---
-        # (这部分保留，用于计算不一致性)
-        # 1a. VIS 流 (Pass 1) -> DSFE_vis
-        vis_b_fea1 = self.vis_layer1_b(x_vis)
-        vis_b_enc_features = self.encoder_b_vis(vis_b_fea1)  # [64, 128, 256]
-        vis_b_dec_features = self.decoder_b_vis(vis_b_enc_features)  # [64, 128, 256]
-        vis_structure = self.dsfe_vis(vis_b_enc_features, vis_b_dec_features)  # [64, 128, 256]
+    # --- [重写] forward 方法：合成域 HDE + Gumbel 区域补全主链路 ---
+    def forward(self, x_vis, x_ir, haze_mask=None, return_dict=False, debug_force_mask=None, **kwargs):
+        x_vis_01 = (x_vis * self.clip_input_std + self.clip_input_mean).clamp(0.0, 1.0)
+        density_map, density_feat = self.hde(x_vis_01, return_feat=True)
+        mask_logits = self.mask_head(density_feat)
+        mask_prob, binary_mask = self.gumbel_binarizer(mask_logits, is_logits=True)
 
-        # 1b. IR 流 (Pass 1) -> DSFE_ir
-        ir_b_fea1 = self.ir_layer1_b(x_ir)
-        ir_b_enc_features = self.encoder_b_ir(ir_b_fea1)  # [64, 128, 256]
-        ir_b_dec_features = self.decoder_b_ir(ir_b_enc_features)  # [64, 128, 256]
-        ir_structure = self.dsfe_ir(ir_b_enc_features, ir_b_dec_features)  # [64, 128, 256]
+        if haze_mask is not None:
+            binary_mask = self._override_binary_mask(binary_mask, haze_mask)
+        if debug_force_mask is not None:
+            binary_mask = self._override_binary_mask(binary_mask, debug_force_mask)
 
-        # --- 阶段三：构建 Pass 2 注入源 (区域补全范式) ---
-        # ir_structure 只用于估计 beta；实际补全/注入源来自 encoder_ir 的完整 IR 内容特征。
         ir_content_outputs, _ = self.encoder_ir(x_ir)
-        ir_content_feat_list = [
-            ir_content_outputs[0],  # H/16, 1024 channels
-            ir_content_outputs[1],  # H/8,  512 channels
-            ir_content_outputs[2],  # H/4,  256 channels
-        ]
 
-        # beta_list: 逐像素 IR 融合权重 β∈[0,1]
-        # β = ir_structure * (1 - vis_structure)，channel-mean 到单通道
-        # 物理含义：可见光结构丢失(vis_s↓) 且 红外结构可靠(ir_s↑) → β↑ → 该处更信 IR 内容特征
-        beta_list = []
-        for i in range(3):  # i=0:H/4, 1:H/8, 2:H/16
-            beta = (ir_structure[i] * (1.0 - vis_structure[i])).mean(dim=1, keepdim=True)
-            beta_list.append(beta)
-        beta_list = [beta_list[2], beta_list[1], beta_list[0]]  # 重排为 [H/16, H/8, H/4]
-
-        # --- 阶段四：精炼编码与注入（Pass 2 - A 模块）---
-        # M=1: 完整 IR 内容特征替代；M=0: beta-based VIS/IR 内容特征融合。
-        fused_outputs, original_outputs = self.encoder_vis(
+        fused_outputs, original_outputs, region_debug = self.encoder_vis(
             x_vis,
-            ir_content_feat_list,
-            beta_list,
-            haze_mask
+            ir_feat_list=ir_content_outputs,
+            haze_mask=binary_mask,
+            density_map=density_map,
+            fusion_weight_heads=self.fusion_weight_heads,
+            return_region_debug=True,
         )
 
-        # (fused_outputs)  [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0]
-        # (original_outputs) [x_layer3_orig, x_layer2_orig, x_layer1_orig, x_layer0]
+        x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0_safe = fused_outputs
 
-        # [用于蒸馏的 H 特征]
-        # (在注入 *之前* 的原始 A 模块 Encoder 特征上计算)
-        vis_h_features = [
-            self.H4_vis(self.CRA4_vis(original_outputs[3])),  # x_layer0
-            self.H3_vis(self.CRA3_vis(original_outputs[2])),  # x_layer1_orig
-            self.H2_vis(self.CRA2_vis(original_outputs[1])),  # x_layer2_orig
-            self.H1_vis(self.CRA1_vis(original_outputs[0]))  # x_layer3_orig
-        ]
-
-        # [用于解码的特征] (使用 fused_outputs)
-        x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0 = fused_outputs
-
-        # --- 阶段五：最终解码（Pass 2 - A 模块）---
-
-        # 5a. CRA 降维 (输入是已融合的特征)
-        res16x_vis = self.CRA1_vis(x_layer3_fused)  # (256)
-
-        # --- 颜色恢复：图内 Cross-Attention（K/V 只来自 M=0 可靠区）---
-        res16x_vis = self.color_restorer(res16x_vis, haze_mask)
-
-        res8x_vis = self.CRA2_vis(x_layer2_fused)  # (128)
-        res4x_vis = self.CRA3_vis(x_layer1_fused)  # (64)
-        res2x_vis = self.CRA4_vis(x_layer0)  # (32) (x_layer0 未被注入)
-
-        # 5b. 运行代码库 A 的 VIS 解码器
-        # (这部分逻辑来自 A 库的 _process_vis_decoder)
+        res16x_vis = self.CRA1_vis(x_layer3_fused)
+        res8x_vis = self.CRA2_vis(x_layer2_fused)
+        res4x_vis = self.CRA3_vis(x_layer1_fused)
+        res2x_vis = self.CRA4_vis(x_layer0_safe)
 
         in_ft = res16x_vis
         res16x_dehazed = self.dehaze_vis(in_ft) + res16x_vis
-        res16x_1, res16x_2 = res16x_dehazed.split([(res16x_dehazed.size(1) // 2), (res16x_dehazed.size(1) // 2)], dim=1)
+        res16x_1, res16x_2 = res16x_dehazed.split(
+            [(res16x_dehazed.size(1) // 2), (res16x_dehazed.size(1) // 2)], dim=1
+        )
         feature_mem_up = [res16x_1]
 
-        # Stage 1 (H/16 -> H/8)
         res16x_up = self.convd16x_vis(res16x_dehazed)
         res16x_up = F.interpolate(res16x_up, size=res8x_vis.size()[2:], mode='bilinear', align_corners=False)
-        res8x_fused = torch.add(res16x_up, res8x_vis)  # 跳跃连接 (使用已融合的 res8x_vis)
+        res8x_fused = torch.add(res16x_up, res8x_vis)
         res8x_dense = self.dense_4_vis(res8x_fused) + res8x_fused
         res8x_1, res8x_2 = res8x_dense.split([(res8x_dense.size(1) // 2), (res8x_dense.size(1) // 2)], dim=1)
         res8x_1 = self.fusion_4_vis(res8x_1, feature_mem_up)
@@ -1388,10 +1414,9 @@ class VIFNetInconsistencyTeacher(nn.Module):
         feature_mem_up.append(res8x_1)
         res8x_out = torch.cat((res8x_1, res8x_2), dim=1)
 
-        # Stage 2 (H/8 -> H/4)
         res8x_up = self.convd8x_vis(res8x_out)
         res8x_up = F.interpolate(res8x_up, size=res4x_vis.size()[2:], mode='bilinear', align_corners=False)
-        res4x_fused = torch.add(res8x_up, res4x_vis)  # 跳跃连接 (使用已融合的 res4x_vis)
+        res4x_fused = torch.add(res8x_up, res4x_vis)
         res4x_dense = self.dense_3_vis(res4x_fused) + res4x_fused
         res4x_1, res4x_2 = res4x_dense.split([(res4x_dense.size(1) // 2), (res4x_dense.size(1) // 2)], dim=1)
         res4x_1 = self.fusion_3_vis(res4x_1, feature_mem_up)
@@ -1399,10 +1424,9 @@ class VIFNetInconsistencyTeacher(nn.Module):
         feature_mem_up.append(res4x_1)
         res4x_out = torch.cat((res4x_1, res4x_2), dim=1)
 
-        # Stage 3 (H/4 -> H/2)
         res4x_up = self.convd4x_vis(res4x_out)
         res4x_up = F.interpolate(res4x_up, size=res2x_vis.size()[2:], mode='bilinear', align_corners=False)
-        res2x_fused = torch.add(res4x_up, res2x_vis)  # 跳跃连接 (使用已融合的 res2x_vis)
+        res2x_fused = torch.add(res4x_up, res2x_vis)
         res2x_dense = self.dense_2_vis(res2x_fused) + res2x_fused
         res2x_1, res2x_2 = res2x_dense.split([(res2x_dense.size(1) // 2), (res2x_dense.size(1) // 2)], dim=1)
         res2x_1 = self.fusion_2_vis(res2x_1, feature_mem_up)
@@ -1410,7 +1434,6 @@ class VIFNetInconsistencyTeacher(nn.Module):
         feature_mem_up.append(res2x_1)
         res2x_out = torch.cat((res2x_1, res2x_2), dim=1)
 
-        # Stage 4 (H/2 -> H)
         res2x_up = self.convd2x_vis(res2x_out)
         res2x_up = F.interpolate(res2x_up, size=x_vis.size()[2:], mode='bilinear', align_corners=False)
         x_fused = res2x_up
@@ -1418,89 +1441,37 @@ class VIFNetInconsistencyTeacher(nn.Module):
         x_1, x_2 = x_dense.split([(x_dense.size(1) // 2), (x_dense.size(1) // 2)], dim=1)
         x_1 = self.fusion_1_vis(x_1, feature_mem_up)
         x_2 = self.conv_1_vis(x_2)
-        vis_features = torch.cat((x_1, x_2), dim=1)  # (16 通道)
+        vis_features = torch.cat((x_1, x_2), dim=1)
 
-        # --- [修改] 保留 IR 流解码器 (用于跨模态损失) ---
-        # 5c. [运行 IR 流 (Pass 2)]
-        # (这部分用于获取最终融合所需的 ir_features)
-        ir_fused_outputs = ir_content_outputs  # 复用完整 IR 内容编码，避免重复计算 encoder_ir
-        ir_layer3, ir_layer2, ir_layer1, ir_layer0 = ir_fused_outputs
+        pred_clear = torch.sigmoid(self.conv_output(vis_features))
 
-        res16x_ir = self.CRA1_ir(ir_layer3)
-        res8x_ir = self.CRA2_ir(ir_layer2)
-        res4x_ir = self.CRA3_ir(ir_layer1)
-        res2x_ir = self.CRA4_ir(ir_layer0)
+        if return_dict:
+            return {
+                "pred_clear": pred_clear,
+                "density_map": density_map,
+                "mask_logits": mask_logits,
+                "mask_prob": mask_prob,
+                "binary_mask": binary_mask,
+                "fused_feats": region_debug["fused_feats"],
+                "ir_feats": region_debug["ir_feats"],
+                "vis_feats": region_debug["vis_feats"],
+                "fusion_weights": region_debug["fusion_weights"],
+            }
 
-        # (这部分逻辑来自 A 库的 _process_ir_stream)
-        in_ft_ir = res16x_ir
-        res16x_dehazed_ir = self.dehaze_ir(in_ft_ir) + res16x_ir
-        res16x_1_ir, res16x_2_ir = res16x_dehazed_ir.split(
-            [(res16x_dehazed_ir.size(1) // 2), (res16x_dehazed_ir.size(1) // 2)], dim=1)
-        feature_mem_up_ir = [res16x_1_ir]
-
-        res16x_up_ir = self.convd16x_ir(res16x_dehazed_ir)
-        res16x_up_ir = F.interpolate(res16x_up_ir, size=res8x_ir.size()[2:], mode='bilinear', align_corners=False)
-        res8x_fused_ir = torch.add(res16x_up_ir, res8x_ir)
-        res8x_dense_ir = self.dense_4_ir(res8x_fused_ir) + res8x_fused_ir
-        res8x_1_ir, res8x_2_ir = res8x_dense_ir.split([(res8x_dense_ir.size(1) // 2), (res8x_dense_ir.size(1) // 2)],
-                                                      dim=1)
-        res8x_1_ir = self.fusion_4_ir(res8x_1_ir, feature_mem_up_ir)
-        res8x_2_ir = self.conv_4_ir(res8x_2_ir)
-        feature_mem_up_ir.append(res8x_1_ir)
-        res8x_out_ir = torch.cat((res8x_1_ir, res8x_2_ir), dim=1)
-
-        res8x_up_ir = self.convd8x_ir(res8x_out_ir)
-        res8x_up_ir = F.interpolate(res8x_up_ir, size=res4x_ir.size()[2:], mode='bilinear', align_corners=False)
-        res4x_fused_ir = torch.add(res8x_up_ir, res4x_ir)
-        res4x_dense_ir = self.dense_3_ir(res4x_fused_ir) + res4x_fused_ir
-        res4x_1_ir, res4x_2_ir = res4x_dense_ir.split([(res4x_dense_ir.size(1) // 2), (res4x_dense_ir.size(1) // 2)],
-                                                      dim=1)
-        res4x_1_ir = self.fusion_3_ir(res4x_1_ir, feature_mem_up_ir)
-        res4x_2_ir = self.conv_3_ir(res4x_2_ir)
-        feature_mem_up_ir.append(res4x_1_ir)
-        res4x_out_ir = torch.cat((res4x_1_ir, res4x_2_ir), dim=1)
-
-        res4x_up_ir = self.convd4x_ir(res4x_out_ir)
-        res4x_up_ir = F.interpolate(res4x_up_ir, size=res2x_ir.size()[2:], mode='bilinear', align_corners=False)
-        res2x_fused_ir = torch.add(res4x_up_ir, res2x_ir)
-        res2x_dense_ir = self.dense_2_ir(res2x_fused_ir) + res2x_fused_ir
-        res2x_1_ir, res2x_2_ir = res2x_dense_ir.split([(res2x_dense_ir.size(1) // 2), (res2x_dense_ir.size(1) // 2)],
-                                                      dim=1)
-        res2x_1_ir = self.fusion_2_ir(res2x_1_ir, feature_mem_up_ir)
-        res2x_2_ir = self.conv_2_ir(res2x_2_ir)
-        res2x_out_ir = torch.cat((res2x_1_ir, res2x_2_ir), dim=1)
-
-        res2x_up_ir = self.convd2x_ir(res2x_out_ir)
-        res2x_up_ir = F.interpolate(res2x_up_ir, size=x_ir.size()[2:], mode='bilinear', align_corners=False)
-        x_fused_ir = res2x_up_ir
-        x_dense_ir = self.dense_1_ir(x_fused_ir) + x_fused_ir
-        x_1_ir, x_2_ir = x_dense_ir.split([(x_dense_ir.size(1) // 2), (x_dense_ir.size(1) // 2)], dim=1)
-        x_1_ir = self.fusion_1_ir(x_1_ir, feature_mem_up_ir)
-        x_2_ir = self.conv_1_ir(x_2_ir)
-        ir_features = torch.cat((x_1_ir, x_2_ir), dim=1)  # (16 通道)
-        # --- [保留 IR 流解码器结束] ---
-
-        # 5d. [修改] 移除最终融合，直接从 vis_features 输出
-
-        # (fused_attended_features 和 final_fusion 调用已被移除)
-        # (ir_features_to_fuse 的掩码逻辑也被移除，因为不再需要融合)
-
-        output = self.conv_output(vis_features)  # [修改] (16 -> 3)
-        # --- [修改结束] ---
-
-        # [修改] 返回融合前的特征 + mask 信息用于计算新损失
+        # Compatibility tuple: item 0 remains pred_clear. Item 4 is the new
+        # HDE/Gumbel binary_mask and no longer has old CMDN m_hard semantics.
         return (
-            output,
-            vis_h_features,
-            vis_features,
-            ir_features,
-            m_hard_out,
-            P_fail,
-            disc_pseudo,
-            tau,
-            G_dec,
-            P_support,
-            G_soft,
+            pred_clear,
+            None,
+            None,
+            None,
+            binary_mask,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
 
 

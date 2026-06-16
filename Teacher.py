@@ -23,11 +23,12 @@ from torch.backends import cudnn
 from torch.utils.data import DataLoader
 
 # --- [修改] 导入 SSIM, ContrastLoss 和 PerceptualLoss ---
-from loss import SSIM, ContrastLoss, PerceptualLoss, DiceLoss, BoundarySmoothnessLoss
+from loss import SSIM
+from loss.teacher_region_loss import compute_teacher_region_loss
 # --- [修改结束] ---
 
 # --- [修改] 导入新的数据集类和模型类 ---
-from data import MultiModalHazeDataset, TestDataset  # TestDataset 现在也支持三模态
+from data import MultiModalHazeDataset, TestDataset, SynthMultiModalDataset, collate_synth  # TestDataset 现在也支持三模态
 from metric import psnr, ssim
 # from model import DualStreamTeacher # <--- 不再使用原始模型
 from model import VIFNetInconsistencyTeacher, CannyEdgeDetector  # <--- 使用新的融合模型
@@ -43,6 +44,7 @@ from torchvision.transforms import Compose, ToTensor, Normalize, Resize, Interpo
 
 # --- [新增结束] ---
 from utils.visualize_mask import visualize_epoch_mask
+from utils.visualize_teacher_region import save_teacher_region_visualization
 # --- [新增] 将 device 和 transform 移至全局 ---
 # (以便 dehaze 函数和 train 函数都能访问)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -327,15 +329,11 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir):
 # 定义函数 train：执行模型训练的主要逻辑
 def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detector):
     """
-    执行教师模型的训练和评估过程。
+    执行合成域 Teacher 区域补全监督训练。
     """
     losses = []
-    # --- [修改] 增加 Edge, Style, CrossModal 日志 ---
-    loss_log = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'Boundary': [],
-                'Disc': [], 'Gate': [], 'Margin': [], 'Area': [], 'Outside': [], 'Bimodal': [], 'Sparse': [], 'total': []}
-    loss_log_tmp = {'L1': [], 'SSIM': [], 'Cr': [], 'Edge': [], 'Style': [], 'CrossModal': [], 'Boundary': [],
-                    'Disc': [], 'Gate': [], 'Margin': [], 'Area': [], 'Outside': [], 'Bimodal': [], 'Sparse': [], 'total': []}
-    # --- [修改结束] ---
+    loss_log = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'edge': [], 'total': []}
+    loss_log_tmp = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'edge': [], 'total': []}
     psnr_log = []
 
     start_step = 0
@@ -344,7 +342,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
     ssims = []
     psnrs = []
     loader_train_iter = iter(loader_train)
-
+    ssim_loss_module = criterion[1] if criterion and len(criterion) > 1 else None
 
     for step in range(start_step + 1, steps + 1):
         teacher_net.train()
@@ -354,267 +352,100 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             for param_group in optim.param_groups:
                 param_group["lr"] = lr
 
-        # --- [修改] 加载数据 (三模态) ---
         try:
             batch_data = next(loader_train_iter)
-            # 检查 collate_fn 是否返回了空元组
-            if not batch_data:
-                print(f"\n警告: 在步骤 {step} 跳过空批次 (collate_fn 返回空)。")
-                loader_train_iter = iter(loader_train)  # 重新迭代
-                continue  # 跳过这个空的 batch
-            if len(batch_data) == 3:
-                hazy_vis, infrared, clear_vis = batch_data
-                sky_mask = None
-            elif len(batch_data) == 4:
-                hazy_vis, infrared, clear_vis, sky_mask = batch_data
-            else:
-                print(f"\n警告: 在步骤 {step} 加载数据项数量错误 ({len(batch_data)})。跳过批次。")
-                loader_train_iter = iter(loader_train)  # 重新迭代
-                continue
         except StopIteration:
             loader_train_iter = iter(loader_train)
-            try:  # 尝试重新获取
+            try:
                 batch_data = next(loader_train_iter)
-                if not batch_data:
-                    print(f"\n警告: 在步骤 {step} (StopIteration后) 跳过空批次 (collate_fn 返回空)。")
-                    continue
-                if len(batch_data) == 3:
-                    hazy_vis, infrared, clear_vis = batch_data
-                    sky_mask = None
-                elif len(batch_data) == 4:
-                    hazy_vis, infrared, clear_vis, sky_mask = batch_data
-                else:
-                    print(f"\n警告: 在步骤 {step} (StopIteration后) 加载数据项数量错误 ({len(batch_data)})。跳过批次。")
-                    continue
-            except StopIteration:  # 如果重新获取还是失败
+            except StopIteration:
                 print("\n警告: 数据加载器在 epoch 开始时意外耗尽。")
-                break  # 提前结束训练可能更好
+                break
             except Exception as e:
                 print(f"\n错误: 在步骤 {step} (StopIteration后) 加载数据时出错: {e}。跳过批次。")
-                continue  # 跳过有问题的 batch
+                continue
         except Exception as e:
             print(f"\n错误: 在步骤 {step} 加载数据时出错: {e}。跳过批次。")
-            continue  # 跳过有问题的 batch
+            continue
 
-        # 移动到设备
+        if not batch_data or len(batch_data) != 5:
+            raise RuntimeError(
+                "New synthetic Teacher training requires hazy_vis, clear_vis, infrared, density_gt, mask_gt."
+            )
+
+        hazy_vis, clear_vis, infrared, density_gt, mask_gt = batch_data
+        if not hazy_vis.numel():
+            print(f"\n警告: 在步骤 {step} 跳过空批次。")
+            continue
+
         hazy_vis = hazy_vis.to(opt.device, non_blocking=True)
-        infrared = infrared.to(opt.device, non_blocking=True)
         clear_vis = clear_vis.to(opt.device, non_blocking=True)
-        if sky_mask is not None:
-            sky_mask = sky_mask.to(opt.device, non_blocking=True)
-        # --- [修改结束] ---
+        infrared = infrared.to(opt.device, non_blocking=True)
+        density_gt = density_gt.to(opt.device, non_blocking=True)
+        mask_gt = mask_gt.to(opt.device, non_blocking=True)
 
-        # --- [修改] 模型前向传播 (双输入)，接收11个输出 ---
-        # 训练时不使用掩码 (haze_mask=None)
-        # disc_alpha: cold-start schedule (first 5 epochs = 0, linear ramp to 1 by epoch 15)
-        steps_per_epoch_for_alpha = len(loader_train) if loader_train else opt.iters_per_epoch
-        epoch_idx = step // steps_per_epoch_for_alpha if steps_per_epoch_for_alpha > 0 else 0
-        disc_alpha = 0.0
-        if epoch_idx >= 5:
-            disc_alpha = min(1.0, (epoch_idx - 5) / 10.0)  # 5→15, linear 0→1
-        pred_image, vis_h_features, vis_features, ir_features, m_hard, P_fail, disc_pseudo, tau, G_dec, P_support, G_soft = \
-            teacher_net(hazy_vis, infrared, haze_mask=None, disc_alpha=disc_alpha, sky_mask=sky_mask)
-        # --- [修改结束] ---
-
-        # --- [修改] 计算损失 (使用 clear_vis 作为 GT) ---
-        # pred_image = teacher_out[0] # (已在解包时获取)
-
-        loss_L1 = criterion[0](pred_image, clear_vis) if opt.w_loss_L1 > 0 else torch.tensor(0.0).to(opt.device)
-        loss_SSIM = (1 - criterion[1](pred_image, clear_vis)) if opt.w_loss_SSIM > 0 else torch.tensor(0.0).to(
-            opt.device)
-        if opt.w_loss_Cr > 0 and criterion[2] is not None:
-            loss_Cr = criterion[2](pred_image, clear_vis, hazy_vis)  # ContrastLoss 可能需要原始 hazy 输入
+        tau_start = getattr(opt, "gumbel_tau_start", 1.0)
+        tau_end = getattr(opt, "gumbel_tau_end", 0.1)
+        progress = min(1.0, (step - 1) / max(1, steps - 1))
+        tau = tau_start + (tau_end - tau_start) * progress
+        if hasattr(teacher_net, "module"):
+            teacher_net.module.set_gumbel_tau(tau)
         else:
-            loss_Cr = torch.tensor(0.0).to(opt.device)
+            teacher_net.set_gumbel_tau(tau)
 
-        # --- 计算边缘损失 (与 GT) ---
-        loss_Edge = torch.tensor(0.0, device=opt.device)
-        # [修改] 确保 criterion[3] (L1损失) 存在
-        if opt.w_loss_Edge > 0 and edge_detector is not None and criterion[3] is not None:
-            try:
-                edge_pred = edge_detector(pred_image)
-                with torch.no_grad():
-                    # --- [修改] 将目标改为 clear_vis (Ground Truth) ---
-                    edge_gt_target = edge_detector(clear_vis)
-                    # 计算预测边缘和 GT 边缘之间的 L1 损失
-                loss_Edge = criterion[3](edge_pred, edge_gt_target.detach())
-            except Exception as e:
-                print(f"\n错误: 计算 Edge 损失失败: {e}")
-                loss_Edge = torch.tensor(0.0, device=opt.device)
+        out = teacher_net(hazy_vis, infrared, return_dict=True)
+        pred_image = out["pred_clear"]
 
-        # --- [新增] 计算风格损失 ---
-        loss_Style = torch.tensor(0.0, device=opt.device)
-        if opt.w_loss_Style > 0 and criterion[4] is not None:
-            # criterion[4] 是 PerceptualLoss
-            loss_Style = criterion[4](pred_image, clear_vis)
-        # --- [新增结束] ---
+        lambda_rec = getattr(opt, "w_loss_rec", getattr(opt, "w_loss_L1", 1.0))
+        lambda_density = getattr(opt, "w_loss_density", 1.0)
+        lambda_mask = getattr(opt, "w_loss_mask", 1.0)
+        lambda_ssim = getattr(opt, "w_loss_SSIM", 0.0)
+        lambda_edge = getattr(opt, "w_loss_Edge", 0.0)
 
-        # --- [新增] 计算跨模态一致性损失 ---
-        loss_CrossModal = torch.tensor(0.0, device=opt.device)
-        if opt.w_loss_CrossModal > 0 and criterion[5] is not None:
-            # criterion[5] 是 L1Loss
-            # 注意：我们 detach() ir_features，只把梯度传给 vis_features
-            # 这样可以鼓励 vis 流模仿 ir 流，而不必让 ir 流反过来模仿 vis 流
-            loss_CrossModal = criterion[5](vis_features, ir_features.detach())
-        # --- [新增结束] ---
-
-        # --- [新增] 计算边界平滑损失 ---
-        loss_Boundary = torch.tensor(0.0, device=opt.device)
-        if opt.w_loss_Boundary > 0 and criterion[6] is not None:
-            loss_Boundary = criterion[6](pred_image, m_hard, gt_image=clear_vis)
-        # --- [新增结束] ---
-
-        # --- [新增] CMDN 自适应区域决策损失 ---
-        region_ready = (
-            P_fail is not None and
-            disc_pseudo is not None and
-            tau is not None and
-            G_dec is not None and
-            P_support is not None and
-            G_soft is not None
+        loss_dict = compute_teacher_region_loss(
+            pred_clear=pred_image,
+            clear_gt=clear_vis,
+            density_map=out["density_map"],
+            density_gt=density_gt,
+            mask_logits=out["mask_logits"],
+            mask_prob=out["mask_prob"],
+            mask_gt=mask_gt,
+            lambda_rec=lambda_rec,
+            lambda_density=lambda_density,
+            lambda_mask=lambda_mask,
+            lambda_ssim=lambda_ssim,
+            lambda_edge=lambda_edge,
+            ssim_module=ssim_loss_module,
         )
-        zero = torch.tensor(0.0, device=opt.device)
-        if region_ready:
-            loss_Disc = F.binary_cross_entropy(
-                P_fail.clamp(1e-6, 1 - 1e-6),
-                disc_pseudo.detach().clamp(1e-6, 1 - 1e-6)
-            )
-            loss_Gate = F.binary_cross_entropy(
-                G_dec.clamp(1e-6, 1 - 1e-6),
-                P_support.detach().clamp(1e-6, 1 - 1e-6)
-            )
-            loss_Margin = F.relu(opt.margin_delta - torch.abs(P_fail - tau)).mean()
-            area_dec = G_dec.flatten(1).mean(dim=1)
-            area_pseudo = disc_pseudo.flatten(1).mean(dim=1).detach()
-            loss_Area = F.relu(area_dec - area_pseudo - opt.area_epsilon).pow(2).mean()
-            outside = (P_support.detach() < opt.support_threshold).float()
-            loss_Outside = (P_fail * outside).sum() / (outside.sum() + 1e-6)
-        else:
-            loss_Disc = loss_Gate = loss_Margin = loss_Area = zero
-            loss_Outside = torch.tensor(0.0, device=hazy_vis.device)
-        loss_Bimodal = zero
-        loss_Sparse = zero
-        # --- [新增结束] ---
+        loss = loss_dict["total"]
 
-        # --- [修改] 总损失 ---
-        loss = (opt.w_loss_L1 * loss_L1 +
-                opt.w_loss_SSIM * loss_SSIM +
-                opt.w_loss_Cr * loss_Cr +
-                opt.w_loss_Edge * loss_Edge +
-                opt.w_loss_Style * loss_Style +  # <-- 新增
-                opt.w_loss_CrossModal * loss_CrossModal +  # <-- 新增
-                opt.w_loss_Boundary * loss_Boundary +  # <-- 新增
-                opt.w_loss_Disc * loss_Disc +           # CMDN 新增
-                opt.w_loss_Gate * loss_Gate +
-                opt.w_loss_Margin * loss_Margin +
-                opt.w_loss_Area * loss_Area +
-                opt.w_loss_outside * loss_Outside)
-        # --- [修改结束] ---
-
-        # --- 反向传播和优化 ---
-        # 梯度清零（更推荐在 optimizer.step() 之后清零）
         optim.zero_grad()
         loss.backward()
         optim.step()
-        # optim.zero_grad() # 移到这里更好
 
-        # --- 记录和打印日志 ---
         losses.append(loss.item())
-        # 确保在记录 .item() 前检查是否为 Tensor
-        loss_log_tmp['L1'].append(loss_L1.item() if isinstance(loss_L1, torch.Tensor) else loss_L1)
-        loss_log_tmp['SSIM'].append(loss_SSIM.item() if isinstance(loss_SSIM, torch.Tensor) else loss_SSIM)
-        loss_log_tmp['Cr'].append(loss_Cr.item() if isinstance(loss_Cr, torch.Tensor) else loss_Cr)
-        # AAA
-        loss_log_tmp['Edge'].append(loss_Edge.item() if isinstance(loss_Edge, torch.Tensor) else loss_Edge)  # <-- [修改]
-        # --- [新增] ---
-        loss_log_tmp['Style'].append(loss_Style.item() if isinstance(loss_Style, torch.Tensor) else loss_Style)
-        loss_log_tmp['CrossModal'].append(
-            loss_CrossModal.item() if isinstance(loss_CrossModal, torch.Tensor) else loss_CrossModal)
-        # --- [新增结束] ---
-        loss_log_tmp['Boundary'].append(
-            loss_Boundary.item() if isinstance(loss_Boundary, torch.Tensor) else loss_Boundary)
-        # --- [新增 CMDN] ---
-        loss_log_tmp['Disc'].append(loss_Disc.item() if isinstance(loss_Disc, torch.Tensor) else loss_Disc)
-        loss_log_tmp['Gate'].append(loss_Gate.item() if isinstance(loss_Gate, torch.Tensor) else loss_Gate)
-        loss_log_tmp['Margin'].append(loss_Margin.item() if isinstance(loss_Margin, torch.Tensor) else loss_Margin)
-        loss_log_tmp['Area'].append(loss_Area.item() if isinstance(loss_Area, torch.Tensor) else loss_Area)
-        loss_log_tmp['Outside'].append(loss_Outside.item() if isinstance(loss_Outside, torch.Tensor) else loss_Outside)
-        loss_log_tmp['Bimodal'].append(loss_Bimodal.item() if isinstance(loss_Bimodal, torch.Tensor) else loss_Bimodal)
-        loss_log_tmp['Sparse'].append(loss_Sparse.item() if isinstance(loss_Sparse, torch.Tensor) else loss_Sparse)
-        # --- [新增结束] ---
+        for key in ("rec", "density", "mask", "ssim", "edge"):
+            loss_log_tmp[key].append(loss_dict[key].item())
         loss_log_tmp['total'].append(loss.item())
 
-        l1_val = (opt.w_loss_L1 * loss_L1.item()) if isinstance(loss_L1, torch.Tensor) and opt.w_loss_L1 > 0 else 0.0
-        ssim_val = (opt.w_loss_SSIM * loss_SSIM.item()) if isinstance(loss_SSIM,
-                                                                      torch.Tensor) and opt.w_loss_SSIM > 0 else 0.0
-        cr_val = (opt.w_loss_Cr * loss_Cr.item()) if isinstance(loss_Cr, torch.Tensor) and opt.w_loss_Cr > 0 else 0.0
-        # print(f'\rloss:{loss.item():.5f} | L1:{l1_val:.5f} | SSIM:{ssim_val:.5f} | Cr:{cr_val:.5f}  | step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}', end='', flush=True)
-        # AAA
-        edge_val = (opt.w_loss_Edge * loss_Edge.item()) if isinstance(loss_Edge,
-                                                                      torch.Tensor) and opt.w_loss_Edge > 0 else 0.0  # <-- [修改]
-        # --- [新增] ---
-        style_val = (opt.w_loss_Style * loss_Style.item()) if isinstance(loss_Style,
-                                                                         torch.Tensor) and opt.w_loss_Style > 0 else 0.0
-        crossmodal_val = (opt.w_loss_CrossModal * loss_CrossModal.item()) if isinstance(loss_CrossModal,
-                                                                                        torch.Tensor) and opt.w_loss_CrossModal > 0 else 0.0
-        # --- [新增结束] ---
+        with torch.no_grad():
+            train_psnr = psnr(pred_image.detach().clamp(0, 1), clear_vis)
+            train_ssim = ssim(pred_image.detach().clamp(0, 1), clear_vis).item()
+            mask_ratio = out["binary_mask"].mean().item()
+            density_mean = out["density_map"].mean().item()
 
-        bnd_val = (opt.w_loss_Boundary * loss_Boundary.item()) if isinstance(loss_Boundary,
-                                                                               torch.Tensor) and opt.w_loss_Boundary > 0 else 0.0
-        # --- [新增 CMDN] ---
-        disc_val = (opt.w_loss_Disc * loss_Disc.item()) if isinstance(loss_Disc,
-                                                                       torch.Tensor) and opt.w_loss_Disc > 0 else 0.0
-        gate_val = (opt.w_loss_Gate * loss_Gate.item()) if isinstance(loss_Gate,
-                                                                      torch.Tensor) and opt.w_loss_Gate > 0 else 0.0
-        margin_val = (opt.w_loss_Margin * loss_Margin.item()) if isinstance(loss_Margin,
-                                                                            torch.Tensor) and opt.w_loss_Margin > 0 else 0.0
-        area_val = (opt.w_loss_Area * loss_Area.item()) if isinstance(loss_Area,
-                                                                      torch.Tensor) and opt.w_loss_Area > 0 else 0.0
-        outside_val = (opt.w_loss_outside * loss_Outside.item()) if isinstance(loss_Outside,
-                                                                               torch.Tensor) and opt.w_loss_outside > 0 else 0.0
-        bimodal_val = 0.0
-        sparse_val = 0.0
-        tau_mean = tau.mean().item() if tau is not None else 0.0
-        G_dec_mean = G_dec.mean().item() if G_dec is not None else 0.0
-        G_soft_mean = G_soft.mean().item() if G_soft is not None else 0.0
-        support_mean = P_support.mean().item() if P_support is not None else 0.0
-        M_hard_mean = m_hard.mean().item() if m_hard is not None else 0.0
-        G_dec_max = G_dec.max().item() if G_dec is not None else 0.0
-        if G_soft is not None:
-            G_soft_max = G_soft.max().item()
-            G_soft_p95 = torch.quantile(G_soft.detach().flatten(), 0.95).item()
-        else:
-            G_soft_max = 0.0
-            G_soft_p95 = 0.0
-        support_max = P_support.max().item() if P_support is not None else 0.0
-        support_area = (P_support >= opt.support_threshold).float().mean().item() if P_support is not None else 0.0
-        M_hard_ratio = m_hard.mean().item() if m_hard is not None else 0.0
-        # --- [新增结束] ---
-
-        # AAA
-
-        # AAA
-        # --- [修改] 更新打印 ---
         print(
-            f'\rloss:{loss.item():.5f} | L1:{l1_val:.5f} | SSIM:{ssim_val:.5f} | Cr:{cr_val:.5f} | Edge:{edge_val:.5f} '
-            f'| Style:{style_val:.5f} | CrossM:{crossmodal_val:.5f} '  # <-- 新增
-            f'| Bnd:{bnd_val:.5f} '
-            f'| Disc:{disc_val:.5f} | Gate:{gate_val:.5f} | Margin:{margin_val:.5f} | Area:{area_val:.5f} | Out:{outside_val:.5f} '
-            f'| Bim:{bimodal_val:.5f} | Spar:{sparse_val:.5f} '
-            f'| tau:{tau_mean:.4f} | G_dec:{G_dec_mean:.4f} | G_soft:{G_soft_mean:.4f} '
-            f'| support:{support_mean:.4f} | M_hard:{M_hard_mean:.4f} '
-            f'| Gd_max:{G_dec_max:.3f} | Gs_max:{G_soft_max:.3f} | Gs_p95:{G_soft_p95:.3f} '
-            f'| sup_max:{support_max:.3f} | sup_area:{support_area:.4f} | M_ratio:{M_hard_ratio:.4f} '
+            f'\rloss:{loss.item():.5f} | rec:{loss_dict["rec"].item():.5f} '
+            f'| density:{loss_dict["density"].item():.5f} | mask:{loss_dict["mask"].item():.5f} '
+            f'| ssim_loss:{loss_dict["ssim"].item():.5f} | edge:{loss_dict["edge"].item():.5f} '
+            f'| mask_ratio:{mask_ratio:.4f} | density_mean:{density_mean:.4f} | tau:{tau:.4f} '
+            f'| PSNR:{train_psnr:.4f} | SSIM:{train_ssim:.4f} '
             f'| step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}',
             end='', flush=True)
-        # --- [修改结束] ---
-        # AAA
 
-        # --- 保存损失记录和执行评估的逻辑 ---
-        steps_per_epoch = len(loader_train) if loader_train else 0  # 获取每个 epoch 的步数
+        steps_per_epoch = len(loader_train) if loader_train else 0
         # Epoch 结束统计
         if steps_per_epoch > 0 and step % steps_per_epoch == 0:
-            # 重新初始化迭代器，确保下一轮能正确开始
             try:
                 loader_train_iter = iter(loader_train)
             except Exception as e:
@@ -630,74 +461,23 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             except Exception as e:
                 print(f"\n错误: 保存 losses.npy 失败: {e}")
 
-            # ---- Epoch 结束：保存掩码可视化 (使用用户指定文件夹的图像) ----
-            mask_vis_dir = opt.real_test_specific_hazy_dir if opt.real_test_specific_hazy_dir else opt.real_test_hazy_path
-            if mask_vis_dir and os.path.isdir(mask_vis_dir):
-                try:
-                    # 加载指定文件夹的前4张图像
-                    vis_images = sorted(glob.glob(os.path.join(mask_vis_dir, '*.jpg')) +
-                                        glob.glob(os.path.join(mask_vis_dir, '*.png')) +
-                                        glob.glob(os.path.join(mask_vis_dir, '*.jpeg')))
-                    if vis_images:
-                        # 缩放尺寸，防止大图 OOM（取训练尺寸 256 或 512，这里用 max_size=512）
-                        mask_vis_resize = Resize((512, 512), interpolation=InterpolationMode.BICUBIC, antialias=True)
-                        vis_tensors = []
-                        ir_tensors = []
-                        sky_tensors = []
-                        mask_vis_ir_dir = opt.real_test_specific_ir_dir if opt.real_test_specific_ir_dir else opt.real_test_ir_path
-                        mask_vis_sky_dir = opt.real_test_specific_sky_mask_dir if opt.real_test_specific_sky_mask_dir else opt.real_test_sky_mask_dir
-                        mask_vis_use_sky = bool(mask_vis_sky_dir) and os.path.isdir(mask_vis_sky_dir)
-                        for img_path in vis_images[:4]:
-                            vis_tensor = transform(mask_vis_resize(Image.open(img_path).convert("RGB")))
-                            vis_tensors.append(vis_tensor)
-                            # 找对应的红外图
-                            base_name = os.path.basename(img_path)
-                            ir_path = os.path.join(mask_vis_ir_dir, base_name)
-                            if os.path.exists(ir_path):
-                                ir_tensor = transform(mask_vis_resize(Image.open(ir_path).convert("RGB")))
-                            else:
-                                # 没有红外图就用可见光图占位
-                                ir_tensor = vis_tensor.clone()
-                            ir_tensors.append(ir_tensor)
-                            if mask_vis_use_sky:
-                                sky_path = find_sky_mask_path(
-                                    mask_vis_sky_dir,
-                                    base_name,
-                                    suffix=opt.sky_mask_suffix,
-                                    ext=opt.sky_mask_ext
-                                )
-                                if sky_path is not None:
-                                    sky_tensor = transform_mask(mask_vis_resize(Image.open(sky_path).convert("L")))
-                                    sky_tensor = (sky_tensor >= 0.5).float()
-                                else:
-                                    print(f"\n[mask_vis] 未找到 {base_name} 对应的 sky mask；使用全黑 mask。")
-                                    sky_tensor = torch.zeros(1, 512, 512)
-                                sky_tensors.append(sky_tensor)
-
-                        vis_batch = torch.stack(vis_tensors)  # (N, 3, H, W)
-                        ir_batch = torch.stack(ir_tensors)
-                        sky_batch = torch.stack(sky_tensors) if sky_tensors else None
-
-                        # 释放显存碎片后再做可视化
-                        torch.cuda.empty_cache()
-
-                        epoch_idx = step // steps_per_epoch
-                        visualize_epoch_mask(
-                            model      = teacher_net,
-                            vis_batch  = vis_batch,
-                            ir_batch   = ir_batch,
-                            epoch      = epoch_idx,
-                            save_dir   = opt.saved_data_dir,
-                            n_samples  = vis_batch.shape[0],
-                            device     = opt.device,
-                            disc_alpha = disc_alpha,
-                            sky_mask_batch = sky_batch
-                        )
-                    else:
-                        print(f"\n[mask_vis] 在 {mask_vis_dir} 中未找到图像，跳过。")
-                except Exception as e:
-                    print(f"\n[mask_vis] 可视化失败，跳过: {e}")
-            # ----------------------------------------
+            try:
+                epoch_idx = step // steps_per_epoch
+                save_teacher_region_visualization(
+                    opt.saved_data_dir,
+                    f"epoch_{epoch_idx}",
+                    hazy_vis.detach().cpu(),
+                    infrared.detach().cpu(),
+                    pred_image.detach().cpu(),
+                    clear_vis.detach().cpu(),
+                    out["density_map"].detach().cpu(),
+                    density_gt.detach().cpu(),
+                    out["mask_prob"].detach().cpu(),
+                    out["binary_mask"].detach().cpu(),
+                    mask_gt.detach().cpu(),
+                )
+            except Exception as e:
+                print(f"\n[teacher_region_vis] 可视化失败，跳过: {e}")
 
         # 确定评估频率 (与之前逻辑保持一致)
         eval_freq_fine = 5 * steps_per_epoch if steps_per_epoch > 0 else opt.iters_per_epoch
@@ -766,17 +546,15 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             except Exception as e:
                 print(f"\n错误: 保存模型权重失败 (epoch {current_epoch}): {e}")
 
-            # --- [新增] 调用真实世界测试 ---
-            # (使用刚保存的 teacher_net 模型在真实数据上运行推理，输出到 opt.real_test_output_dir)
-            hazy_source = opt.real_test_specific_hazy_dir if opt.real_test_specific_hazy_dir else opt.real_test_hazy_path
-            ir_source = opt.real_test_specific_ir_dir if opt.real_test_specific_ir_dir else opt.real_test_ir_path
-            run_real_world_test(
-                teacher_net,
-                current_epoch,
-                hazy_source,
-                ir_source
-            )
-            # --- [新增结束] ---
+            if getattr(opt, "run_real_infer_in_teacher", False):
+                hazy_source = opt.real_test_specific_hazy_dir if opt.real_test_specific_hazy_dir else opt.real_test_hazy_path
+                ir_source = opt.real_test_specific_ir_dir if opt.real_test_specific_ir_dir else opt.real_test_ir_path
+                run_real_world_test(
+                    teacher_net,
+                    current_epoch,
+                    hazy_source,
+                    ir_source
+                )
 
             os.makedirs(opt.saved_data_dir, exist_ok=True)
             try:
@@ -959,32 +737,16 @@ if __name__ == "__main__":
     train_base_dir = opt.train_data_dir  # 训练集根目录
     test_base_dir = opt.test_data_dir  # 测试集根目录
 
-    # 训练数据集路径
-    hazy_vis_folder = os.path.join(train_base_dir, 'hazy')
-    ir_folder = os.path.join(train_base_dir, 'ir')
-    clear_vis_folder = os.path.join(train_base_dir, 'clear')
-    print("[SkyMask][Train] use_train_sky_mask=", opt.use_train_sky_mask)
-    print("[SkyMask][Train] train_sky_mask_dir=", opt.train_sky_mask_dir)
-    print("[SkyMask][Train] sky_mask_suffix=", opt.sky_mask_suffix)
-    print("[SkyMask][Train] sky_mask_ext=", opt.sky_mask_ext)
-    print("[SkyMask][Train] require_train_sky_mask=", opt.require_train_sky_mask)
+    # 训练数据集路径：合成域五元组 hazy_vis, clear_vis, infrared, density_gt, mask_gt
     try:
-        train_set = MultiModalHazeDataset(
-            hazy_visible_path=hazy_vis_folder,
-            infrared_path=ir_folder,
-            clear_visible_path=clear_vis_folder,
+        train_set = SynthMultiModalDataset(
+            root=train_base_dir,
             train=True,
-            size=256,  # 训练时使用随机裁剪
-            format='auto',  # 自动兼容 jpg/png/multi-level 数据集
-            sky_mask_path=opt.train_sky_mask_dir,
-            use_sky_mask=opt.use_train_sky_mask,
-            sky_mask_suffix=opt.sky_mask_suffix,
-            sky_mask_ext=opt.sky_mask_ext,
-            require_sky_mask=opt.require_train_sky_mask
+            size=256,
         )
         print(f"成功加载训练数据集，共 {len(train_set)} 个样本。")
     except Exception as e:
-        print(f"错误: 初始化训练数据集 MultiModalHazeDataset 失败: {e}")
+        print(f"错误: 初始化训练数据集 SynthMultiModalDataset 失败: {e}")
         train_set = None  # 设置为 None 以便后续检查
         exit()  # 训练集加载失败则退出
 
@@ -1028,7 +790,7 @@ if __name__ == "__main__":
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
-            collate_fn=collate_fn_skip_none,
+            collate_fn=collate_synth,
             pin_memory=True,  # 如果内存充足，可以加速数据传输
             drop_last=True  # 丢弃最后一个不完整的 batch，避免 BN 层问题
         )
@@ -1060,15 +822,8 @@ if __name__ == "__main__":
     teacher_net = teacher_net.to(opt.device)
     # --- [修改结束] ---
 
-    # AAA
-    # --- [新增] 初始化边缘检测器 ---
-    edge_detector = CannyEdgeDetector().to(opt.device)
-    # 确保它不参与训练（Sobel 没有可训练参数，但这是个好习惯）
-    for param in edge_detector.parameters():
-        param.requires_grad = False
-    edge_detector.eval()
-    # --- [新增结束] ---
-    # AAA
+    # 新区域 loss 内部使用 Sobel edge；不再初始化旧 Canny/Boundary/CrossModal 链路。
+    edge_detector = None
 
     epoch_size = len(loader_train) if loader_train else 0
     if epoch_size == 0:
@@ -1089,67 +844,8 @@ if __name__ == "__main__":
         print(f"计算总参数量时出错: {e}")
     print("------------------------------------------------------------------")
 
-    # --- [修改] 损失函数和优化器 ---
-    criterion = []
-    # criterion[0]: L1 Loss (用于 L1)
-    criterion.append(nn.L1Loss().to(opt.device))
-    # criterion[1]: SSIM Loss
-    criterion.append(SSIM().to(opt.device))
-
-    # --- [代码修改：按需加载 ContrastLoss] ---
-    # criterion[2]: Contrast Loss
-    contrast_loss_instance = None
-    if opt.w_loss_Cr > 0:  # 检查权重是否大于0
-        try:
-            contrast_loss_instance = ContrastLoss(ablation=False).to(opt.device)
-            criterion.append(contrast_loss_instance)
-            print(f"已加载 ContrastLoss (权重: {opt.w_loss_Cr})。")
-        except Exception as e:
-            # 如果 ContrastLoss 初始化失败（例如缺少 VGG 权重），则禁用它
-            print(f"错误: 初始化 ContrastLoss 失败: {e}。将 Cr 损失权重设为 0。")
-            criterion.append(None)
-            opt.w_loss_Cr = 0  # 禁用对比度损失
-    else:
-        print("ContrastLoss (Cr) 已禁用 (权重为 0)，不加载 VGG。")
-        criterion.append(None)
-    # --- [修改结束] ---
-
-    # 确保 criterion 列表长度至少为 3
-    while len(criterion) < 3:
-        criterion.append(None)
-
-    # --- [修改] criterion[3]: 使用 Dice Loss (用于 Edge Loss) ---
-    criterion.append(DiceLoss().to(opt.device))
-    # --- [修改结束] ---
-
-    # --- [代码修改：按需加载 Style Loss] ---
-    # criterion[4]: Style Loss (PerceptualLoss)
-    style_loss_instance = None
-    if opt.w_loss_Style > 0:  # 检查权重是否大于0
-        # 我们只关心风格，所以 content_weight=0.0, style_weight=1.0
-        try:
-            style_loss_instance = PerceptualLoss(content_weight=0.0, style_weight=1.0).to(opt.device)
-            criterion.append(style_loss_instance)
-            print(f"已加载 Style Loss (权重: {opt.w_loss_Style})。")
-        except Exception as e:
-            print(f"警告: 初始化 PerceptualLoss (Style Loss) 失败: {e}。将 w_loss_Style 设为 0。")
-            criterion.append(None)
-            opt.w_loss_Style = 0
-    else:
-        print("Style Loss (Style) 已禁用 (权重为 0)，不加载 VGG。")
-        criterion.append(None)
-    # --- [修改结束] ---
-
-    # criterion[5]: Cross-Modal Consistency Loss (L1)
-    criterion.append(nn.L1Loss().to(opt.device))
-    # --- [新增结束] ---
-
-    # criterion[6]: Boundary Smoothness Loss
-    criterion.append(BoundarySmoothnessLoss(
-        band_k=opt.boundary_band_k, lambda_edge=opt.boundary_lambda_edge
-    ).to(opt.device))
-
-    # --- [修改结束] ---
+    # 新合成域 Teacher 只需要 SSIM module 供 compute_teacher_region_loss 复用。
+    criterion = [nn.L1Loss().to(opt.device), SSIM().to(opt.device)]
 
     # Adam 优化器
     optimizer = optim.Adam(params=filter(lambda x: x.requires_grad, teacher_net.parameters()), lr=opt.start_lr,

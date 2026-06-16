@@ -1,6 +1,7 @@
 from .vifnet_basic_modules import *
 from .dsfe import *
 from .hde import *
+from .gumbel_sigmoid import *
 
 from .Teacher import *
 from .Student import *

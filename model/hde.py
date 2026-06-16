@@ -1,30 +1,35 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.ops import DeformConv2d
+
+try:
+    from torchvision.ops import DeformConv2d as _TorchvisionDeformConv2d
+except Exception:
+    _TorchvisionDeformConv2d = None
 
 
-def differentiable_otsu(q_complete, num_bins=256, delta=0.02, temperature=0.01):
-    """Differentiable Otsu threshold for a batch of single-channel maps."""
-    b = q_complete.shape[0]
-    q = q_complete.reshape(b, -1)
-    bins = torch.linspace(0, 1, num_bins, device=q_complete.device, dtype=q_complete.dtype)
+class _FallbackDeformConv2d(nn.Module):
+    """Conv2d fallback with the same forward(x, offset) interface."""
 
-    diff = q.unsqueeze(-1) - bins.view(1, 1, num_bins)
-    hist = torch.exp(-(diff ** 2) / (2 * delta ** 2)).sum(dim=1)
-    hist = hist / (hist.sum(dim=1, keepdim=True) + 1e-6)
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0,
+                 dilation=1, groups=1, bias=True):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
 
-    bin_values = bins.view(1, num_bins)
-    p1 = torch.cumsum(hist, dim=1)
-    mu1 = torch.cumsum(hist * bin_values, dim=1)
-    mu_total = mu1[:, -1:]
-    p2 = 1 - p1
-    mu2 = (mu_total - mu1) / (p2 + 1e-6)
-    sigma_b = p1 * p2 * (mu1 / (p1 + 1e-6) - mu2) ** 2
+    def forward(self, x, offset):
+        return self.conv(x)
 
-    weights = torch.softmax(sigma_b / temperature, dim=1)
-    tau = (weights * bin_values).sum(dim=1).view(b, 1, 1, 1)
-    return tau
+
+DeformConv2d = _TorchvisionDeformConv2d or _FallbackDeformConv2d
 
 
 class HDE(nn.Module):
@@ -98,7 +103,7 @@ class HDE(nn.Module):
         nn.init.zeros_(self.offset_conv2.weight)
         nn.init.zeros_(self.offset_conv2.bias)
 
-    def forward(self, x_vis_01):
+    def forward(self, x_vis_01, return_feat=False):
         # Stage 1
         f = self.conv_init(x_vis_01)            # (B, 32, H, W)
 
@@ -124,4 +129,6 @@ class HDE(nn.Module):
         M_vis = torch.sigmoid(
             self.attn_conv(torch.cat([gap, gmp], dim=1))
         )                                        # (B, 1, H, W)
+        if return_feat:
+            return M_vis, fm
         return M_vis

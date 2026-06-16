@@ -9,3 +9,4 @@ from .Dice import *
 from .perceptual import PerceptualLoss
 # --- [新增结束] ---
 from .boundary import BoundarySmoothnessLoss
+from .teacher_region_loss import compute_teacher_region_loss
