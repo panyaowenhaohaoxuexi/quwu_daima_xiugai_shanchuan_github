@@ -55,6 +55,7 @@ transform = Compose([
 # --- [新增结束] ---
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
+REAL_PROBE_COLUMNS = ["Hazy", "IR", "Pred", "Density_pred", "Mask_prob", "Binary_mask"]
 
 # 训练轮次
 start_time = time.time()
@@ -167,25 +168,31 @@ def _draw_centered_text(draw, box, text, font, fill=(20, 20, 20)):
     draw.text((x, y), text, fill=fill, font=font)
 
 
-def _save_real_overview(panels, save_path):
-    titles = ["Hazy", "IR", "Pred", "Density_pred", "Mask_prob", "Binary_mask"]
+def save_real_probe_overview(samples, save_path):
     panel_size = 192
     title_h = 32
+    row_label_w = 90
     padding = 6
-    width = len(titles) * panel_size
-    height = title_h + panel_size
+    width = row_label_w + len(REAL_PROBE_COLUMNS) * panel_size
+    height = title_h + len(samples) * panel_size
     canvas = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(canvas)
     font = ImageFont.load_default()
 
-    for col, title in enumerate(titles):
-        x0 = col * panel_size
+    for col, title in enumerate(REAL_PROBE_COLUMNS):
+        x0 = row_label_w + col * panel_size
         _draw_centered_text(draw, (x0, 0, x0 + panel_size, title_h), title, font)
-        image = _tensor_to_pil_img(panels[col].squeeze(0))
-        if padding > 0:
-            resample = Image.NEAREST if title == "Binary_mask" else Image.BILINEAR
-            image = image.resize((panel_size - 2 * padding, panel_size - 2 * padding), resample)
-        canvas.paste(image, (x0 + padding, title_h + padding))
+
+    for row, panels in enumerate(samples):
+        y0 = title_h + row * panel_size
+        _draw_centered_text(draw, (0, y0, row_label_w, y0 + panel_size), f"Scene {row + 1}", font)
+        for col, title in enumerate(REAL_PROBE_COLUMNS):
+            x0 = row_label_w + col * panel_size
+            image = _tensor_to_pil_img(panels[col].squeeze(0))
+            if padding > 0:
+                resample = Image.NEAREST if title == "Binary_mask" else Image.BILINEAR
+                image = image.resize((panel_size - 2 * padding, panel_size - 2 * padding), resample)
+            canvas.paste(image, (x0 + padding, y0 + padding))
 
     canvas.save(save_path)
 
@@ -280,14 +287,13 @@ def run_real_world_visualization(model, epoch, hazy_dir, ir_dir):
     os.makedirs(output_folder, exist_ok=True)
     vis_images = _list_real_images(hazy_dir)
     max_images = getattr(opt, "real_vis_max_images", 8)
-    if max_images > 0:
-        vis_images = vis_images[:max_images]
 
     if not vis_images:
         print(f"[RealVis] warning: no supported images found in {hazy_dir}.")
         return
 
     print(f"\n[RealVis] Epoch {epoch} overview -> {output_folder}")
+    samples = []
     was_training = model.training
     model.eval()
     try:
@@ -307,21 +313,53 @@ def run_real_world_visualization(model, epoch, hazy_dir, ir_dir):
                     haze_vis_resized, haze_ir_resized, h, w = _resize_to_model_multiple(haze_vis, haze_ir)
                     out = model(haze_vis_resized, haze_ir_resized, return_dict=True)
 
-                    binary_panel = _panel_3ch((out["binary_mask"] >= 0.5).float(), (192, 192), mode="nearest")
+                    pred_clear = F.interpolate(
+                        out["pred_clear"],
+                        size=(h, w),
+                        mode="bicubic",
+                        align_corners=False,
+                    ).clamp(0.0, 1.0)
+                    density_map = F.interpolate(
+                        out["density_map"],
+                        size=(h, w),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).clamp(0.0, 1.0)
+                    mask_prob = F.interpolate(
+                        out["mask_prob"],
+                        size=(h, w),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).clamp(0.0, 1.0)
+                    binary_mask = F.interpolate(
+                        (out["binary_mask"] >= 0.5).float(),
+                        size=(h, w),
+                        mode="nearest",
+                    ).clamp(0.0, 1.0)
+
                     panels = [
                         _panel_3ch(_denorm_clip(haze_vis), (192, 192)),
                         _panel_3ch(_denorm_clip(haze_ir), (192, 192)),
-                        _panel_3ch(out["pred_clear"], (192, 192), mode='bicubic'),
-                        _panel_3ch(out["density_map"], (192, 192)),
-                        _panel_3ch(out["mask_prob"], (192, 192)),
-                        binary_panel,
+                        _panel_3ch(pred_clear, (192, 192), mode="bicubic"),
+                        _panel_3ch(density_map, (192, 192)),
+                        _panel_3ch(mask_prob, (192, 192)),
+                        _panel_3ch(binary_mask, (192, 192), mode="nearest"),
                     ]
-                    save_path = os.path.join(output_folder, f"{stem}_overview.png")
-                    _save_real_overview(panels, save_path)
+                    samples.append(panels)
+                    if max_images > 0 and len(samples) >= max_images:
+                        break
                 except FileNotFoundError as e:
                     print(f"\n[RealVis] error: missing image file {e}; skip.")
                 except Exception as e:
                     print(f"\n[RealVis] error processing {base_filename}: {e}; skip.")
+
+            if not samples:
+                print(f"[RealVis] warning: no valid paired hazy/IR samples found in hazy_dir={hazy_dir}, ir_dir={ir_dir}")
+                return
+
+            save_path = os.path.join(output_folder, "overview.png")
+            save_real_probe_overview(samples, save_path)
+            print(f"[RealVis] saved real-domain probe overview: {save_path}")
     finally:
         if was_training:
             model.train()
@@ -482,23 +520,24 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
             except Exception as e:
                 print(f"\n错误: 保存 losses.npy 失败: {e}")
 
-            try:
-                epoch_idx = step // steps_per_epoch
-                save_teacher_region_visualization(
-                    opt.saved_data_dir,
-                    f"epoch_{epoch_idx}",
-                    hazy_vis.detach().cpu(),
-                    infrared.detach().cpu(),
-                    pred_image.detach().cpu(),
-                    clear_vis.detach().cpu(),
-                    out["density_map"].detach().cpu(),
-                    density_gt.detach().cpu(),
-                    out["mask_prob"].detach().cpu(),
-                    out["binary_mask"].detach().cpu(),
-                    mask_gt.detach().cpu(),
-                )
-            except Exception as e:
-                print(f"\n[teacher_region_vis] 可视化失败，跳过: {e}")
+            if getattr(opt, "save_train_batch_region_vis", False):
+                try:
+                    epoch_idx = step // steps_per_epoch
+                    save_teacher_region_visualization(
+                        opt.saved_data_dir,
+                        f"epoch_{epoch_idx}",
+                        hazy_vis.detach().cpu(),
+                        infrared.detach().cpu(),
+                        pred_image.detach().cpu(),
+                        clear_vis.detach().cpu(),
+                        out["density_map"].detach().cpu(),
+                        density_gt.detach().cpu(),
+                        out["mask_prob"].detach().cpu(),
+                        out["binary_mask"].detach().cpu(),
+                        mask_gt.detach().cpu(),
+                    )
+                except Exception as e:
+                    print(f"\n[teacher_region_vis] 可视化失败，跳过: {e}")
 
         # 确定评估频率 (与之前逻辑保持一致)
         eval_freq_fine = 5 * steps_per_epoch if steps_per_epoch > 0 else opt.iters_per_epoch
@@ -574,13 +613,14 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
                     opt.real_test_hazy_path,
                     opt.real_test_ir_path
                 )
-                if opt.real_test_specific_hazy_dir and opt.real_test_specific_ir_dir:
-                    run_real_world_visualization(
-                        teacher_net,
-                        current_epoch,
-                        opt.real_test_specific_hazy_dir,
-                        opt.real_test_specific_ir_dir
-                    )
+
+            if opt.real_test_specific_hazy_dir and opt.real_test_specific_ir_dir:
+                run_real_world_visualization(
+                    teacher_net,
+                    current_epoch,
+                    opt.real_test_specific_hazy_dir,
+                    opt.real_test_specific_ir_dir
+                )
 
             os.makedirs(opt.saved_data_dir, exist_ok=True)
             try:

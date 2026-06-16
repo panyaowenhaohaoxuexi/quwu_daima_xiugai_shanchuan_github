@@ -64,6 +64,8 @@ parser.add_argument('--gumbel_tau_start', default=1.0, type=float, help='initial
 parser.add_argument('--gumbel_tau_end', default=0.1, type=float, help='final Gumbel-Sigmoid temperature')
 parser.add_argument('--run_real_infer_in_teacher', type=str2bool, nargs='?', const=True, default=False,
                     help='run real-domain inference during Teacher training; default off for synthetic Teacher training')
+parser.add_argument('--save_train_batch_region_vis', type=str2bool, nargs='?', const=True, default=False,
+                    help='是否保存合成训练 batch 的监督可视化 teacher_region_vis；默认关闭，避免和真实域中间可视化混淆')
 
 # --- 3. 定义文件和目录相关的参数 ---
 
