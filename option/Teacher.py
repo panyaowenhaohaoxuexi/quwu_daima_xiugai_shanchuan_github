@@ -1,4 +1,4 @@
-﻿﻿"""
+﻿"""
 这段Python代码是一个实验配置和初始化脚本。
 它使用 argparse 库来定义和解析一系列用于深度学习训练的命令行参数，如训练轮数、学习率、损失权重和保存路径等。
 在解析参数后，它会自动检测PyTorch是否可以使用CUDA（GPU），并相应地设置 opt.device。
@@ -99,32 +99,26 @@ parser.add_argument('--test_data_dir', type=str, default='/root/autodl-tmp/1_FLI
 
 # =========================================
 # 【真实域普通测试 — 输入路径】
-#   使用训练得到的 Teacher 模型，对 real_test_hazy_path / real_test_ir_path 下的数据进行去雾。
-#   输出最终 pred_clear 去雾图，保存到 real_test_output_dir/epoch_N/。
+#   训练评估节点统一使用 real_test_hazy_path / real_test_ir_path 做真实域测试。
+#   输出 6 列 overview 到 real_test_output_dir/epoch_N/overview.png。
 # =========================================
 parser.add_argument('--real_test_hazy_path', type=str, default='/root/autodl-tmp/1_FLIR_M3FD/1_FLIR_autodl/3_train_test/hazy',
-                    help='真实域普通测试用有雾可见光图像文件夹')
+                    help='训练中真实域测试和 overview 可视化用有雾可见光图像文件夹')
 parser.add_argument('--real_test_ir_path', type=str, default='/root/autodl-tmp/1_FLIR_M3FD/1_FLIR_autodl/3_train_test/ir',
-                    help='真实域普通测试用红外图像文件夹，文件名需与可见光一一对应')
+                    help='训练中真实域测试和 overview 可视化用红外图像文件夹，文件名需与可见光一一对应')
 
 # =========================================
-# 【训练中真实域中间过程可视化 — 输入路径】
-#   使用当前训练中的 Teacher 模型，对 specific 路径下的数据进行前向推理。
-#   只保存 overview 图到 saved_data_dir/real_vis/epoch_N/。
+# 【真实域测试 — overview 样本数】
 # =========================================
-parser.add_argument('--real_test_specific_hazy_dir', type=str, default='/root/autodl-tmp/1_FLIR_M3FD/1_FLIR_autodl/3_train_test/hazy',
-                    help='训练中真实域中间过程可视化用有雾可见光目录；留空则跳过中间可视化')
-parser.add_argument('--real_test_specific_ir_dir', type=str, default='/root/autodl-tmp/1_FLIR_M3FD/1_FLIR_autodl/3_train_test/ir',
-                    help='训练中真实域中间过程可视化用红外图像目录，文件名需与可见光一一对应；留空则跳过中间可视化')
 parser.add_argument('--real_vis_max_images', default=8, type=int,
-                    help='训练中真实域中间过程 overview 每个 epoch 最多保存的样本数；<=0 表示全部保存，不影响普通真实域测试')
+                    help='真实域 overview 每个 epoch 最多展示的有效 hazy/IR 配对样本数；<=0 表示全部保存')
 
 # =========================================
 # 【真实域普通测试 — 输出路径】
 # =========================================
 parser.add_argument('--real_test_output_dir', type=str,
                     default='/root/autodl-tmp/quwu_daima_xiugai_shanchuan_github/train_test/Teacher_guocheng_test',
-                    help='真实域普通测试去雾结果输出根目录，结果保存在 epoch_N/ 子文件夹下')
+                    help='真实域测试结果输出根目录，overview 保存到 epoch_N/overview.png')
 
 # =========================================
 # 【实验记录路径】 (args.txt 配置存档，与训练无关)

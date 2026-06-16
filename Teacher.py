@@ -37,7 +37,6 @@ from option.Teacher import opt  # 导入配置选项
 
 # --- [新增] 导入 Eval.py 所需的模块 ---
 import glob
-import torchvision
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 from torchvision.transforms import Compose, ToTensor, Normalize, Resize, InterpolationMode
@@ -197,62 +196,32 @@ def save_real_probe_overview(samples, save_path):
     canvas.save(save_path)
 
 
-def dehaze(model, vis_image_path, ir_image_path, folder):
-    """
-    使用加载的双流模型对单张可见光/红外图像进行去雾，并保存 pred_clear。
-    模型 eval/train 状态由调用方管理。
-    """
-    try:
-        haze_vis = transform(Image.open(vis_image_path).convert("RGB")).unsqueeze(0).to(device)
-        haze_ir = transform(Image.open(ir_image_path).convert("RGB")).unsqueeze(0).to(device)
-        haze_vis_resized, haze_ir_resized, h, w = _resize_to_model_multiple(haze_vis, haze_ir)
-
-        pred_output = model(haze_vis_resized, haze_ir_resized)
-
-        if isinstance(pred_output, tuple):
-            out_tensor = pred_output[0]
-        else:
-            out_tensor = pred_output
-
-        out = F.interpolate(
-            out_tensor,
-            size=(h, w),
-            mode='bicubic',
-            align_corners=False,
-        ).clamp(0.0, 1.0).squeeze(0)
-
-        output_filename = os.path.basename(vis_image_path)
-        torchvision.utils.save_image(out, os.path.join(folder, output_filename))
-
-    except FileNotFoundError as e:
-        print(f"\n错误: 找不到图像文件 {e}。跳过。")
-    except Exception as e:
-        base_name = os.path.basename(vis_image_path)
-        print(f"\n处理图像 {base_name} 时发生错误: {e}。跳过。")
-
-
 def run_real_world_test(model, epoch, hazy_dir, ir_dir):
     """
-    在指定的真实（无标签）数据集上运行普通推理，只保存最终 pred_clear。
+    在训练评估节点执行真实域测试。
+    输入只来自 real_test_hazy_path / real_test_ir_path。
+    输出 6 列 overview: Hazy | IR | Pred | Density_pred | Mask_prob | Binary_mask。
+    保存位置: real_test_output_dir/epoch_{epoch}/overview.png。
     """
     if not hazy_dir or not ir_dir:
-        print("[RealTest] hazy_dir or ir_dir is empty, skip real-domain final inference.")
+        print("[RealTest] hazy_dir or ir_dir is empty, skip real-domain overview.")
         return
 
     if not os.path.isdir(hazy_dir) or not os.path.isdir(ir_dir):
         print(f"[RealTest] invalid dirs: hazy_dir={hazy_dir}, ir_dir={ir_dir}, skip.")
         return
 
-    output_folder = os.path.join(opt.real_test_output_dir, f'epoch_{epoch}')
+    output_folder = os.path.join(opt.real_test_output_dir, f"epoch_{epoch}")
     os.makedirs(output_folder, exist_ok=True)
-    print(f"\n正在对真实世界图像运行推理 (Epoch {epoch}) -> 保存至 {output_folder}")
-
     vis_images = _list_real_images(hazy_dir)
+    max_images = getattr(opt, "real_vis_max_images", 8)
 
     if not vis_images:
-        print(f"警告: 在 {hazy_dir} 中未找到图像文件。")
+        print(f"[RealTest] warning: no supported images found in {hazy_dir}.")
         return
 
+    print(f"[RealTest] Epoch {epoch} overview -> {output_folder}")
+    samples = []
     was_training = model.training
     model.eval()
     try:
@@ -264,47 +233,6 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir):
                 ir_path = find_paired_image(ir_dir, stem)
                 if ir_path is None:
                     print(f"\n[RealTest] warning: no paired IR image for {base_filename}; skip.")
-                    continue
-                dehaze(model, vis_path, ir_path, output_folder)
-    finally:
-        if was_training:
-            model.train()
-
-
-def run_real_world_visualization(model, epoch, hazy_dir, ir_dir):
-    """
-    在真实域 specific 数据上保存训练中间过程 overview。
-    """
-    if not hazy_dir or not ir_dir:
-        print("[RealVis] hazy_dir or ir_dir is empty, skip real-domain overview visualization.")
-        return
-
-    if not os.path.isdir(hazy_dir) or not os.path.isdir(ir_dir):
-        print(f"[RealVis] invalid dirs: hazy_dir={hazy_dir}, ir_dir={ir_dir}, skip.")
-        return
-
-    output_folder = os.path.join(opt.saved_data_dir, "real_vis", f"epoch_{epoch}")
-    os.makedirs(output_folder, exist_ok=True)
-    vis_images = _list_real_images(hazy_dir)
-    max_images = getattr(opt, "real_vis_max_images", 8)
-
-    if not vis_images:
-        print(f"[RealVis] warning: no supported images found in {hazy_dir}.")
-        return
-
-    print(f"\n[RealVis] Epoch {epoch} overview -> {output_folder}")
-    samples = []
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} | {rate_fmt}"
-            for vis_path in tqdm(vis_images, bar_format=bar_format, desc=f"Epoch {epoch} 真实可视化"):
-                base_filename = os.path.basename(vis_path)
-                stem = os.path.splitext(base_filename)[0]
-                ir_path = find_paired_image(ir_dir, stem)
-                if ir_path is None:
-                    print(f"\n[RealVis] warning: no paired IR image for {base_filename}; skip.")
                     continue
 
                 try:
@@ -349,17 +277,17 @@ def run_real_world_visualization(model, epoch, hazy_dir, ir_dir):
                     if max_images > 0 and len(samples) >= max_images:
                         break
                 except FileNotFoundError as e:
-                    print(f"\n[RealVis] error: missing image file {e}; skip.")
+                    print(f"\n[RealTest] error: missing image file {e}; skip.")
                 except Exception as e:
-                    print(f"\n[RealVis] error processing {base_filename}: {e}; skip.")
+                    print(f"\n[RealTest] error processing {base_filename}: {e}; skip.")
 
             if not samples:
-                print(f"[RealVis] warning: no valid paired hazy/IR samples found in hazy_dir={hazy_dir}, ir_dir={ir_dir}")
+                print(f"[RealTest] warning: no valid paired hazy/IR samples found in hazy_dir={hazy_dir}, ir_dir={ir_dir}")
                 return
 
             save_path = os.path.join(output_folder, "overview.png")
             save_real_probe_overview(samples, save_path)
-            print(f"[RealVis] saved real-domain probe overview: {save_path}")
+            print(f"[RealTest] saved real-domain overview: {save_path}")
     finally:
         if was_training:
             model.train()
@@ -612,19 +540,6 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
                     current_epoch,
                     opt.real_test_hazy_path,
                     opt.real_test_ir_path
-                )
-
-# 排查错误
-            print(f"[RealVisDebug] perform_eval epoch={current_epoch}, saved_data_dir={opt.saved_data_dir}, "
-                f"specific_hazy={opt.real_test_specific_hazy_dir}, specific_ir={opt.real_test_specific_ir_dir}")
-
-
-            if opt.real_test_specific_hazy_dir and opt.real_test_specific_ir_dir:
-                run_real_world_visualization(
-                    teacher_net,
-                    current_epoch,
-                    opt.real_test_specific_hazy_dir,
-                    opt.real_test_specific_ir_dir
                 )
 
             os.makedirs(opt.saved_data_dir, exist_ok=True)
