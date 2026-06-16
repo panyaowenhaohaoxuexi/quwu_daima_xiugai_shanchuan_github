@@ -871,6 +871,7 @@ if __name__ == "__main__":
         contrast_loss_module,
     ]
 
+
     # Adam 优化器
     optimizer = optim.Adam(params=filter(lambda x: x.requires_grad, teacher_net.parameters()), lr=opt.start_lr,
                            betas=(0.9, 0.999),
