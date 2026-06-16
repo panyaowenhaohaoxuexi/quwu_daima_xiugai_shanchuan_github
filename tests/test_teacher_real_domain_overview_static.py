@@ -15,6 +15,13 @@ def _function_body(source, name):
     return source[start:end]
 
 
+def _argument_block(source, name):
+    start = source.index(f"parser.add_argument('--{name}'")
+    next_arg = source.find("\nparser.add_argument(", start + 1)
+    end = len(source) if next_arg == -1 else next_arg
+    return source[start:end]
+
+
 def test_specific_probe_options_and_visualization_entrypoint_are_removed():
     teacher_py = _read("Teacher.py")
     option_teacher_py = _read("option/Teacher.py")
@@ -74,8 +81,15 @@ def test_train_real_domain_trigger_is_only_run_real_infer_in_teacher():
 def test_train_batch_region_visualization_remains_default_off_and_gated():
     option_teacher_py = _read("option/Teacher.py")
     teacher_py = _read("Teacher.py")
+    save_region_arg = _argument_block(option_teacher_py, "save_train_batch_region_vis")
+    run_real_arg = _argument_block(option_teacher_py, "run_real_infer_in_teacher")
 
     assert "--save_train_batch_region_vis" in option_teacher_py
-    assert "default=False" in option_teacher_py
+    assert "default=True" in save_region_arg
+    assert "默认开启" in save_region_arg
+    assert "9 列监督图" in save_region_arg
+    assert "default=True" in run_real_arg
+    assert "default on" in run_real_arg
+    assert "6-column real-domain overview" in run_real_arg
     assert 'getattr(opt, "save_train_batch_region_vis", False)' in teacher_py
     assert "save_teacher_region_visualization(" in teacher_py
