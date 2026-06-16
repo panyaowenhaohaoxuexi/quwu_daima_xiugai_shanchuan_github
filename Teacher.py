@@ -94,9 +94,10 @@ def collate_fn_skip_none(batch):
 
 def find_paired_image(folder, stem):
     for ext in IMAGE_EXTS:
-        path = os.path.join(folder, stem + ext)
-        if os.path.exists(path):
-            return path
+        for candidate_ext in (ext, ext.upper()):
+            path = os.path.join(folder, stem + candidate_ext)
+            if os.path.exists(path):
+                return path
     return None
 
 
@@ -133,7 +134,10 @@ def _denorm_clip(x):
 
 
 def _panel_3ch(x, size, mode='bilinear'):
-    x = F.interpolate(x, size=size, mode=mode, align_corners=False)
+    if mode in ("nearest", "nearest-exact"):
+        x = F.interpolate(x, size=size, mode=mode)
+    else:
+        x = F.interpolate(x, size=size, mode=mode, align_corners=False)
     x = x.clamp(0.0, 1.0)
     if x.shape[1] == 1:
         return x.repeat(1, 3, 1, 1)
@@ -259,13 +263,14 @@ def run_real_world_visualization(model, epoch, hazy_dir, ir_dir):
                     haze_vis_resized, haze_ir_resized, h, w = _resize_to_model_multiple(haze_vis, haze_ir)
                     out = model(haze_vis_resized, haze_ir_resized, return_dict=True)
 
+                    binary_panel = _panel_3ch((out["binary_mask"] >= 0.5).float(), (h, w), mode="nearest")
                     panels = [
                         _panel_3ch(_denorm_clip(haze_vis), (h, w)),
                         _panel_3ch(_denorm_clip(haze_ir), (h, w)),
                         _panel_3ch(out["pred_clear"], (h, w), mode='bicubic'),
                         _panel_3ch(out["density_map"], (h, w)),
                         _panel_3ch(out["mask_prob"], (h, w)),
-                        _panel_3ch(out["binary_mask"], (h, w)),
+                        binary_panel,
                     ]
                     overview = torch.cat(panels, dim=3)
                     save_path = os.path.join(output_folder, f"{stem}_overview.png")
