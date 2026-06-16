@@ -40,9 +40,9 @@ parser.add_argument('--epochs', type=int, default=20)
 # 原始参数设置
 # parser.add_argument('--iters_per_epoch', type=int, default=5000)
 # 修改参数设置
-parser.add_argument('--iters_per_epoch', type=int, default=5000)
+parser.add_argument('--iters_per_epoch', type=int, default=1000)
 # 定义一个用于更精细评估的步数阈值
-parser.add_argument('--finer_eval_step', type=int, default=100000)
+parser.add_argument('--finer_eval_step', type=int, default=20000)
 # 定义初始学习率
 parser.add_argument('--start_lr', default=0.0001, type=float, help='start learning rate')
 # 定义结束学习率（用于学习率调度）

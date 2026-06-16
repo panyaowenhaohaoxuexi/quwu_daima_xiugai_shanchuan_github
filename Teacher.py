@@ -614,6 +614,11 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
                     opt.real_test_ir_path
                 )
 
+# 排查错误
+            print(f"[RealVisDebug] perform_eval epoch={current_epoch}, saved_data_dir={opt.saved_data_dir}, "
+                f"specific_hazy={opt.real_test_specific_hazy_dir}, specific_ir={opt.real_test_specific_ir_dir}")
+
+
             if opt.real_test_specific_hazy_dir and opt.real_test_specific_ir_dir:
                 run_real_world_visualization(
                     teacher_net,
