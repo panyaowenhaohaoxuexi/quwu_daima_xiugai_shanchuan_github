@@ -12,7 +12,13 @@ from torchvision.models import VGG19_Weights
 class Vgg19(torch.nn.Module):
     def __init__(self, requires_grad=False):
         super(Vgg19, self).__init__()
-        vgg_pretrained_features = models.vgg19(weights=VGG19_Weights.DEFAULT).features
+        try:
+            vgg_pretrained_features = models.vgg19(weights=VGG19_Weights.DEFAULT).features
+        except Exception as exc:
+            raise RuntimeError(
+                "ContrastLoss requires torchvision VGG19 pretrained weights. "
+                "Please pre-cache the weights or disable w_loss_Cr."
+            ) from exc
         self.slice1 = torch.nn.Sequential()
         self.slice2 = torch.nn.Sequential()
         self.slice3 = torch.nn.Sequential()
@@ -45,17 +51,24 @@ class ContrastLoss(nn.Module):
     def __init__(self, ablation=False):
 
         super(ContrastLoss, self).__init__()
-        self.vgg = Vgg19().cuda()
+        self.vgg = Vgg19()
+        for p in self.vgg.parameters():
+            p.requires_grad = False
         self.l1 = nn.L1Loss()
         self.weights = [1.0 / 32, 1.0 / 16, 1.0 / 8, 1.0 / 4, 1.0]
         self.ab = ablation
-        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1).cuda()
-        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1).cuda()
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1))
 
     def forward(self, a, p, n):
-        a = (a - self.mean) / self.std
-        p = (p - self.mean) / self.std
-        n = (n - self.mean) / self.std
+        if next(self.vgg.parameters()).device != a.device:
+            self.vgg.to(a.device)
+        self.vgg.eval()
+        mean = self.mean.to(device=a.device, dtype=a.dtype)
+        std = self.std.to(device=a.device, dtype=a.dtype)
+        a = (a - mean) / std
+        p = (p - mean) / std
+        n = (n - mean) / std
         a_vgg, p_vgg, n_vgg = self.vgg(a), self.vgg(p), self.vgg(n)
         loss = 0
 
@@ -80,8 +93,8 @@ class VGGLoss(nn.Module):
         self.weights = (1.0, 1.0, 1.0, 1.0, 1.0)
 
         vgg = torchvision.models.vgg19(pretrained=True).features
-        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1).cuda()
-        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1).cuda()
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1))
         self.layers = nn.ModuleList()
         prev_layer = 0
         for next_layer in feature_layers[:n_layers]:
@@ -97,8 +110,10 @@ class VGGLoss(nn.Module):
         self.criterion = nn.L1Loss().to(device)
 
     def forward(self, source, target):
-        source = (source - self.mean) / self.std
-        target = (target - self.mean) / self.std
+        mean = self.mean.to(device=source.device, dtype=source.dtype)
+        std = self.std.to(device=source.device, dtype=source.dtype)
+        source = (source - mean) / std
+        target = (target - mean) / std
         loss = 0
         for layer, weight in zip(self.layers, self.weights):
             source = layer(source)

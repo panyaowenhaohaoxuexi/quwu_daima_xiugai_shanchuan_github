@@ -48,13 +48,21 @@ def compute_teacher_region_loss(
     mask_logits,
     mask_prob,
     mask_gt,
+    hazy_vis_01=None,
     lambda_rec=1.0,
     lambda_density=1.0,
     lambda_mask=1.0,
     lambda_ssim=0.0,
+    lambda_cr=0.0,
     lambda_edge=0.0,
     ssim_module=None,
+    contrast_module=None,
 ):
+    """Compute synthetic Teacher losses.
+
+    hazy_vis_01 is expected to be de-normalized to [0,1]; this function does
+    not perform CLIP de-normalization.
+    """
     device = pred_clear.device
     clear_gt = clear_gt.to(device=device, dtype=pred_clear.dtype)
     density_gt = density_gt.to(device=device, dtype=density_map.dtype)
@@ -93,6 +101,14 @@ def compute_teacher_region_loss(
     else:
         loss_ssim = _zero(device)
 
+    if lambda_cr > 0:
+        if hazy_vis_01 is None or contrast_module is None:
+            raise ValueError("lambda_cr > 0 requires hazy_vis_01 and contrast_module.")
+        hazy_vis_01 = hazy_vis_01.to(device=device, dtype=pred_clear.dtype)
+        loss_cr = contrast_module(pred_clear, clear_gt, hazy_vis_01)
+    else:
+        loss_cr = _zero(device)
+
     if lambda_edge > 0:
         loss_edge = F.l1_loss(_sobel_edges(pred_clear), _sobel_edges(clear_gt).detach())
     else:
@@ -103,6 +119,7 @@ def compute_teacher_region_loss(
         + lambda_density * loss_density
         + lambda_mask * loss_mask
         + lambda_ssim * loss_ssim
+        + lambda_cr * loss_cr
         + lambda_edge * loss_edge
     )
 
@@ -112,5 +129,6 @@ def compute_teacher_region_loss(
         "density": loss_density,
         "mask": loss_mask,
         "ssim": loss_ssim,
+        "cr": loss_cr,
         "edge": loss_edge,
     }

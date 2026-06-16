@@ -49,20 +49,17 @@ parser.add_argument('--start_lr', default=0.0001, type=float, help='start learni
 parser.add_argument('--end_lr', default=0.000001, type=float, help='end learning rate')
 # 定义一个动作参数，如果命令行中包含此参数，则不使用余弦学习率调度
 parser.add_argument('--no_lr_sche', action='store_true', help='no lr cos schedule')
-# 定义 L1 损失的权重
+# 当前最终清晰图重建监督: L_dehaze = L1 + SSIM + Cr
 parser.add_argument('--w_loss_L1', default=0.8, type=float, help='weight of loss L1')
 parser.add_argument('--w_loss_rec', default=0.8, type=float, help='weight of supervised clear RGB reconstruction loss')
 parser.add_argument('--w_loss_density', default=1.0, type=float, help='weight of haze density L1 loss')
 parser.add_argument('--w_loss_mask', default=1.0, type=float, help='weight of IR completion mask BCE+Dice loss')
-# 定义 SSIM 损失的权重
 parser.add_argument('--w_loss_SSIM', default=0.2, type=float, help='weight of loss SSIM')
-# 定义 Cr (对比度) 损失的权重
 parser.add_argument('--w_loss_Cr', default=0.05, type=float, help='weight of loss Cr')
 
-# --- [新增] ---
-# 添加一个新的损失权重，用于红外边缘一致性
-parser.add_argument('--w_loss_Edge', default=0.15, type=float, help='weight of IR Edge consistency loss')
-# --- [新增结束] ---
+# Edge loss is kept only as a compatibility entry for older experiments.
+parser.add_argument('--w_loss_Edge', default=0.0, type=float,
+                    help='deprecated for current Teacher reconstruction loss; kept for compatibility')
 # --- [新增] 风格损失 和 跨模态一致性损失 ---
 parser.add_argument('--w_loss_Style', default=0.1, type=float, help='weight of Style loss (Perceptual)')
 parser.add_argument('--w_loss_CrossModal', default=0.1, type=float, help='weight of Cross-Modal Consistency loss (L1 between vis/ir features)')

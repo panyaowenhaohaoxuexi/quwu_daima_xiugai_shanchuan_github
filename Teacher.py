@@ -22,8 +22,8 @@ from torch.backends import cudnn
 # 从 PyTorch 数据加载工具中导入 DataLoader 类，用于批量加载数据
 from torch.utils.data import DataLoader
 
-# --- [修改] 导入 SSIM, ContrastLoss 和 PerceptualLoss ---
-from loss import SSIM
+# --- [修改] 导入 SSIM 和 ContrastLoss ---
+from loss import SSIM, ContrastLoss
 from loss.teacher_region_loss import compute_teacher_region_loss
 # --- [修改结束] ---
 
@@ -332,8 +332,8 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
     执行合成域 Teacher 区域补全监督训练。
     """
     losses = []
-    loss_log = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'edge': [], 'total': []}
-    loss_log_tmp = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'edge': [], 'total': []}
+    loss_log = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'cr': [], 'edge': [], 'total': []}
+    loss_log_tmp = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'cr': [], 'edge': [], 'total': []}
     psnr_log = []
 
     start_step = 0
@@ -343,6 +343,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
     psnrs = []
     loader_train_iter = iter(loader_train)
     ssim_loss_module = criterion[1] if criterion and len(criterion) > 1 else None
+    contrast_module = criterion[2] if criterion and len(criterion) > 2 else None
 
     for step in range(start_step + 1, steps + 1):
         teacher_net.train()
@@ -395,11 +396,23 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
 
         out = teacher_net(hazy_vis, infrared, return_dict=True)
         pred_image = out["pred_clear"]
+        clip_mean = torch.tensor(
+            [0.48145466, 0.4578275, 0.40821073],
+            device=hazy_vis.device,
+            dtype=hazy_vis.dtype,
+        ).view(1, 3, 1, 1)
+        clip_std = torch.tensor(
+            [0.26862954, 0.26130258, 0.27577711],
+            device=hazy_vis.device,
+            dtype=hazy_vis.dtype,
+        ).view(1, 3, 1, 1)
+        hazy_vis_01 = (hazy_vis * clip_std + clip_mean).clamp(0.0, 1.0)
 
         lambda_rec = getattr(opt, "w_loss_rec", getattr(opt, "w_loss_L1", 1.0))
         lambda_density = getattr(opt, "w_loss_density", 1.0)
         lambda_mask = getattr(opt, "w_loss_mask", 1.0)
         lambda_ssim = getattr(opt, "w_loss_SSIM", 0.0)
+        lambda_cr = getattr(opt, "w_loss_Cr", 0.0)
         lambda_edge = getattr(opt, "w_loss_Edge", 0.0)
 
         loss_dict = compute_teacher_region_loss(
@@ -410,12 +423,15 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
             mask_logits=out["mask_logits"],
             mask_prob=out["mask_prob"],
             mask_gt=mask_gt,
+            hazy_vis_01=hazy_vis_01,
             lambda_rec=lambda_rec,
             lambda_density=lambda_density,
             lambda_mask=lambda_mask,
             lambda_ssim=lambda_ssim,
+            lambda_cr=lambda_cr,
             lambda_edge=lambda_edge,
             ssim_module=ssim_loss_module,
+            contrast_module=contrast_module,
         )
         loss = loss_dict["total"]
 
@@ -424,7 +440,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         optim.step()
 
         losses.append(loss.item())
-        for key in ("rec", "density", "mask", "ssim", "edge"):
+        for key in ("rec", "density", "mask", "ssim", "cr", "edge"):
             loss_log_tmp[key].append(loss_dict[key].item())
         loss_log_tmp['total'].append(loss.item())
 
@@ -437,7 +453,8 @@ def train(teacher_net, loader_train, loader_test, optim, criterion, edge_detecto
         print(
             f'\rloss:{loss.item():.5f} | rec:{loss_dict["rec"].item():.5f} '
             f'| density:{loss_dict["density"].item():.5f} | mask:{loss_dict["mask"].item():.5f} '
-            f'| ssim_loss:{loss_dict["ssim"].item():.5f} | edge:{loss_dict["edge"].item():.5f} '
+            f'| ssim_loss:{loss_dict["ssim"].item():.5f} | cr:{loss_dict["cr"].item():.5f} '
+            f'| edge:{loss_dict["edge"].item():.5f} '
             f'| mask_ratio:{mask_ratio:.4f} | density_mean:{density_mean:.4f} | tau:{tau:.4f} '
             f'| PSNR:{train_psnr:.4f} | SSIM:{train_ssim:.4f} '
             f'| step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}',
@@ -844,8 +861,11 @@ if __name__ == "__main__":
         print(f"计算总参数量时出错: {e}")
     print("------------------------------------------------------------------")
 
-    # 新合成域 Teacher 只需要 SSIM module 供 compute_teacher_region_loss 复用。
-    criterion = [nn.L1Loss().to(opt.device), SSIM().to(opt.device)]
+    criterion = [
+        nn.L1Loss().to(opt.device),
+        SSIM().to(opt.device),
+        ContrastLoss().to(opt.device),
+    ]
 
     # Adam 优化器
     optimizer = optim.Adam(params=filter(lambda x: x.requires_grad, teacher_net.parameters()), lr=opt.start_lr,
