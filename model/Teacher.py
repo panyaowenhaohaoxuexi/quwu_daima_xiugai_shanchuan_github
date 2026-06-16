@@ -1189,8 +1189,10 @@ class VIFNetInconsistencyTeacher(nn.Module):
     def __init__(self, res_blocks=18):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
-        # Kept only as an attribute name for legacy checkpoints/introspection.
-        # The new synthetic-domain Teacher forward never calls CMDN/Otsu/sky-mask routing.
+        # Legacy CMDN is intentionally disabled in active TMM.
+        # The active Teacher path uses HDE + mask_head + GumbelSigmoidBinarizer.
+        # Keep this attribute only for old checkpoints and introspection; forward
+        # does not call CMDN/Otsu/sky-mask routing.
         self.cmdn = None
 
         self.hde = HDE()
@@ -1352,6 +1354,8 @@ class VIFNetInconsistencyTeacher(nn.Module):
     def set_gumbel_tau(self, tau):
         self.gumbel_binarizer.set_tau(tau)
 
+    # Debug/ablation helper only. Formal training and formal inference should
+    # pass no external override so binary_mask comes from internal HDE + Gumbel.
     def _override_binary_mask(self, binary_mask, override_mask):
         override_mask = override_mask.to(device=binary_mask.device, dtype=binary_mask.dtype)
         if override_mask.dim() == 3:
@@ -1361,6 +1365,9 @@ class VIFNetInconsistencyTeacher(nn.Module):
 
     # --- [重写] forward 方法：合成域 HDE + Gumbel 区域补全主链路 ---
     def forward(self, x_vis, x_ir, haze_mask=None, return_dict=False, debug_force_mask=None, **kwargs):
+        # haze_mask/debug_force_mask are retained strictly for diagnostics and
+        # ablations. Formal Eval_EMA inference must leave them as None, using
+        # the model-internal HDE + mask_head + Gumbel binary_mask below.
         x_vis_01 = (x_vis * self.clip_input_std + self.clip_input_mean).clamp(0.0, 1.0)
         density_map, density_feat = self.hde(x_vis_01, return_feat=True)
         mask_logits = self.mask_head(density_feat)
