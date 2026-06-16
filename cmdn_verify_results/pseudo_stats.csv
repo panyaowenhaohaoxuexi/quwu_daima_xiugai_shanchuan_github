@@ -1,2 +1,0 @@
-filename,p_min,p_mean,p_max,m_hard_mean,g_soft_mean,p_fail_mean,tau_mean,max_abs_alpha_diff,requires_grad
-01435.png,2.2207639631233178e-05,0.06886779516935349,0.47708430886268616,0.0,0.024912159889936447,0.4932686686515808,0.550000011920929,0.0,False
