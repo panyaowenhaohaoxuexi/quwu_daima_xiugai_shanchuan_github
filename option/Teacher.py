@@ -76,11 +76,16 @@ parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/Sup3
                     help='训练日志(log.txt)、损失(losses.npy)、指标(ssims.npy/psnrs.npy)保存目录')
 
 # =========================================
-# 【训练数据集路径】 (有雾图 + 红外图 + 清晰图GT)
-#   子目录结构: train_data_dir/hazy/, ir/, clear/
+# 【训练数据集路径】合成域五元组监督
+#   子目录结构:
+#   train_data_dir/clear/
+#   train_data_dir/hazy/
+#   train_data_dir/ir/
+#   train_data_dir/Transmission_Map_GT/
+#   train_data_dir/IR_Completion_Mask_GT/
 # =========================================
 parser.add_argument('--train_data_dir', type=str, default='/root/autodl-tmp/FLIR_zengqiang/train',
-                    help='训练集根目录，内含 hazy/ ir/ clear/ 三个子文件夹')
+                    help='训练集根目录，需包含 clear/ hazy/ ir/ Transmission_Map_GT/ IR_Completion_Mask_GT/')
 
 # =========================================
 # 【验证/测试数据集路径】 (有雾图 + 红外图 + 清晰图GT)

@@ -1467,29 +1467,24 @@ class VIFNetInconsistencyTeacher(nn.Module):
         )
 
 
-# --- 主函数测试部分 (保持不变) ---
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # 实例化新模型
     net = VIFNetInconsistencyTeacher().to(device)
     dummy_input_vis = torch.randn(1, 3, 256, 256).to(device)
     dummy_input_ir = torch.randn(1, 3, 256, 256).to(device)
 
-    # [修改] 接收 11 个输出
-    output_tensor, intermediate_features, vis_features_out, ir_features_out, m_hard_out, P_fail, disc_pseudo, tau, G_dec, P_support, G_soft = net(dummy_input_vis, dummy_input_ir)
+    with torch.no_grad():
+        out = net(dummy_input_vis, dummy_input_ir, return_dict=True)
 
-    print("Output shape:", output_tensor.shape)
-    print("Vis Features (Decoder Output) shape:", vis_features_out.shape)
-    print("IR Features (Decoder Output) shape:", ir_features_out.shape)
-    print("P_fail shape:", P_fail.shape if P_fail is not None else "None")
-    print("disc_pseudo shape:", disc_pseudo.shape if disc_pseudo is not None else "None")
-    print("tau shape:", tau.shape if tau is not None else "None")
-    print("Intermediate features shapes:")
-    for feat in intermediate_features:
-        print(feat.shape)
+    print("pred_clear:", out["pred_clear"].shape)
+    print("density_map:", out["density_map"].shape)
+    print("mask_logits:", out["mask_logits"].shape)
+    print("mask_prob:", out["mask_prob"].shape)
+    print("binary_mask:", out["binary_mask"].shape)
+    print("fused_feats:", [x.shape for x in out["fused_feats"]])
+    print("ir_feats:", [x.shape for x in out["ir_feats"]])
+    print("vis_feats:", [x.shape for x in out["vis_feats"]])
+    print("fusion_weights:", [x.shape for x in out["fusion_weights"]])
 
-    try:
-        pytorch_total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-        print("Total_params: ==> {}".format(pytorch_total_params))
-    except Exception as e:
-        print(f"Error calculating total parameters: {e}")
+    pytorch_total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    print("Total_params:", pytorch_total_params)
