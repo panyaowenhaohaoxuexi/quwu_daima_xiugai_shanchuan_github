@@ -861,10 +861,14 @@ if __name__ == "__main__":
         print(f"计算总参数量时出错: {e}")
     print("------------------------------------------------------------------")
 
+    contrast_loss_module = None
+    if getattr(opt, "w_loss_Cr", 0.0) > 0:
+        contrast_loss_module = ContrastLoss().to(opt.device)
+
     criterion = [
         nn.L1Loss().to(opt.device),
         SSIM().to(opt.device),
-        ContrastLoss().to(opt.device),
+        contrast_loss_module,
     ]
 
     # Adam 优化器
