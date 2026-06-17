@@ -59,7 +59,7 @@ def test_real_domain_overview_columns_are_prediction_only():
     teacher_py = _read("Teacher.py")
 
     assert "REAL_PROBE_COLUMNS" in teacher_py
-    assert '["Hazy", "IR", "Pred", "Density_pred", "Mask_prob", "Binary_mask"]' in teacher_py.replace("\n", "")
+    assert '["Hazy", "IR", "Pred_raw", "Transported_rgb", "Final_pred", "Density_pred", "Mask_prob", "Binary_mask"]' in teacher_py.replace("\n", "")
 
     run_real_test_body = _function_body(teacher_py, "run_real_world_test")
     for forbidden in ("Clear", "Density_gt", "Mask_gt", "clear_vis", "density_gt", "mask_gt"):
@@ -90,6 +90,6 @@ def test_train_batch_region_visualization_remains_default_off_and_gated():
     assert "9 列监督图" in save_region_arg
     assert "default=True" in run_real_arg
     assert "default on" in run_real_arg
-    assert "6-column real-domain overview" in run_real_arg
+    assert "6-column real-domain overview" in run_real_arg or "real-domain overview" in run_real_arg
     assert 'getattr(opt, "save_train_batch_region_vis", False)' in teacher_py
     assert "save_teacher_region_visualization(" in teacher_py

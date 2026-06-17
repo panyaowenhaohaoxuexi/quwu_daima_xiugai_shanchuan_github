@@ -54,7 +54,7 @@ transform = Compose([
 # --- [新增结束] ---
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
-REAL_PROBE_COLUMNS = ["Hazy", "IR", "Pred", "Density_pred", "Mask_prob", "Binary_mask"]
+REAL_PROBE_COLUMNS = ["Hazy", "IR", "Pred_raw", "Transported_rgb", "Final_pred", "Density_pred", "Mask_prob", "Binary_mask"]
 
 # 训练轮次
 start_time = time.time()
@@ -264,10 +264,24 @@ def run_real_world_test(model, epoch, hazy_dir, ir_dir):
                         size=(h, w),
                         mode="nearest",
                     ).clamp(0.0, 1.0)
+                    pred_raw = F.interpolate(
+                        out.get("pred_raw", out["pred_clear"]),
+                        size=(h, w),
+                        mode="bicubic",
+                        align_corners=False,
+                    ).clamp(0.0, 1.0)
+                    transported_rgb = F.interpolate(
+                        out.get("transported_rgb", out["pred_clear"]),
+                        size=(h, w),
+                        mode="bicubic",
+                        align_corners=False,
+                    ).clamp(0.0, 1.0)
 
                     panels = [
                         _panel_3ch(_denorm_clip(haze_vis), (192, 192)),
                         _panel_3ch(_denorm_clip(haze_ir), (192, 192)),
+                        _panel_3ch(pred_raw, (192, 192), mode="bicubic"),
+                        _panel_3ch(transported_rgb, (192, 192), mode="bicubic"),
                         _panel_3ch(pred_clear, (192, 192), mode="bicubic"),
                         _panel_3ch(density_map, (192, 192)),
                         _panel_3ch(mask_prob, (192, 192)),
@@ -302,8 +316,8 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
     执行合成域 Teacher 区域补全监督训练。
     """
     losses = []
-    loss_log = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'cr': [], 'edge': [], 'total': []}
-    loss_log_tmp = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'cr': [], 'edge': [], 'total': []}
+    loss_log = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'cr': [], 'edge': [], 'align': [], 'comp': [], 'sparse': [], 'ir_tv': [], 'total': []}
+    loss_log_tmp = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'cr': [], 'edge': [], 'align': [], 'comp': [], 'sparse': [], 'ir_tv': [], 'total': []}
     psnr_log = []
 
     start_step = 0
@@ -377,6 +391,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
             dtype=hazy_vis.dtype,
         ).view(1, 3, 1, 1)
         hazy_vis_01 = (hazy_vis * clip_std + clip_mean).clamp(0.0, 1.0)
+        x_ir_01 = (infrared * clip_std + clip_mean).clamp(0.0, 1.0)
 
         lambda_rec = getattr(opt, "w_loss_rec", 1.0)
         lambda_density = getattr(opt, "w_loss_density", 1.0)
@@ -384,6 +399,19 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
         lambda_ssim = getattr(opt, "w_loss_SSIM", 0.0)
         lambda_cr = getattr(opt, "w_loss_Cr", 0.0)
         lambda_edge = getattr(opt, "w_loss_Edge", 0.0)
+        if step < getattr(opt, "color_loss_start_step", 1000):
+            lambda_align = 0.0
+            lambda_comp = 0.0
+            lambda_sparse = 0.0
+            lambda_ir_tv = 0.0
+        else:
+            lambda_align = getattr(opt, "w_loss_align", 0.1)
+            lambda_comp = getattr(opt, "w_loss_comp", 1.0)
+            lambda_ir_tv = getattr(opt, "w_loss_ir_tv", 0.05)
+            sparse_target = getattr(opt, "w_loss_sparse", 0.01)
+            sparse_warmup = max(1, getattr(opt, "sparse_warmup_steps", 5000))
+            sparse_progress = min(1.0, (step - getattr(opt, "color_loss_start_step", 1000)) / sparse_warmup)
+            lambda_sparse = sparse_target * sparse_progress
 
         loss_dict = compute_teacher_region_loss(
             pred_clear=pred_image,
@@ -394,12 +422,27 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
             mask_prob=out["mask_prob"],
             mask_gt=mask_gt,
             hazy_vis_01=hazy_vis_01,
+            pred_raw=out.get("pred_raw"),
+            transported_rgb=out.get("transported_rgb"),
+            semantic_ir=out.get("semantic_ir"),
+            semantic_vis=out.get("semantic_vis"),
+            proto_keys=out.get("proto_keys"),
+            proto_values=out.get("proto_values"),
+            proto_attn=out.get("proto_attn"),
+            proto_assign=out.get("proto_assign"),
+            x_ir_01=x_ir_01,
+            binary_mask=out.get("binary_mask"),
             lambda_rec=lambda_rec,
             lambda_density=lambda_density,
             lambda_mask=lambda_mask,
             lambda_ssim=lambda_ssim,
             lambda_cr=lambda_cr,
             lambda_edge=lambda_edge,
+            lambda_align=lambda_align,
+            lambda_comp=lambda_comp,
+            lambda_sparse=lambda_sparse,
+            lambda_ir_tv=lambda_ir_tv,
+            ir_tv_edge_lambda=getattr(opt, "ir_tv_edge_lambda", 10.0),
             ssim_module=ssim_loss_module,
             contrast_module=contrast_module,
         )
@@ -410,7 +453,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
         optim.step()
 
         losses.append(loss.item())
-        for key in ("rec", "density", "mask", "ssim", "cr", "edge"):
+        for key in ("rec", "density", "mask", "ssim", "cr", "edge", "align", "comp", "sparse", "ir_tv"):
             loss_log_tmp[key].append(loss_dict[key].item())
         loss_log_tmp['total'].append(loss.item())
 
@@ -418,14 +461,34 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
             train_psnr = psnr(pred_image.detach().clamp(0, 1), clear_vis)
             train_ssim = ssim(pred_image.detach().clamp(0, 1), clear_vis).item()
             mask_ratio = out["binary_mask"].mean().item()
+            mask_gt_ratio = mask_gt.float().mean().item()
+            reliable_area_ratio = out.get("reliable_area_ratio", torch.tensor([0.0], device=pred_image.device)).float().mean().item()
             density_mean = out["density_map"].mean().item()
+            transported = out.get("transported_rgb")
+            transported_mean = transported.mean().item() if transported is not None else 0.0
+            transported_std = transported.std().item() if transported is not None else 0.0
+            proto_attn = out.get("proto_attn")
+            if proto_attn is not None:
+                proto_entropy = (-(proto_attn * torch.log(proto_attn.clamp_min(1e-6))).sum(dim=-1)).mean().item()
+            else:
+                proto_entropy = 0.0
+            max_sim_map = out.get("max_sim_map")
+            max_sim_mean = max_sim_map.mean().item() if max_sim_map is not None else 0.0
+            max_sim_max = max_sim_map.max().item() if max_sim_map is not None else 0.0
+            max_sim_min = max_sim_map.min().item() if max_sim_map is not None else 0.0
 
         print(
             f'\rloss:{loss.item():.5f} | rec:{loss_dict["rec"].item():.5f} '
             f'| density:{loss_dict["density"].item():.5f} | mask:{loss_dict["mask"].item():.5f} '
             f'| ssim_loss:{loss_dict["ssim"].item():.5f} | cr:{loss_dict["cr"].item():.5f} '
-            f'| edge:{loss_dict["edge"].item():.5f} '
-            f'| mask_ratio:{mask_ratio:.4f} | density_mean:{density_mean:.4f} | tau:{tau:.4f} '
+            f'| edge:{loss_dict["edge"].item():.5f} | align:{loss_dict["align"].item():.5f} '
+            f'| comp:{loss_dict["comp"].item():.5f} | sparse:{loss_dict["sparse"].item():.5f} '
+            f'| ir_tv:{loss_dict["ir_tv"].item():.5f} '
+            f'| mask_ratio:{mask_ratio:.4f} | mask_gt_ratio:{mask_gt_ratio:.4f} '
+            f'| reliable_area:{reliable_area_ratio:.4f} | density_mean:{density_mean:.4f} '
+            f'| transported_mu:{transported_mean:.4f} | transported_std:{transported_std:.4f} '
+            f'| proto_entropy:{proto_entropy:.4f} | max_sim:{max_sim_mean:.4f}/{max_sim_min:.4f}/{max_sim_max:.4f} '
+            f'| tau:{tau:.4f} '
             f'| PSNR:{train_psnr:.4f} | SSIM:{train_ssim:.4f} '
             f'| step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}',
             end='', flush=True)
@@ -463,6 +526,9 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
                         out["mask_prob"].detach().cpu(),
                         out["binary_mask"].detach().cpu(),
                         mask_gt.detach().cpu(),
+                        proto_assign=out.get("proto_assign").detach().cpu() if out.get("proto_assign") is not None else None,
+                        proto_attn=out.get("proto_attn").detach().cpu() if out.get("proto_attn") is not None else None,
+                        max_sim_map=out.get("max_sim_map").detach().cpu() if out.get("max_sim_map") is not None else None,
                     )
                 except Exception as e:
                     print(f"\n[teacher_region_vis] 可视化失败，跳过: {e}")
@@ -769,7 +835,11 @@ if __name__ == "__main__":
         )
 
     # --- [修改] 模型初始化 ---
-    teacher_net = VIFNetInconsistencyTeacher().to(opt.device)  # 实例化新的模型
+    teacher_net = VIFNetInconsistencyTeacher(
+        semantic_dim=opt.semantic_dim,
+        num_color_prototypes=opt.num_color_prototypes,
+        transport_temperature=opt.transport_temperature,
+    ).to(opt.device)  # 实例化新的模型
     teacher_net = teacher_net.to(opt.device)
     # --- [修改结束] ---
 

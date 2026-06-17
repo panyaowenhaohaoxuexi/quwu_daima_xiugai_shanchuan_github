@@ -24,7 +24,9 @@ SAVE_INTERNAL_OVERVIEW = True
 EVAL_OVERVIEW_COLUMNS = [
     "Hazy",
     "IR",
-    "Pred",
+    "Pred_raw",
+    "Transported_rgb",
+    "Final_pred",
     "Density_pred",
     "Mask_prob",
     "Binary_mask",
@@ -75,8 +77,8 @@ def tensor_to_pil(panel):
     return torchvision.transforms.functional.to_pil_image(panel)
 
 
-def save_internal_overview(hazy, ir, pred, density, prob, binary, save_path):
-    panels = [hazy, ir, pred, density, prob, binary]
+def save_internal_overview(hazy, ir, pred_raw, transported_rgb, pred, density, prob, binary, save_path):
+    panels = [hazy, ir, pred_raw, transported_rgb, pred, density, prob, binary]
     images = [tensor_to_pil(panel) for panel in panels]
     tile_w, tile_h = images[0].size
     label_h = 24
@@ -111,12 +113,16 @@ def dehaze(model, vis_image_path, ir_image_path, folder):
             out = model(haze_vis_resized, haze_ir_resized, return_dict=True)
 
         pred_clear = out["pred_clear"]
+        pred_raw = out.get("pred_raw", pred_clear)
+        transported_rgb = out.get("transported_rgb", pred_clear)
         density_map = out["density_map"]
         mask_prob = out["mask_prob"]
         binary_mask = out["binary_mask"]
 
         original_size = (h, w)
         pred_clear_restored = resize_to_original(pred_clear, original_size, "bicubic")
+        pred_raw_restored = resize_to_original(pred_raw, original_size, "bicubic")
+        transported_rgb_restored = resize_to_original(transported_rgb, original_size, "bicubic")
         density_restored = resize_to_original(density_map, original_size, "bilinear")
         mask_prob_restored = resize_to_original(mask_prob, original_size, "bilinear")
         binary_mask_thresholded = (binary_mask >= 0.5).float()
@@ -136,6 +142,8 @@ def dehaze(model, vis_image_path, ir_image_path, folder):
             save_internal_overview(
                 denormalize_model_input(haze_vis),
                 denormalize_model_input(haze_ir),
+                pred_raw_restored.clamp(0, 1),
+                transported_rgb_restored.clamp(0, 1),
                 pred_clear_restored.clamp(0, 1),
                 density_restored.clamp(0, 1),
                 mask_prob_restored.clamp(0, 1),
@@ -171,7 +179,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
     except Exception as exc:
         print(f"[Eval] error: failed to load checkpoint: {exc}")
-        print("[Eval] hint: inspect missing/unexpected keys or try strict=False manually.")
+        print("[Eval] hint: inspect missing/unexpected keys. New color_transport parameters can make old checkpoints report missing keys; use an explicit strict=False load only for legacy checkpoint inspection.")
         raise SystemExit(1)
 
     model.eval()

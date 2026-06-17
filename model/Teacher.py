@@ -1076,6 +1076,120 @@ class ChannelAttentionFusion(nn.Module):
 # --- [新增结束] ---
 
 
+class CrossModalSemanticColorTransport(nn.Module):
+    """
+    Cross-modal semantic color transport.
+
+    Query comes from full-image IR semantics. Key comes from reliable-region
+    hazy-visible semantics. Value always comes from reliable-region x_vis_01
+    RGB, never from clear_gt.
+    """
+
+    def __init__(self, in_channels=256, semantic_dim=128, num_prototypes=32, temperature=0.07, eps=1e-6):
+        super(CrossModalSemanticColorTransport, self).__init__()
+        self.semantic_dim = semantic_dim
+        self.num_prototypes = num_prototypes
+        self.temperature = temperature
+        self.eps = eps
+        self.proj_ir = nn.Sequential(
+            nn.Conv2d(in_channels, semantic_dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(semantic_dim, semantic_dim, kernel_size=1),
+        )
+        self.proj_vis = nn.Sequential(
+            nn.Conv2d(in_channels, semantic_dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(semantic_dim, semantic_dim, kernel_size=1),
+        )
+        self.assignment_head = nn.Conv2d(semantic_dim, num_prototypes, kernel_size=1)
+
+    def _safe_reliable_mean_rgb(self, rgb_value, reliable_mask, reliable_area):
+        reliable_sum = reliable_mask.sum(dim=(2, 3), keepdim=False).clamp_min(self.eps)
+        reliable_mean = (rgb_value * reliable_mask).sum(dim=(2, 3), keepdim=False) / reliable_sum
+        safe_rgb = torch.full_like(reliable_mean, 0.5)
+        has_reliable = (reliable_area > 0).view(-1, 1)
+        return torch.where(has_reliable, reliable_mean, safe_rgb)
+
+    def forward(self, ir_feat, vis_feat, x_vis_01, haze_mask):
+        B, C, Hf, Wf = ir_feat.shape
+        if vis_feat.shape[:2] != (B, C) or vis_feat.shape[2:] != (Hf, Wf):
+            raise ValueError(f"IR/VIS feature mismatch: ir={ir_feat.shape}, vis={vis_feat.shape}")
+        if haze_mask.dim() == 3:
+            haze_mask = haze_mask.unsqueeze(1)
+
+        s_ir = F.normalize(self.proj_ir(ir_feat), dim=1, eps=self.eps)
+        s_vis = F.normalize(self.proj_vis(vis_feat), dim=1, eps=self.eps)
+
+        mask_feat = F.interpolate(haze_mask.float(), size=(Hf, Wf), mode="nearest")
+        mask_feat = (mask_feat >= 0.5).float()
+        reliable_mask = 1.0 - mask_feat
+        reliable_area_ratio = reliable_mask.mean(dim=(1, 2, 3))
+
+        rgb_value = F.interpolate(x_vis_01.clamp(0.0, 1.0), size=(Hf, Wf), mode="bilinear", align_corners=False)
+        rgb_value = rgb_value.clamp(0.0, 1.0)
+
+        N = Hf * Wf
+        assign_logits = self.assignment_head(s_vis).flatten(2)  # B,K,N
+        reliable_flat = reliable_mask.flatten(2)  # B,1,N
+        assign_logits = assign_logits + (1.0 - reliable_flat) * (-1e4)
+        proto_assign = F.softmax(assign_logits, dim=-1)
+        proto_assign = proto_assign * reliable_flat
+        denom = proto_assign.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        proto_assign = proto_assign / denom
+        has_reliable = (reliable_flat.sum(dim=-1, keepdim=True) > 0).to(proto_assign.dtype)
+        proto_assign = proto_assign * has_reliable
+        proto_assign = torch.nan_to_num(proto_assign, nan=0.0, posinf=0.0, neginf=0.0)
+
+        s_vis_flat = s_vis.flatten(2).transpose(1, 2)  # B,N,D
+        rgb_flat = rgb_value.flatten(2).transpose(1, 2)  # B,N,3
+        proto_keys = torch.bmm(proto_assign, s_vis_flat)  # B,K,D
+        proto_keys = F.normalize(proto_keys, dim=-1, eps=self.eps)
+        proto_keys = torch.nan_to_num(proto_keys, nan=0.0, posinf=0.0, neginf=0.0)
+
+        proto_values = torch.bmm(proto_assign, rgb_flat)  # B,K,3
+        fallback_rgb = self._safe_reliable_mean_rgb(rgb_value, reliable_mask, reliable_area_ratio)
+        proto_values = torch.where(has_reliable.transpose(1, 2).bool(), proto_values, fallback_rgb.unsqueeze(1))
+        proto_values = torch.nan_to_num(proto_values, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+        s_ir_flat = s_ir.flatten(2).transpose(1, 2)  # B,N,D
+        logits = torch.bmm(s_ir_flat, proto_keys.transpose(1, 2)) / max(self.temperature, self.eps)
+        proto_attn = F.softmax(logits, dim=-1)
+        proto_attn = torch.nan_to_num(proto_attn, nan=1.0 / self.num_prototypes, posinf=0.0, neginf=0.0)
+        proto_attn = proto_attn / proto_attn.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+
+        transported_rgb_flat = torch.bmm(proto_attn, proto_values)  # B,N,3
+        transported_rgb_feat = transported_rgb_flat.transpose(1, 2).reshape(B, 3, Hf, Wf)
+        transported_rgb = F.interpolate(
+            transported_rgb_feat,
+            size=x_vis_01.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).clamp(0.0, 1.0)
+
+        max_sim, _ = logits.mul(max(self.temperature, self.eps)).max(dim=-1)
+        max_sim_map = max_sim.view(B, 1, Hf, Wf)
+        finite_max_sim = torch.nan_to_num(max_sim, nan=0.0, posinf=0.0, neginf=0.0)
+        max_sim_stats = {
+            "mean": finite_max_sim.mean(dim=1),
+            "max": finite_max_sim.max(dim=1).values,
+            "min": finite_max_sim.min(dim=1).values,
+        }
+
+        return {
+            "transported_rgb": transported_rgb,
+            "transported_rgb_feat": transported_rgb_feat.clamp(0.0, 1.0),
+            "semantic_ir": s_ir,
+            "semantic_vis": s_vis,
+            "proto_keys": proto_keys,
+            "proto_values": proto_values,
+            "proto_attn": proto_attn,
+            "proto_assign": proto_assign.view(B, self.num_prototypes, Hf, Wf),
+            "reliable_area_ratio": reliable_area_ratio,
+            "max_sim_map": max_sim_map,
+            "max_sim_stats": max_sim_stats,
+        }
+
+
 class RegionColorRestorer(nn.Module):
     """
     区域颜色恢复模块（Region Color Restorer）。
@@ -1186,7 +1300,13 @@ class VIFNetInconsistencyTeacher(nn.Module):
       - Color restoration: in-image Cross-Attention, K/V from M=0 reliable regions only
     """
 
-    def __init__(self, res_blocks=18):
+    def __init__(
+        self,
+        res_blocks=18,
+        semantic_dim=128,
+        num_color_prototypes=32,
+        transport_temperature=0.07,
+    ):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
         # Legacy CMDN is intentionally disabled in active TMM.
@@ -1341,8 +1461,15 @@ class VIFNetInconsistencyTeacher(nn.Module):
             torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
         )
 
-        # 区域颜色恢复（瓶颈层，256ch，H/16 分辨率）
-        self.color_restorer = RegionColorRestorer(feat_dim=256, num_heads=8)
+        self.semantic_dim = semantic_dim
+        self.num_color_prototypes = num_color_prototypes
+        self.transport_temperature = transport_temperature
+        self.color_transport = CrossModalSemanticColorTransport(
+            in_channels=256,
+            semantic_dim=semantic_dim,
+            num_prototypes=num_color_prototypes,
+            temperature=transport_temperature,
+        )
 
         # [修改] conv_output 现在直接接收来自 vis_features 的 16 个通道
         self.conv_output = ConvLayer(16, 3, kernel_size=3, stride=1)
@@ -1390,6 +1517,14 @@ class VIFNetInconsistencyTeacher(nn.Module):
         )
 
         x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0_safe = fused_outputs
+
+        # Current region_debug order is [H/16, H/8, H/4, H/2].
+        # If that order changes, update this H/4 semantic color transport hook.
+        ir_h4 = region_debug["ir_feats"][2]
+        vis_h4 = region_debug["vis_feats"][2]
+        assert ir_h4.shape[1] == 256, f"Expected H/4 IR feat 256ch, got {ir_h4.shape}"
+        assert vis_h4.shape[1] == 256, f"Expected H/4 VIS feat 256ch, got {vis_h4.shape}"
+        assert ir_h4.shape[2:] == vis_h4.shape[2:], "IR/VIS H4 feature spatial size mismatch"
 
         res16x_vis = self.CRA1_vis(x_layer3_fused)
         res8x_vis = self.CRA2_vis(x_layer2_fused)
@@ -1442,11 +1577,21 @@ class VIFNetInconsistencyTeacher(nn.Module):
         x_2 = self.conv_1_vis(x_2)
         vis_features = torch.cat((x_1, x_2), dim=1)
 
-        pred_clear = torch.sigmoid(self.conv_output(vis_features))
+        pred_raw = torch.sigmoid(self.conv_output(vis_features)).clamp(0.0, 1.0)
+        color_out = self.color_transport(
+            ir_feat=ir_h4,
+            vis_feat=vis_h4,
+            x_vis_01=x_vis_01,
+            haze_mask=binary_mask,
+        )
+        transported_rgb = color_out["transported_rgb"].clamp(0.0, 1.0)
+        M_full = F.interpolate(binary_mask, size=pred_raw.shape[-2:], mode="nearest")
+        pred_clear = (M_full * transported_rgb + (1.0 - M_full) * pred_raw).clamp(0.0, 1.0)
 
         if return_dict:
-            return {
+            return_dict = {
                 "pred_clear": pred_clear,
+                "pred_raw": pred_raw,
                 "density_map": density_map,
                 "mask_logits": mask_logits,
                 "mask_prob": mask_prob,
@@ -1456,6 +1601,8 @@ class VIFNetInconsistencyTeacher(nn.Module):
                 "vis_feats": region_debug["vis_feats"],
                 "fusion_weights": region_debug["fusion_weights"],
             }
+            return_dict.update(color_out)
+            return return_dict
 
         # Compatibility tuple: item 0 remains pred_clear. Item 4 is the new
         # HDE/Gumbel binary_mask and no longer has old CMDN m_hard semantics.
@@ -1476,14 +1623,28 @@ class VIFNetInconsistencyTeacher(nn.Module):
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = VIFNetInconsistencyTeacher().to(device)
+    net = VIFNetInconsistencyTeacher(semantic_dim=128, num_color_prototypes=32, transport_temperature=0.07).to(device)
     dummy_input_vis = torch.randn(1, 3, 256, 256).to(device)
     dummy_input_ir = torch.randn(1, 3, 256, 256).to(device)
+    debug_mask = torch.zeros(1, 1, 256, 256, device=device)
+    debug_mask[:, :, :, :128] = 1.0
 
     with torch.no_grad():
-        out = net(dummy_input_vis, dummy_input_ir, return_dict=True)
+        # debug_force_mask is only for smoke tests/ablations; formal inference
+        # uses the model-internal HDE + Gumbel binary_mask.
+        out = net(dummy_input_vis, dummy_input_ir, return_dict=True, debug_force_mask=debug_mask)
 
     print("pred_clear:", out["pred_clear"].shape)
+    print("pred_raw:", out["pred_raw"].shape)
+    print("transported_rgb:", out["transported_rgb"].shape)
+    print("transported_rgb_feat:", out["transported_rgb_feat"].shape)
+    print("semantic_ir:", out["semantic_ir"].shape)
+    print("semantic_vis:", out["semantic_vis"].shape)
+    print("proto_keys:", out["proto_keys"].shape)
+    print("proto_values:", out["proto_values"].shape)
+    print("proto_attn:", out["proto_attn"].shape)
+    print("proto_assign:", out["proto_assign"].shape)
+    print("max_sim_map:", out["max_sim_map"].shape)
     print("density_map:", out["density_map"].shape)
     print("mask_logits:", out["mask_logits"].shape)
     print("mask_prob:", out["mask_prob"].shape)
@@ -1492,6 +1653,24 @@ if __name__ == "__main__":
     print("ir_feats:", [x.shape for x in out["ir_feats"]])
     print("vis_feats:", [x.shape for x in out["vis_feats"]])
     print("fusion_weights:", [x.shape for x in out["fusion_weights"]])
+    assert out["pred_clear"].shape == out["pred_raw"].shape == out["transported_rgb"].shape == (1, 3, 256, 256)
+    assert out["semantic_ir"].shape[1] == net.semantic_dim
+    assert out["semantic_vis"].shape[1] == net.semantic_dim
+    assert out["semantic_ir"].shape[2:] == out["semantic_vis"].shape[2:]
+    Hf, Wf = out["semantic_ir"].shape[2:]
+    assert out["proto_attn"].shape == (1, Hf * Wf, net.num_color_prototypes)
+    assert torch.isfinite(out["proto_attn"]).all()
+    M_full = F.interpolate(out["binary_mask"], size=out["pred_raw"].shape[-2:], mode="nearest")
+    assert torch.allclose(
+        out["pred_clear"][M_full.expand_as(out["pred_clear"]) == 1],
+        out["transported_rgb"][M_full.expand_as(out["transported_rgb"]) == 1],
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        out["pred_clear"][M_full.expand_as(out["pred_clear"]) == 0],
+        out["pred_raw"][M_full.expand_as(out["pred_raw"]) == 0],
+        atol=1e-6,
+    )
 
     pytorch_total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print("Total_params:", pytorch_total_params)

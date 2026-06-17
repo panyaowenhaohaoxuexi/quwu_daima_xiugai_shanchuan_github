@@ -55,6 +55,14 @@ parser.add_argument('--w_loss_density', default=1.0, type=float, help='weight of
 parser.add_argument('--w_loss_mask', default=1.0, type=float, help='weight of IR completion mask BCE+Dice loss')
 parser.add_argument('--w_loss_SSIM', default=0.2, type=float, help='weight of loss SSIM')
 parser.add_argument('--w_loss_Cr', default=0.05, type=float, help='weight of loss Cr')
+parser.add_argument('--w_loss_align', default=0.1, type=float,
+                    help='weight of reliable-region cross-modal semantic alignment loss')
+parser.add_argument('--w_loss_comp', default=1.0, type=float,
+                    help='weight of completion-region transported RGB reconstruction loss')
+parser.add_argument('--w_loss_sparse', default=0.01, type=float,
+                    help='weight of completion-region prototype attention entropy loss')
+parser.add_argument('--w_loss_ir_tv', default=0.05, type=float,
+                    help='weight of IR-edge-aware completion-region color TV loss')
 
 # Edge loss is kept only as a compatibility entry for older experiments.
 parser.add_argument('--w_loss_Edge', default=0.0, type=float,
@@ -62,10 +70,22 @@ parser.add_argument('--w_loss_Edge', default=0.0, type=float,
 
 parser.add_argument('--gumbel_tau_start', default=1.0, type=float, help='initial Gumbel-Sigmoid temperature')
 parser.add_argument('--gumbel_tau_end', default=0.1, type=float, help='final Gumbel-Sigmoid temperature')
+parser.add_argument('--color_loss_start_step', default=1000, type=int,
+                    help='step before which color transport auxiliary losses are disabled')
+parser.add_argument('--sparse_warmup_steps', default=5000, type=int,
+                    help='linear warmup steps for prototype attention sparse loss')
+parser.add_argument('--semantic_dim', default=128, type=int,
+                    help='semantic embedding dimension for cross-modal color transport')
+parser.add_argument('--num_color_prototypes', default=32, type=int,
+                    help='number of reliable-region semantic color prototypes')
+parser.add_argument('--transport_temperature', default=0.07, type=float,
+                    help='softmax temperature for prototype color transport attention')
+parser.add_argument('--ir_tv_edge_lambda', default=10.0, type=float,
+                    help='IR gradient edge sensitivity for completion color TV loss')
 
 ##
 parser.add_argument('--run_real_infer_in_teacher', type=str2bool, nargs='?', const=True, default=True,
-                    help='run real-domain inference during Teacher training; default on to save 6-column real-domain overview')
+                    help='run real-domain inference during Teacher training; default on to save real-domain overview')
 
 parser.add_argument('--save_train_batch_region_vis', type=str2bool, nargs='?', const=True, default=True,
                     help='是否保存合成训练 batch 的监督可视化 teacher_region_vis；默认开启，保存 9 列监督图到 saved_data_dir')
