@@ -59,10 +59,22 @@ parser.add_argument('--w_loss_align', default=0.1, type=float,
                     help='weight of reliable-region cross-modal semantic alignment loss')
 parser.add_argument('--w_loss_comp', default=1.0, type=float,
                     help='weight of completion-region transported RGB reconstruction loss')
+parser.add_argument('--w_loss_comp_perc', default=0.5, type=float,
+                    help='weight of completion-region multiscale gradient perceptual loss')
 parser.add_argument('--w_loss_sparse', default=0.01, type=float,
                     help='weight of completion-region prototype attention entropy loss')
 parser.add_argument('--w_loss_ir_tv', default=0.05, type=float,
                     help='weight of IR-edge-aware completion-region color TV loss')
+parser.add_argument('--align_mode', default='infonce', choices=['infonce', 'cosine'],
+                    help='reliable-region semantic alignment mode')
+parser.add_argument('--align_temperature', default=0.07, type=float,
+                    help='temperature for InfoNCE semantic alignment')
+parser.add_argument('--infonce_fp_threshold', default=0.8, type=float,
+                    help='target false-positive masking threshold for InfoNCE negatives')
+parser.add_argument('--infonce_max_samples', default=1024, type=int,
+                    help='maximum reliable positions sampled per batch item for InfoNCE')
+parser.add_argument('--infonce_fp_warmup_steps', default=5000, type=int,
+                    help='steps after color_loss_start_step to anneal InfoNCE false-positive masking threshold')
 
 # Edge loss is kept only as a compatibility entry for older experiments.
 parser.add_argument('--w_loss_Edge', default=0.0, type=float,

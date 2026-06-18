@@ -40,6 +40,19 @@ def _sobel_edges(x):
     return torch.sqrt(gx * gx + gy * gy + 1e-6)
 
 
+def _multiscale_gradient_feats(x, scales=(1, 2, 4)):
+    feats = []
+    for scale in scales:
+        if scale == 1:
+            xs = x
+        else:
+            h = max(1, x.shape[2] // scale)
+            w = max(1, x.shape[3] // scale)
+            xs = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
+        feats.append(_sobel_edges(xs))
+    return feats
+
+
 def _masked_mean(value, mask, eps=1e-6):
     denom = mask.sum().clamp_min(eps)
     if mask.sum() <= 0:
@@ -51,6 +64,75 @@ def _gradient_abs(x):
     dx = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1])
     dy = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :])
     return dx, dy
+
+
+def _info_nce_align(
+    s_ir,
+    s_vis,
+    reliable_mask,
+    temperature,
+    fp_threshold,
+    max_samples,
+    return_stats=False,
+):
+    losses = []
+    stats = {
+        "sample_counts": [],
+        "masked_i2v": 0,
+        "masked_v2i": 0,
+    }
+
+    B, D, H, W = s_ir.shape
+    ir_flat = s_ir.permute(0, 2, 3, 1).reshape(B, H * W, D)
+    vis_flat = s_vis.permute(0, 2, 3, 1).reshape(B, H * W, D)
+    mask_flat = reliable_mask.reshape(B, -1) > 0.5
+
+    for b in range(B):
+        reliable_idx = torch.nonzero(mask_flat[b], as_tuple=False).flatten()
+        if reliable_idx.numel() < 2:
+            continue
+
+        if max_samples is not None and reliable_idx.numel() > max_samples:
+            with torch.no_grad():
+                perm = torch.randperm(reliable_idx.numel(), device=s_ir.device)[:max_samples]
+                reliable_idx = reliable_idx[perm]
+
+        if reliable_idx.numel() < 2:
+            continue
+
+        anchor = ir_flat[b, reliable_idx]
+        cand = vis_flat[b, reliable_idx]
+        sample_count = anchor.shape[0]
+        labels = torch.arange(sample_count, device=s_ir.device)
+        diag = torch.eye(sample_count, dtype=torch.bool, device=s_ir.device)
+
+        sim_i2v = anchor @ cand.t()
+        logits_i2v = sim_i2v / temperature
+        false_pos_i2v = (sim_i2v > fp_threshold) & (~diag)
+        logits_i2v = logits_i2v.masked_fill(false_pos_i2v, -1e4)
+
+        sim_v2i = cand @ anchor.t()
+        logits_v2i = sim_v2i / temperature
+        false_pos_v2i = (sim_v2i > fp_threshold) & (~diag)
+        logits_v2i = logits_v2i.masked_fill(false_pos_v2i, -1e4)
+
+        loss_i2v = F.cross_entropy(logits_i2v, labels)
+        loss_v2i = F.cross_entropy(logits_v2i, labels)
+        losses.append(0.5 * (loss_i2v + loss_v2i))
+
+        if return_stats:
+            stats["sample_counts"].append(int(sample_count))
+            stats["masked_i2v"] += int(false_pos_i2v.sum().item())
+            stats["masked_v2i"] += int(false_pos_v2i.sum().item())
+
+    if losses:
+        loss = torch.stack(losses).mean()
+    else:
+        loss = s_ir.new_tensor(0.0)
+
+    if return_stats:
+        return loss, stats
+    return loss
 
 
 def compute_teacher_region_loss(
@@ -80,9 +162,14 @@ def compute_teacher_region_loss(
     lambda_edge=0.0,
     lambda_align=0.0,
     lambda_comp=0.0,
+    lambda_comp_perc=0.0,
     lambda_sparse=0.0,
     lambda_ir_tv=0.0,
     ir_tv_edge_lambda=10.0,
+    align_mode="cosine",
+    align_temperature=0.07,
+    infonce_fp_threshold=0.8,
+    infonce_max_samples=1024,
     ssim_module=None,
     contrast_module=None,
 ):
@@ -156,6 +243,25 @@ def compute_teacher_region_loss(
     else:
         loss_comp = _zero(device)
 
+    if lambda_comp_perc > 0:
+        mask_cp = F.interpolate(mask_gt, size=pred_clear.shape[2:], mode="nearest")
+        mask_cp = (mask_cp >= 0.5).to(dtype=pred_clear.dtype)
+        if mask_cp.sum() > 0:
+            pred_feats = _multiscale_gradient_feats(pred_clear)
+            gt_feats = _multiscale_gradient_feats(clear_gt)
+            loss_comp_perc = _zero(device)
+            for pred_feat, gt_feat in zip(pred_feats, gt_feats):
+                mask_feat = F.interpolate(mask_cp, size=pred_feat.shape[2:], mode="nearest")
+                loss_comp_perc = loss_comp_perc + _masked_mean(
+                    torch.abs(pred_feat - gt_feat.detach()),
+                    mask_feat,
+                )
+            loss_comp_perc = loss_comp_perc / len(pred_feats)
+        else:
+            loss_comp_perc = _zero(device)
+    else:
+        loss_comp_perc = _zero(device)
+
     if lambda_align > 0:
         if semantic_ir is None or semantic_vis is None:
             raise ValueError("lambda_align > 0 requires semantic_ir and semantic_vis.")
@@ -164,8 +270,20 @@ def compute_teacher_region_loss(
         mask_sem = F.interpolate(mask_gt, size=semantic_ir.shape[2:], mode="nearest")
         reliable_mask = (1.0 - (mask_sem >= 0.5).float()).to(dtype=pred_clear.dtype)
         if reliable_mask.sum() > 0:
-            cos = (semantic_ir * semantic_vis).sum(dim=1, keepdim=True)
-            loss_align = _masked_mean(1.0 - cos, reliable_mask)
+            if align_mode == "infonce":
+                loss_align = _info_nce_align(
+                    semantic_ir,
+                    semantic_vis,
+                    reliable_mask,
+                    temperature=align_temperature,
+                    fp_threshold=infonce_fp_threshold,
+                    max_samples=infonce_max_samples,
+                )
+            elif align_mode == "cosine":
+                cos = (semantic_ir * semantic_vis).sum(dim=1, keepdim=True)
+                loss_align = _masked_mean(1.0 - cos, reliable_mask)
+            else:
+                raise ValueError(f"Unsupported align_mode: {align_mode}")
         else:
             loss_align = _zero(device)
     else:
@@ -223,6 +341,7 @@ def compute_teacher_region_loss(
         + lambda_edge * loss_edge
         + lambda_align * loss_align
         + lambda_comp * loss_comp
+        + lambda_comp_perc * loss_comp_perc
         + lambda_sparse * loss_sparse
         + lambda_ir_tv * loss_ir_tv
     )
@@ -237,6 +356,7 @@ def compute_teacher_region_loss(
         "edge": loss_edge,
         "align": loss_align,
         "comp": loss_comp,
+        "comp_perc": loss_comp_perc,
         "sparse": loss_sparse,
         "ir_tv": loss_ir_tv,
     }

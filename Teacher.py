@@ -316,8 +316,8 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
     执行合成域 Teacher 区域补全监督训练。
     """
     losses = []
-    loss_log = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'cr': [], 'edge': [], 'align': [], 'comp': [], 'sparse': [], 'ir_tv': [], 'total': []}
-    loss_log_tmp = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'cr': [], 'edge': [], 'align': [], 'comp': [], 'sparse': [], 'ir_tv': [], 'total': []}
+    loss_log = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'cr': [], 'edge': [], 'align': [], 'comp': [], 'comp_perc': [], 'sparse': [], 'ir_tv': [], 'total': []}
+    loss_log_tmp = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'cr': [], 'edge': [], 'align': [], 'comp': [], 'comp_perc': [], 'sparse': [], 'ir_tv': [], 'total': []}
     psnr_log = []
 
     start_step = 0
@@ -402,16 +402,24 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
         if step < getattr(opt, "color_loss_start_step", 1000):
             lambda_align = 0.0
             lambda_comp = 0.0
+            lambda_comp_perc = 0.0
             lambda_sparse = 0.0
             lambda_ir_tv = 0.0
+            effective_fp_threshold = 1.0
         else:
+            color_start_step = getattr(opt, "color_loss_start_step", 1000)
             lambda_align = getattr(opt, "w_loss_align", 0.1)
             lambda_comp = getattr(opt, "w_loss_comp", 1.0)
+            lambda_comp_perc = getattr(opt, "w_loss_comp_perc", 0.5)
             lambda_ir_tv = getattr(opt, "w_loss_ir_tv", 0.05)
             sparse_target = getattr(opt, "w_loss_sparse", 0.01)
             sparse_warmup = max(1, getattr(opt, "sparse_warmup_steps", 5000))
-            sparse_progress = min(1.0, (step - getattr(opt, "color_loss_start_step", 1000)) / sparse_warmup)
+            sparse_progress = min(1.0, (step - color_start_step) / sparse_warmup)
             lambda_sparse = sparse_target * sparse_progress
+            fp_warmup = max(1, getattr(opt, "infonce_fp_warmup_steps", 5000))
+            fp_progress = min(1.0, max(0.0, (step - color_start_step) / fp_warmup))
+            fp_target = getattr(opt, "infonce_fp_threshold", 0.8)
+            effective_fp_threshold = 1.0 + (fp_target - 1.0) * fp_progress
 
         loss_dict = compute_teacher_region_loss(
             pred_clear=pred_image,
@@ -440,9 +448,14 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
             lambda_edge=lambda_edge,
             lambda_align=lambda_align,
             lambda_comp=lambda_comp,
+            lambda_comp_perc=lambda_comp_perc,
             lambda_sparse=lambda_sparse,
             lambda_ir_tv=lambda_ir_tv,
             ir_tv_edge_lambda=getattr(opt, "ir_tv_edge_lambda", 10.0),
+            align_mode=getattr(opt, "align_mode", "infonce"),
+            align_temperature=getattr(opt, "align_temperature", 0.07),
+            infonce_fp_threshold=effective_fp_threshold,
+            infonce_max_samples=getattr(opt, "infonce_max_samples", 1024),
             ssim_module=ssim_loss_module,
             contrast_module=contrast_module,
         )
@@ -453,7 +466,7 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
         optim.step()
 
         losses.append(loss.item())
-        for key in ("rec", "density", "mask", "ssim", "cr", "edge", "align", "comp", "sparse", "ir_tv"):
+        for key in ("rec", "density", "mask", "ssim", "cr", "edge", "align", "comp", "comp_perc", "sparse", "ir_tv"):
             loss_log_tmp[key].append(loss_dict[key].item())
         loss_log_tmp['total'].append(loss.item())
 
@@ -482,7 +495,8 @@ def train(teacher_net, loader_train, loader_test, optim, criterion):
             f'| density:{loss_dict["density"].item():.5f} | mask:{loss_dict["mask"].item():.5f} '
             f'| ssim_loss:{loss_dict["ssim"].item():.5f} | cr:{loss_dict["cr"].item():.5f} '
             f'| edge:{loss_dict["edge"].item():.5f} | align:{loss_dict["align"].item():.5f} '
-            f'| comp:{loss_dict["comp"].item():.5f} | sparse:{loss_dict["sparse"].item():.5f} '
+            f'| comp:{loss_dict["comp"].item():.5f} | comp_perc:{loss_dict["comp_perc"].item():.5f} '
+            f'| sparse:{loss_dict["sparse"].item():.5f} '
             f'| ir_tv:{loss_dict["ir_tv"].item():.5f} '
             f'| mask_ratio:{mask_ratio:.4f} | mask_gt_ratio:{mask_gt_ratio:.4f} '
             f'| reliable_area:{reliable_area_ratio:.4f} | density_mean:{density_mean:.4f} '
