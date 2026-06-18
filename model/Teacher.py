@@ -1322,7 +1322,8 @@ class VIFNetInconsistencyTeacher(nn.Module):
         # ablations. Formal Eval_EMA inference must leave them as None, using
         # the model-internal HDE + mask_head + Gumbel binary_mask below.
         x_vis_01 = (x_vis * self.clip_input_std + self.clip_input_mean).clamp(0.0, 1.0)
-        density_map, density_feat = self.hde(x_vis_01, return_feat=True)
+        x_ir_01 = (x_ir * self.clip_input_std + self.clip_input_mean).clamp(0.0, 1.0)
+        density_map, density_feat = self.hde(x_vis_01, x_ir_01, return_feat=True)
         mask_logits = self.mask_head(density_feat)
         mask_prob, binary_mask = self.gumbel_binarizer(mask_logits, is_logits=True)
 

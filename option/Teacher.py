@@ -175,10 +175,10 @@ parser.add_argument('--test_num_workers', default=16, type=int,
 # ============================================================================
 # 开启后训练过程中会跑真实域 hazy/IR 配对推理，会增加评估时间和显存峰值；排查 OOM 时可先关闭。
 parser.add_argument('--run_real_infer_in_teacher', type=str2bool, nargs='?', const=True, default=True,
-                    help='是否在 Teacher 训练中执行真实域推理；默认开启。训练太慢或评估阶段 OOM 时可设 false。')
+                    help='是否在 Teacher 训练中执行 real-domain overview；默认开启（default on）。训练太慢或评估阶段 OOM 时可设 false。')
 # 保存 9 列训练区域可视化，便于检查 mask/融合/颜色搬运，但会增加 I/O 和少量显存占用。
 parser.add_argument('--save_train_batch_region_vis', type=str2bool, nargs='?', const=True, default=True,
-                    help='是否保存训练 batch 的 9 列区域可视化到 saved_data_dir；默认开启，I/O 慢或 OOM 排查时可关闭。')
+                    help='是否保存训练 batch 的 9 列监督图到 saved_data_dir；默认开启，I/O 慢或 OOM 排查时可关闭。')
 # 每轮真实域 overview 最多保存的配对数量。增大可观察更多样本但更慢、占更多磁盘；<=0 表示全部。
 parser.add_argument('--real_vis_max_images', default=0, type=int,
                     help='每个 epoch 最多展示的真实域 hazy/IR 配对数；默认 8，<=0 表示全部。')
