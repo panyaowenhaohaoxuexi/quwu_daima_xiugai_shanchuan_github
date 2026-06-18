@@ -1,4 +1,4 @@
-﻿"""
+﻿﻿"""
 这段Python代码是一个实验配置和初始化脚本。
 它使用 argparse 库来定义和解析一系列用于深度学习训练的命令行参数，如训练轮数、学习率、损失权重和保存路径等。
 在解析参数后，它会自动检测PyTorch是否可以使用CUDA（GPU），并相应地设置 opt.device。
@@ -74,7 +74,7 @@ parser.add_argument('--w_loss_SSIM', default=0.2, type=float,
 parser.add_argument('--w_loss_Cr', default=0.05, type=float,
                     help='对比重建损失权重；初次训练保留 0.05。去雾不足可小幅增大，过增强/偏色时减小。')
 # 旧边缘损失兼容项，当前训练默认关闭。除非复现实验，不建议开启或修改。
-parser.add_argument('--w_loss_Edge', default=0.0, type=float,
+parser.add_argument('--w_loss_Edge', default=0.1, type=float,
                     help='旧版边缘损失兼容权重；当前默认 0.0 表示关闭，初次训练保持不变。')
 
 # ============================================================================
@@ -161,14 +161,14 @@ parser.add_argument('--verify_temperature', default=0.1, type=float,
 # H/4 双向融合构造 B×N×N attention。256×256 输入时 H/4=64×64，N=4096。
 # 初次训练建议 batch_size=1 或 2；OOM 时先降 batch_size，再关可视化或降低输入尺寸。
 # ============================================================================
-parser.add_argument('--batch_size', default=2, type=int,
-                    help='训练 batch；默认 2。H/4 全图 attention 占显存，OOM 时优先降为 1。')
-parser.add_argument('--num_workers', default=8, type=int,
-                    help='训练 DataLoader 进程数；默认 8。CPU/内存不足或 Windows 卡住时减小，GPU 等数据时可增大。')
-parser.add_argument('--test_batch_size', default=1, type=int,
-                    help='测试 batch；默认 1。测试显存不足时保持 1，显存充足且需加速时可增大。')
-parser.add_argument('--test_num_workers', default=4, type=int,
-                    help='测试 DataLoader 进程数；默认 4。CPU/内存不足或加载报错时减小。')
+parser.add_argument('--batch_size', default=8, type=int,
+                    help='训练 batch；默认 8。H/4 全图 attention 占显存，OOM 时优先降为 1。')
+parser.add_argument('--num_workers', default=16, type=int,
+                    help='训练 DataLoader 进程数；默认 16。CPU/内存不足或 Windows 卡住时减小，GPU 等数据时可增大。')
+parser.add_argument('--test_batch_size', default=8, type=int,
+                    help='测试 batch；默认 8。测试显存不足时保持 1，显存充足且需加速时可增大。')
+parser.add_argument('--test_num_workers', default=16, type=int,
+                    help='测试 DataLoader 进程数；默认 16。CPU/内存不足或加载报错时减小。')
 
 # ============================================================================
 # 八、可视化和真实域测试开关
@@ -187,10 +187,10 @@ parser.add_argument('--real_vis_max_images', default=8, type=int,
 # 九、路径参数
 # ============================================================================
 # 模型权重输出目录；脚本会自动创建，确保所在磁盘空间充足且当前用户可写。
-parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/quwu_daima_xiugai_shanchuan_github/Teacher_xunlian/saved_model',
+parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/quwu_daima_xiugai_shanchuan_github_TMMv2/Teacher_xunlian/saved_model',
                     help='模型 checkpoint（.pth）保存目录；会自动创建，需有写权限和足够磁盘空间。')
 # 日志、损失、指标和训练可视化输出目录；脚本会自动创建。
-parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/quwu_daima_xiugai_shanchuan_github/Teacher_xunlian/saved_data',
+parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/quwu_daima_xiugai_shanchuan_github_TMMv2/Teacher_xunlian/saved_data',
                     help='训练日志、loss/指标数组及区域可视化保存目录；会自动创建并需要写权限。')
 # 合成训练集根目录，五类子目录缺一不可，并应使用可配对的文件名。
 parser.add_argument('--train_data_dir', type=str, default='/root/autodl-tmp/1_FLIR_M3FD/1_FLIR_autodl/1_train',
@@ -206,7 +206,7 @@ parser.add_argument('--real_test_ir_path', type=str, default='/root/autodl-tmp/1
                     help='真实域红外目录；文件名必须与 real_test_hazy_path 中可见光图一一对应。')
 # 真实域 overview 输出根目录，结果会继续写入 epoch_N/overview.png。
 parser.add_argument('--real_test_output_dir', type=str,
-                    default='/root/autodl-tmp/quwu_daima_xiugai_shanchuan_github/train_test/Teacher_guocheng_test',
+                    default='/root/autodl-tmp/quwu_daima_xiugai_shanchuan_github_TMMv2/train_test/Teacher_guocheng_test',
                     help='真实域结果根目录；各轮 overview 写入该目录下的 epoch_N/overview.png。')
 # 实验配置归档根目录；实际 args.txt 保存到 exp_dir/dataset/model_name/args.txt。
 parser.add_argument('--exp_dir', type=str, default='./experiment',
