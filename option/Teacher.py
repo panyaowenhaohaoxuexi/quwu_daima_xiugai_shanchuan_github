@@ -180,7 +180,7 @@ parser.add_argument('--run_real_infer_in_teacher', type=str2bool, nargs='?', con
 parser.add_argument('--save_train_batch_region_vis', type=str2bool, nargs='?', const=True, default=True,
                     help='是否保存训练 batch 的 9 列区域可视化到 saved_data_dir；默认开启，I/O 慢或 OOM 排查时可关闭。')
 # 每轮真实域 overview 最多保存的配对数量。增大可观察更多样本但更慢、占更多磁盘；<=0 表示全部。
-parser.add_argument('--real_vis_max_images', default=8, type=int,
+parser.add_argument('--real_vis_max_images', default=0, type=int,
                     help='每个 epoch 最多展示的真实域 hazy/IR 配对数；默认 8，<=0 表示全部。')
 
 # ============================================================================
