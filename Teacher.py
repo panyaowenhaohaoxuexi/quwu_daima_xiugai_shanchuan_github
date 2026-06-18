@@ -853,6 +853,9 @@ if __name__ == "__main__":
         semantic_dim=opt.semantic_dim,
         num_color_prototypes=opt.num_color_prototypes,
         transport_temperature=opt.transport_temperature,
+        fusion_temperature=opt.fusion_temperature,
+        verify_threshold=opt.verify_threshold,
+        verify_temperature=opt.verify_temperature,
     ).to(opt.device)  # 实例化新的模型
     teacher_net = teacher_net.to(opt.device)
     # --- [修改结束] ---

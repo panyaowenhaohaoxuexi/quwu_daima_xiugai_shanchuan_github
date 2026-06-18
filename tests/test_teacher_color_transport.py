@@ -1,7 +1,9 @@
 import torch
 import torch.nn.functional as F
+import pytest
 
 from model.Teacher import CrossModalSemanticColorTransport
+from model.teacher_semantic import SharedSemanticProjection
 
 
 def _make_inputs(mask_value=None):
@@ -26,6 +28,7 @@ def test_color_transport_outputs_expected_names_and_shapes():
         semantic_dim=16,
         num_prototypes=5,
         temperature=0.07,
+        shared_proj=SharedSemanticProjection(256, 16),
     )
 
     out = module(ir_feat, vis_feat, x_vis_01, binary_mask)
@@ -64,6 +67,7 @@ def test_color_transport_empty_reliable_region_is_numerically_safe():
         semantic_dim=8,
         num_prototypes=4,
         temperature=0.07,
+        shared_proj=SharedSemanticProjection(256, 8),
     )
 
     out = module(ir_feat, vis_feat, x_vis_01, binary_mask)
@@ -85,3 +89,20 @@ def test_region_locked_composite_formula_uses_transport_for_completion_only():
 
     assert torch.allclose(pred_clear[m_full.expand_as(pred_clear) == 1], transported_rgb[m_full.expand_as(transported_rgb) == 1], atol=1e-6)
     assert torch.allclose(pred_clear[m_full.expand_as(pred_clear) == 0], pred_raw[m_full.expand_as(pred_raw) == 0], atol=1e-6)
+
+
+def test_color_transport_requires_shared_projection():
+    with pytest.raises(ValueError, match="shared_proj"):
+        CrossModalSemanticColorTransport(shared_proj=None)
+
+
+def test_color_transport_uses_the_supplied_projection_instance():
+    shared_proj = SharedSemanticProjection(256, 8)
+    module = CrossModalSemanticColorTransport(
+        in_channels=256,
+        semantic_dim=8,
+        num_prototypes=4,
+        shared_proj=shared_proj,
+    )
+
+    assert module.shared_proj is shared_proj

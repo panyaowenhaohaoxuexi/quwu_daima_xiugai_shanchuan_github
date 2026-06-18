@@ -13,6 +13,8 @@ if __package__:
     from .hde import HDE
     from .gumbel_sigmoid import GumbelSigmoidBinarizer
     from .teacher_color import CrossModalSemanticColorTransport
+    from .teacher_semantic import SharedSemanticProjection
+    from .teacher_fusion import BiDirectionalSemanticFusion
 else:
     CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
@@ -25,6 +27,8 @@ else:
     from hde import HDE
     from gumbel_sigmoid import GumbelSigmoidBinarizer
     from teacher_color import CrossModalSemanticColorTransport
+    from teacher_semantic import SharedSemanticProjection
+    from teacher_fusion import BiDirectionalSemanticFusion
 # [已移除] CLIP 导入 — 颜色恢复改为纯图内 Cross-Attention
 
 
@@ -400,7 +404,7 @@ class Bottle2neck(nn.Module):
 class Res2Net(nn.Module):
     """
         Res2Net: 去雾模型的编码器部分，基于 Res2Net 结构。
-        *** [区域补全范式]：按 HAPM 掩码分流 — M=1 纯IR补全，M=0 自适应融合 ***
+        *** [区域补全范式]：M=1 纯IR补全，M=0 非对称残差融合 ***
     """
 
     def __init__(self, block, layers, baseWidth=26, scale=4, in_channels=3):  # 添加 in_channels 参数
@@ -447,6 +451,9 @@ class Res2Net(nn.Module):
             nn.BatchNorm2d(1024),
             nn.ReLU(inplace=True),
         )
+        self.align_conv0 = nn.Conv2d(64, 64, kernel_size=1)
+        self.align_conv2 = nn.Conv2d(512, 512, kernel_size=1)
+        self.align_conv3 = nn.Conv2d(1024, 1024, kernel_size=1)
 
         # 初始化权重
         for m in self.modules():
@@ -487,11 +494,12 @@ class Res2Net(nn.Module):
         return beta
 
     def forward(self, x, ir_feat_list=None, beta_list=None, haze_mask=None,
-                density_map=None, fusion_weight_heads=None, return_region_debug=False):
+                density_map=None, fusion_weight_heads=None, bidir_fusion=None,
+                return_region_debug=False):
         """
         [区域补全范式] Res2Net forward，按 HAPM 掩码严格分流：
-          - M=1（补全区）：beta_eff=1，完整 IR 内容特征替代 VIS 特征
-          - M=0（融合区）：beta_eff=beta，可见光与红外内容特征自适应凸组合
+          - M=1（补全区）：完整、未对齐的 IR 内容特征替代 VIS 特征
+          - M=0（融合区）：H/4 双向语义检索，其余尺度注入 IR 结构残差
 
         ir_feat_list: 纯 IR 内容特征，来自 encoder_ir 的完整多尺度编码特征。
                       顺序为 [H/16, H/8, H/4]，通道分别为 [1024, 512, 256]。
@@ -536,24 +544,24 @@ class Res2Net(nn.Module):
         if len(ir_feat_list) >= 4:
             F_ir_0 = self.inject_conv0(ir_feat_list[3])
             F_ir_0 = F.interpolate(F_ir_0, size=x_layer0.shape[2:], mode='bilinear', align_corners=False)
+            F_ir_0_aligned = self.align_conv0(F_ir_0)
             if fusion_weight_heads is not None:
                 if density_map is None:
                     raise ValueError("density_map is required when using fusion_weight_heads.")
-                beta_0 = self._density_guided_beta(
-                    x_layer0, F_ir_0, density_map, fusion_weight_heads[3], 129
+                g_0 = self._density_guided_beta(
+                    x_layer0, F_ir_0_aligned, density_map, fusion_weight_heads[3], 129
                 )
             else:
-                beta_0 = F.interpolate(beta_list[3], size=x_layer0.shape[2:], mode='bilinear', align_corners=False)
+                g_0 = F.interpolate(beta_list[3], size=x_layer0.shape[2:], mode='bilinear', align_corners=False)
             if haze_mask is not None:
                 mask_0 = F.interpolate(haze_mask, size=x_layer0.shape[2:], mode='nearest')
             else:
-                mask_0 = torch.zeros_like(beta_0)
-            fusion_0 = (1.0 - beta_0) * x_layer0 + beta_0 * F_ir_0
-            x_layer0_safe = mask_0 * F_ir_0 + (1.0 - mask_0) * fusion_0
+                mask_0 = torch.zeros_like(g_0)
+            x_layer0_safe = (1.0 - mask_0) * (x_layer0 + g_0 * F_ir_0_aligned) + mask_0 * F_ir_0
         else:
             F_ir_0 = x_layer0
-            beta_0 = torch.zeros(x_layer0.shape[0], 1, x_layer0.shape[2], x_layer0.shape[3],
-                                 device=x_layer0.device, dtype=x_layer0.dtype)
+            g_0 = torch.zeros(x_layer0.shape[0], 1, x_layer0.shape[2], x_layer0.shape[3],
+                              device=x_layer0.device, dtype=x_layer0.dtype)
             x_layer0_safe = x_layer0
 
         # --- H/4 尺度 (layer1, 256ch) ---
@@ -561,48 +569,62 @@ class Res2Net(nn.Module):
         F_vis_1 = x_layer1_orig
         F_ir_1 = self.inject_conv1(ir_feat_list[2])  # H/4, 256->256, IR content
         F_ir_1 = F.interpolate(F_ir_1, size=F_vis_1.shape[2:], mode='bilinear', align_corners=False)
-        if fusion_weight_heads is not None:
-            beta_1 = self._density_guided_beta(F_vis_1, F_ir_1, density_map, fusion_weight_heads[2], 513)
-        else:
-            beta_1 = F.interpolate(beta_list[2], size=F_vis_1.shape[2:], mode='bilinear', align_corners=False)
         if haze_mask is not None:
             mask_1 = F.interpolate(haze_mask, size=F_vis_1.shape[2:], mode='nearest')
         else:
-            mask_1 = torch.zeros_like(beta_1)
-        beta_eff_1 = mask_1 + (1.0 - mask_1) * beta_1  # M=1->IR content, M=0->beta fusion
-        x_layer1_fused = (1.0 - beta_eff_1) * F_vis_1 + beta_eff_1 * F_ir_1
+            mask_1 = torch.zeros(F_vis_1.shape[0], 1, F_vis_1.shape[2], F_vis_1.shape[3],
+                                 device=F_vis_1.device, dtype=F_vis_1.dtype)
+        if bidir_fusion is not None and fusion_weight_heads is not None:
+            x_layer1_fused, fusion_debug_h4 = bidir_fusion(
+                F_vis=F_vis_1,
+                F_ir=F_ir_1,
+                density_map=density_map,
+                mask=mask_1,
+                fusion_head=fusion_weight_heads[2],
+            )
+            beta_1 = fusion_debug_h4["g"]
+        else:
+            if fusion_weight_heads is not None:
+                beta_1 = self._density_guided_beta(
+                    F_vis_1, F_ir_1, density_map, fusion_weight_heads[2], 513
+                )
+            else:
+                beta_1 = F.interpolate(beta_list[2], size=F_vis_1.shape[2:], mode='bilinear', align_corners=False)
+            beta_eff_1 = mask_1 + (1.0 - mask_1) * beta_1
+            x_layer1_fused = (1.0 - beta_eff_1) * F_vis_1 + beta_eff_1 * F_ir_1
+            fusion_debug_h4 = None
 
         # --- H/8 尺度 (layer2, 512ch) ---
         x_layer2_orig = self.layer2(x_layer1_fused)  # (B, 512, H/8, W/8)
         F_vis_2 = x_layer2_orig
         F_ir_2 = self.inject_conv2(ir_feat_list[1])  # H/8, 512->512, IR content
         F_ir_2 = F.interpolate(F_ir_2, size=F_vis_2.shape[2:], mode='bilinear', align_corners=False)
+        F_ir_2_aligned = self.align_conv2(F_ir_2)
         if fusion_weight_heads is not None:
-            beta_2 = self._density_guided_beta(F_vis_2, F_ir_2, density_map, fusion_weight_heads[1], 1025)
+            g_2 = self._density_guided_beta(F_vis_2, F_ir_2_aligned, density_map, fusion_weight_heads[1], 1025)
         else:
-            beta_2 = F.interpolate(beta_list[1], size=F_vis_2.shape[2:], mode='bilinear', align_corners=False)
+            g_2 = F.interpolate(beta_list[1], size=F_vis_2.shape[2:], mode='bilinear', align_corners=False)
         if haze_mask is not None:
             mask_2 = F.interpolate(haze_mask, size=F_vis_2.shape[2:], mode='nearest')
         else:
-            mask_2 = torch.zeros_like(beta_2)
-        beta_eff_2 = mask_2 + (1.0 - mask_2) * beta_2
-        x_layer2_fused = (1.0 - beta_eff_2) * F_vis_2 + beta_eff_2 * F_ir_2
+            mask_2 = torch.zeros_like(g_2)
+        x_layer2_fused = (1.0 - mask_2) * (F_vis_2 + g_2 * F_ir_2_aligned) + mask_2 * F_ir_2
 
         # --- H/16 尺度 (layer3, 1024ch) ---
         x_layer3_orig = self.layer3(x_layer2_fused)  # (B, 1024, H/16, W/16)
         F_vis_3 = x_layer3_orig
         F_ir_3 = self.inject_conv3(ir_feat_list[0])  # H/16, 1024->1024, IR content
         F_ir_3 = F.interpolate(F_ir_3, size=F_vis_3.shape[2:], mode='bilinear', align_corners=False)
+        F_ir_3_aligned = self.align_conv3(F_ir_3)
         if fusion_weight_heads is not None:
-            beta_3 = self._density_guided_beta(F_vis_3, F_ir_3, density_map, fusion_weight_heads[0], 2049)
+            g_3 = self._density_guided_beta(F_vis_3, F_ir_3_aligned, density_map, fusion_weight_heads[0], 2049)
         else:
-            beta_3 = F.interpolate(beta_list[0], size=F_vis_3.shape[2:], mode='bilinear', align_corners=False)
+            g_3 = F.interpolate(beta_list[0], size=F_vis_3.shape[2:], mode='bilinear', align_corners=False)
         if haze_mask is not None:
             mask_3 = F.interpolate(haze_mask, size=F_vis_3.shape[2:], mode='nearest')
         else:
-            mask_3 = torch.zeros_like(beta_3)
-        beta_eff_3 = mask_3 + (1.0 - mask_3) * beta_3
-        x_layer3_fused = (1.0 - beta_eff_3) * F_vis_3 + beta_eff_3 * F_ir_3
+            mask_3 = torch.zeros_like(g_3)
+        x_layer3_fused = (1.0 - mask_3) * (F_vis_3 + g_3 * F_ir_3_aligned) + mask_3 * F_ir_3
 
         # 返回 注入后(fused)的特征（解码用）和 注入前(orig)的特征（蒸馏用）
         # H/2 uses x_layer0_safe to prevent visible shallow-feature leakage in completion regions.
@@ -614,7 +636,8 @@ class Res2Net(nn.Module):
                 "fused_feats": [x_layer3_fused, x_layer2_fused, x_layer1_fused, x_layer0_safe],
                 "ir_feats": [F_ir_3, F_ir_2, F_ir_1, F_ir_0],
                 "vis_feats": [F_vis_3, F_vis_2, F_vis_1, x_layer0],
-                "fusion_weights": [beta_3, beta_2, beta_1, beta_0],
+                "fusion_weights": [g_3, g_2, beta_1, g_0],
+                "fusion_debug_h4": fusion_debug_h4,
             }
             return fused_outputs, original_outputs, fused_debug
 
@@ -1083,7 +1106,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
     """
     Region-completion paradigm teacher model. HAPM mask splits into two paths:
       - Pass 1 (lightweight dual-stream): pure IR structure + per-pixel fusion weight beta
-      - Pass 2 (Res2Net): M=1 -> pure IR fill, M=0 -> adaptive VIS/IR fusion
+      - Pass 2 (Res2Net): M=1 -> pure IR fill, M=0 -> asymmetric IR residual fusion
       - Color restoration: in-image Cross-Attention, K/V from M=0 reliable regions only
     """
 
@@ -1093,6 +1116,9 @@ class VIFNetInconsistencyTeacher(nn.Module):
         semantic_dim=128,
         num_color_prototypes=32,
         transport_temperature=0.07,
+        fusion_temperature=0.07,
+        verify_threshold=0.2,
+        verify_temperature=0.1,
     ):
         super(VIFNetInconsistencyTeacher, self).__init__()
 
@@ -1251,11 +1277,24 @@ class VIFNetInconsistencyTeacher(nn.Module):
         self.semantic_dim = semantic_dim
         self.num_color_prototypes = num_color_prototypes
         self.transport_temperature = transport_temperature
+        self.fusion_temperature = fusion_temperature
+        self.verify_threshold = verify_threshold
+        self.verify_temperature = verify_temperature
+        self.shared_semantic_proj = SharedSemanticProjection(256, semantic_dim)
         self.color_transport = CrossModalSemanticColorTransport(
             in_channels=256,
             semantic_dim=semantic_dim,
             num_prototypes=num_color_prototypes,
             temperature=transport_temperature,
+            shared_proj=self.shared_semantic_proj,
+        )
+        self.bidir_fusion = BiDirectionalSemanticFusion(
+            in_channels=256,
+            semantic_dim=semantic_dim,
+            temperature=fusion_temperature,
+            verify_threshold=verify_threshold,
+            verify_temperature=verify_temperature,
+            shared_proj=self.shared_semantic_proj,
         )
 
         # [修改] conv_output 现在直接接收来自 vis_features 的 16 个通道
@@ -1300,6 +1339,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
             haze_mask=binary_mask,
             density_map=density_map,
             fusion_weight_heads=self.fusion_weight_heads,
+            bidir_fusion=self.bidir_fusion,
             return_region_debug=True,
         )
 
@@ -1387,6 +1427,7 @@ class VIFNetInconsistencyTeacher(nn.Module):
                 "ir_feats": region_debug["ir_feats"],
                 "vis_feats": region_debug["vis_feats"],
                 "fusion_weights": region_debug["fusion_weights"],
+                "fusion_debug_h4": region_debug.get("fusion_debug_h4"),
             }
             return_dict.update(color_out)
             return return_dict

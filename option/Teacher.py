@@ -92,6 +92,12 @@ parser.add_argument('--num_color_prototypes', default=32, type=int,
                     help='number of reliable-region semantic color prototypes')
 parser.add_argument('--transport_temperature', default=0.07, type=float,
                     help='softmax temperature for prototype color transport attention')
+parser.add_argument('--fusion_temperature', default=0.07, type=float,
+                    help='softmax temperature for H/4 VIS-to-IR semantic retrieval')
+parser.add_argument('--verify_threshold', default=0.2, type=float,
+                    help='raw cosine threshold for H/4 IR-to-VIS semantic verification')
+parser.add_argument('--verify_temperature', default=0.1, type=float,
+                    help='sigmoid temperature for H/4 semantic verification gate')
 parser.add_argument('--ir_tv_edge_lambda', default=10.0, type=float,
                     help='IR gradient edge sensitivity for completion color TV loss')
 

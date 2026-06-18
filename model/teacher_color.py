@@ -12,22 +12,17 @@ class CrossModalSemanticColorTransport(nn.Module):
     RGB, never from clear_gt.
     """
 
-    def __init__(self, in_channels=256, semantic_dim=128, num_prototypes=32, temperature=0.07, eps=1e-6):
+    def __init__(self, shared_proj, in_channels=256, semantic_dim=128, num_prototypes=32, temperature=0.07, eps=1e-6):
         super(CrossModalSemanticColorTransport, self).__init__()
+        if shared_proj is None:
+            raise ValueError("shared_proj is required for CrossModalSemanticColorTransport")
         self.semantic_dim = semantic_dim
         self.num_prototypes = num_prototypes
         self.temperature = temperature
         self.eps = eps
-        self.proj_ir = nn.Sequential(
-            nn.Conv2d(in_channels, semantic_dim, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(semantic_dim, semantic_dim, kernel_size=1),
-        )
-        self.proj_vis = nn.Sequential(
-            nn.Conv2d(in_channels, semantic_dim, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(semantic_dim, semantic_dim, kernel_size=1),
-        )
+        # The Teacher owns and registers the shared projection. Keep only a
+        # reference here so checkpoint keys live under shared_semantic_proj.*.
+        object.__setattr__(self, "shared_proj", shared_proj)
         self.assignment_head = nn.Conv2d(semantic_dim, num_prototypes, kernel_size=1)
 
     def _safe_reliable_mean_rgb(self, rgb_value, reliable_mask, reliable_area):
@@ -44,8 +39,7 @@ class CrossModalSemanticColorTransport(nn.Module):
         if haze_mask.dim() == 3:
             haze_mask = haze_mask.unsqueeze(1)
 
-        s_ir = F.normalize(self.proj_ir(ir_feat), dim=1, eps=self.eps)
-        s_vis = F.normalize(self.proj_vis(vis_feat), dim=1, eps=self.eps)
+        s_ir, s_vis = self.shared_proj(ir_feat, vis_feat)
 
         mask_feat = F.interpolate(haze_mask.float(), size=(Hf, Wf), mode="nearest")
         mask_feat = (mask_feat >= 0.5).float()
