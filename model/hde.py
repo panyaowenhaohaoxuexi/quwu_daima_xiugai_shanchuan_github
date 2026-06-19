@@ -1,36 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-try:
-    from torchvision.ops import DeformConv2d as _TorchvisionDeformConv2d
-except Exception:
-    _TorchvisionDeformConv2d = None
-
-
-class _FallbackDeformConv2d(nn.Module):
-    """Conv2d fallback with the same forward(x, offset) interface."""
-
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0,
-                 dilation=1, groups=1, bias=True):
-        super().__init__()
-        self.conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=bias,
-        )
-
-    def forward(self, x, offset, mask=None):
-        # mask is intentionally ignored in fallback.
-        return self.conv(x)
-
-
-DeformConv2d = _TorchvisionDeformConv2d or _FallbackDeformConv2d
+from torchvision.ops import DeformConv2d
 
 
 class IRDifferenceStructureEncoder(nn.Module):
@@ -173,10 +144,7 @@ class HDE(nn.Module):
             nn.init.zeros_(mask_head.bias)
 
     def _apply_deform(self, deform, x, offset, mask):
-        try:
-            return deform(x, offset, mask)
-        except TypeError:
-            return deform(x, offset)
+        return deform(x, offset, mask)
 
     def forward(self, x_vis_01, x_ir_01=None, return_feat=False, return_debug=False):
         if x_ir_01 is None:

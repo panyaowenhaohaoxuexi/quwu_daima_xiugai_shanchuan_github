@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from model.hde import HDE, IRDifferenceStructureEncoder, _FallbackDeformConv2d
+from model.hde import HDE, IRDifferenceStructureEncoder
 
 
 def _inputs(requires_grad=False):
@@ -11,6 +11,20 @@ def _inputs(requires_grad=False):
     x_vis = torch.rand(2, 3, 32, 32, requires_grad=requires_grad)
     x_ir = torch.rand(2, 3, 32, 32, requires_grad=requires_grad)
     return x_vis, x_ir
+
+
+def test_hde_requires_torchvision_dcn_without_fallback():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "model" / "hde.py").read_text(encoding="utf-8")
+
+    assert "from torchvision.ops import DeformConv2d" in source
+    for forbidden in (
+        "_FallbackDeformConv2d",
+        "_TorchvisionDeformConv2d",
+        "except TypeError",
+        "except Exception",
+    ):
+        assert forbidden not in source
 
 
 def test_ir_difference_encoder_uses_fixed_registered_kernels():
@@ -190,17 +204,6 @@ def test_hde_ir_modulation_branch_backpropagates_to_x_ir():
     assert x_ir.grad.abs().sum() > 0
 
 
-def test_fallback_deform_conv_accepts_mask_argument():
-    fallback = _FallbackDeformConv2d(3, 4, kernel_size=3, padding=1)
-    x = torch.rand(1, 3, 16, 16)
-    offset = torch.zeros(1, 18, 16, 16)
-    mask = torch.ones(1, 9, 16, 16)
-
-    output = fallback(x, offset, mask)
-
-    assert output.shape == (1, 4, 16, 16)
-
-
 class _MaskAwareDeform(nn.Module):
     def __init__(self):
         super().__init__()
@@ -208,11 +211,6 @@ class _MaskAwareDeform(nn.Module):
 
     def forward(self, x, offset, mask):
         self.received_mask = mask
-        return x
-
-
-class _OffsetOnlyDeform(nn.Module):
-    def forward(self, x, offset):
         return x
 
 
@@ -227,17 +225,6 @@ def test_apply_deform_passes_mask_to_supported_interface():
 
     assert output.shape == x.shape
     assert deform.received_mask is mask
-
-
-def test_apply_deform_falls_back_when_mask_signature_is_unsupported():
-    hde = HDE()
-    x = torch.rand(1, 3, 16, 16)
-    offset = torch.zeros(1, 18, 16, 16)
-    mask = torch.ones(1, 9, 16, 16)
-
-    output = hde._apply_deform(_OffsetOnlyDeform(), x, offset, mask)
-
-    assert output.shape == x.shape
 
 
 def test_teacher_uses_normalized_ir_for_hde_and_keeps_mask_head_at_96_channels():
