@@ -1,8 +1,9 @@
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
-from model.hde import HDE, IRDifferenceStructureEncoder
+from model.hde import HDE, IRDifferenceStructureEncoder, _FallbackDeformConv2d
 
 
 def _inputs(requires_grad=False):
@@ -127,6 +128,116 @@ def test_hde_backward_reaches_visible_and_infrared_inputs():
     assert x_ir.grad is not None
     assert torch.isfinite(x_ir.grad).all()
     assert x_ir.grad.abs().sum() > 0
+
+
+def test_hde_modulation_mask_heads_are_stably_initialized():
+    hde = HDE()
+
+    for module in (
+        hde.mask_conv1_vis,
+        hde.mask_conv1_ir,
+        hde.mask_conv2_vis,
+        hde.mask_conv2_ir,
+    ):
+        assert module.out_channels == 9
+    for module in (
+        hde.offset_conv1_vis,
+        hde.offset_conv1_ir,
+        hde.offset_conv2_vis,
+        hde.offset_conv2_ir,
+    ):
+        assert module.out_channels == 18
+    for module in (hde.mask_conv1_vis, hde.mask_conv2_vis):
+        assert torch.allclose(module.weight, torch.zeros_like(module.weight), atol=1e-6)
+        assert torch.allclose(module.bias, torch.full_like(module.bias, 5.0), atol=1e-6)
+    for module in (hde.mask_conv1_ir, hde.mask_conv2_ir):
+        assert torch.allclose(module.weight, torch.zeros_like(module.weight), atol=1e-6)
+        assert torch.allclose(module.bias, torch.zeros_like(module.bias), atol=1e-6)
+
+
+def test_hde_modulation_masks_start_near_identity():
+    hde = HDE().eval()
+    x_vis, x_ir = _inputs()
+
+    with torch.no_grad():
+        _, _, debug = hde(x_vis, x_ir, return_feat=True, return_debug=True)
+
+    for key in ("mask1", "mask2", "mask1_vis", "mask2_vis", "mask1_ir", "mask2_ir"):
+        assert key in debug
+        assert debug[key].shape == (2, 9, 32, 32)
+    for key in ("mask1", "mask2"):
+        assert debug[key].min() > 0.98
+        assert debug[key].mean() > 0.99
+        assert debug[key].max() <= 1.0
+    for key in ("mask1_ir", "mask2_ir"):
+        assert torch.allclose(debug[key], torch.zeros_like(debug[key]), atol=1e-6)
+
+
+def test_hde_ir_modulation_branch_backpropagates_to_x_ir():
+    hde = HDE().eval()
+    with torch.no_grad():
+        hde.mask_conv1_ir.weight.fill_(1e-3)
+        hde.mask_conv2_ir.weight.fill_(1e-3)
+        hde.mask_conv1_ir.bias.zero_()
+        hde.mask_conv2_ir.bias.zero_()
+    x_vis, x_ir = _inputs(requires_grad=True)
+
+    _, _, debug = hde(x_vis, x_ir, return_feat=True, return_debug=True)
+    (debug["mask1"].mean() + debug["mask2"].mean()).backward()
+
+    assert x_ir.grad is not None
+    assert torch.isfinite(x_ir.grad).all()
+    assert x_ir.grad.abs().sum() > 0
+
+
+def test_fallback_deform_conv_accepts_mask_argument():
+    fallback = _FallbackDeformConv2d(3, 4, kernel_size=3, padding=1)
+    x = torch.rand(1, 3, 16, 16)
+    offset = torch.zeros(1, 18, 16, 16)
+    mask = torch.ones(1, 9, 16, 16)
+
+    output = fallback(x, offset, mask)
+
+    assert output.shape == (1, 4, 16, 16)
+
+
+class _MaskAwareDeform(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.received_mask = None
+
+    def forward(self, x, offset, mask):
+        self.received_mask = mask
+        return x
+
+
+class _OffsetOnlyDeform(nn.Module):
+    def forward(self, x, offset):
+        return x
+
+
+def test_apply_deform_passes_mask_to_supported_interface():
+    hde = HDE()
+    deform = _MaskAwareDeform()
+    x = torch.rand(1, 3, 16, 16)
+    offset = torch.zeros(1, 18, 16, 16)
+    mask = torch.ones(1, 9, 16, 16)
+
+    output = hde._apply_deform(deform, x, offset, mask)
+
+    assert output.shape == x.shape
+    assert deform.received_mask is mask
+
+
+def test_apply_deform_falls_back_when_mask_signature_is_unsupported():
+    hde = HDE()
+    x = torch.rand(1, 3, 16, 16)
+    offset = torch.zeros(1, 18, 16, 16)
+    mask = torch.ones(1, 9, 16, 16)
+
+    output = hde._apply_deform(_OffsetOnlyDeform(), x, offset, mask)
+
+    assert output.shape == x.shape
 
 
 def test_teacher_uses_normalized_ir_for_hde_and_keeps_mask_head_at_96_channels():

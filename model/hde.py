@@ -25,7 +25,8 @@ class _FallbackDeformConv2d(nn.Module):
             bias=bias,
         )
 
-    def forward(self, x, offset):
+    def forward(self, x, offset, mask=None):
+        # mask is intentionally ignored in fallback.
         return self.conv(x)
 
 
@@ -119,6 +120,8 @@ class HDE(nn.Module):
         # Offset channels = 2 * 3 * 3 = 18. IR-guided heads consume both streams.
         self.offset_conv1_vis = nn.Conv2d(32, 18, kernel_size=3, padding=1, bias=True)
         self.offset_conv1_ir = nn.Conv2d(64, 18, kernel_size=3, padding=1, bias=True)
+        self.mask_conv1_vis = nn.Conv2d(32, 9, kernel_size=3, padding=1, bias=True)
+        self.mask_conv1_ir = nn.Conv2d(64, 9, kernel_size=3, padding=1, bias=True)
         self.deform_conv1 = DeformConv2d(32, 64, kernel_size=3, padding=1, bias=False)
         self.bn_relu1 = nn.Sequential(
             nn.BatchNorm2d(64),
@@ -127,6 +130,8 @@ class HDE(nn.Module):
 
         self.offset_conv2_vis = nn.Conv2d(64, 18, kernel_size=3, padding=1, bias=True)
         self.offset_conv2_ir = nn.Conv2d(128, 18, kernel_size=3, padding=1, bias=True)
+        self.mask_conv2_vis = nn.Conv2d(64, 9, kernel_size=3, padding=1, bias=True)
+        self.mask_conv2_ir = nn.Conv2d(128, 9, kernel_size=3, padding=1, bias=True)
         self.deform_conv2 = DeformConv2d(64, 64, kernel_size=3, padding=1, bias=False)
         self.bn_relu2 = nn.Sequential(
             nn.BatchNorm2d(64),
@@ -160,6 +165,19 @@ class HDE(nn.Module):
             nn.init.zeros_(offset_head.weight)
             nn.init.zeros_(offset_head.bias)
 
+        for mask_head in (self.mask_conv1_vis, self.mask_conv2_vis):
+            nn.init.zeros_(mask_head.weight)
+            nn.init.constant_(mask_head.bias, 5.0)
+        for mask_head in (self.mask_conv1_ir, self.mask_conv2_ir):
+            nn.init.zeros_(mask_head.weight)
+            nn.init.zeros_(mask_head.bias)
+
+    def _apply_deform(self, deform, x, offset, mask):
+        try:
+            return deform(x, offset, mask)
+        except TypeError:
+            return deform(x, offset)
+
     def forward(self, x_vis_01, x_ir_01=None, return_feat=False, return_debug=False):
         if x_ir_01 is None:
             x_ir_01 = x_vis_01
@@ -168,14 +186,32 @@ class HDE(nn.Module):
         ir_struct = self.ir_struct_encoder(x_ir_01)
         ir_struct_64 = self.ir_struct_to64(ir_struct)
 
+        offset1_input = torch.cat([f_vis, ir_struct], dim=1)
         offset1_vis = self.offset_conv1_vis(f_vis)
-        offset1_ir = self.offset_conv1_ir(torch.cat([f_vis, ir_struct], dim=1))
-        f = self.deform_conv1(f_vis, offset1_vis + offset1_ir)
+        offset1_ir = self.offset_conv1_ir(offset1_input)
+        mask1_vis = self.mask_conv1_vis(f_vis)
+        mask1_ir = self.mask_conv1_ir(offset1_input)
+        mask1 = torch.sigmoid(mask1_vis + mask1_ir)
+        f = self._apply_deform(
+            self.deform_conv1,
+            f_vis,
+            offset1_vis + offset1_ir,
+            mask1,
+        )
         f = self.bn_relu1(f)
 
+        offset2_input = torch.cat([f, ir_struct_64], dim=1)
         offset2_vis = self.offset_conv2_vis(f)
-        offset2_ir = self.offset_conv2_ir(torch.cat([f, ir_struct_64], dim=1))
-        f = self.deform_conv2(f, offset2_vis + offset2_ir)
+        offset2_ir = self.offset_conv2_ir(offset2_input)
+        mask2_vis = self.mask_conv2_vis(f)
+        mask2_ir = self.mask_conv2_ir(offset2_input)
+        mask2 = torch.sigmoid(mask2_vis + mask2_ir)
+        f = self._apply_deform(
+            self.deform_conv2,
+            f,
+            offset2_vis + offset2_ir,
+            mask2,
+        )
         f = self.bn_relu2(f)
 
         fm_vis = torch.cat(
@@ -210,6 +246,12 @@ class HDE(nn.Module):
                 "offset1_ir": offset1_ir,
                 "offset2_vis": offset2_vis,
                 "offset2_ir": offset2_ir,
+                "mask1": mask1,
+                "mask2": mask2,
+                "mask1_vis": mask1_vis,
+                "mask2_vis": mask2_vis,
+                "mask1_ir": mask1_ir,
+                "mask2_ir": mask2_ir,
             }
             if return_feat:
                 return density_map, fm_vis, debug
