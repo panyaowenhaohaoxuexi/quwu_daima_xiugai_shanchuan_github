@@ -16,6 +16,7 @@ from option._formal_config import tir_normalization_config_from_args
 from training.omega_sampler import OmegaSampler
 from training.source_step import compute_source_batch_losses
 from training.step_control import perform_optimizer_step
+from training.step_transaction import rollback_step_transaction, snapshot_step_transaction
 from training.omega_state import update_empty_omega_streak
 from training.metrics import psnr, ssim_global
 from utils.visualize_fog_routed import build_diagnostic_panel
@@ -72,8 +73,10 @@ def main(argv=None):
     print(f"[density] semantics={args.density_gt_semantics} inspection={inspection}")
     sampler = StatefulRandomSampler(len(dataset), seed=args.model_init_seed)
     dataset.set_sampler_epoch(sampler.epoch)
+    source_loader_generator = torch.Generator().manual_seed(args.model_init_seed + 301)
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
-                        num_workers=args.num_workers, collate_fn=collate_synth)
+                        num_workers=args.num_workers, collate_fn=collate_synth,
+                        generator=source_loader_generator)
     # The same persisted semantic configuration is used for source training,
     # resume and evaluation; no architecture default may silently replace a
     # user-supplied model/preprocessing setting.
@@ -89,11 +92,13 @@ def main(argv=None):
     omega_generator.manual_seed(args.model_init_seed + 101)
     model.train()
     global_step, empty_omega_streak, start_epoch = 0, 0, 0
+    source_failed_step_streak = 0
     density_batch_logged = False
     if resume_checkpoint is not None:
         restored = restore_source_training_state(
             resume_checkpoint, model, optimizer, sampler, args.density_gt_semantics,
             manifest_fingerprint=dataset.manifest_fingerprint(), omega_generator=omega_generator,
+            dataloader_generators={"source": source_loader_generator},
         )
         global_step = restored["global_step"]
         empty_omega_streak = restored["empty_omega_streak"]
@@ -110,7 +115,9 @@ def main(argv=None):
         epoch_completed = False
         while not epoch_completed:
             step_failed = False
-            for hazy, clear, tir, density in iter(loader):
+            source_iterator_state_before = source_loader_generator.get_state()
+            source_iterator = iter(loader)
+            for hazy, clear, tir, density in source_iterator:
                 if hazy.numel() == 0:
                     continue
                 hazy, clear, tir, density = (value.to(device) for value in (hazy, clear, tir, density))
@@ -121,24 +128,45 @@ def main(argv=None):
                         f"mean={density.mean().item():.6f}"
                     )
                     density_batch_logged = True
+                transaction = snapshot_step_transaction(
+                    modules=[model], omega_generator=omega_generator,
+                    dataloader_generators={"source": source_loader_generator},
+                )
                 source_result = compute_source_batch_losses(
                     model, (hazy, clear, tir, density), args, omega_sampler, global_step,
                     omega_generator=omega_generator,
                 )
                 losses, state = source_result["losses"], source_result["state"]
-                valid_omega_count = int(source_result["omega"]["omega_support"].shape[0])
+                route_stats = source_result["route_supervision"]
+                valid_q_region_count = int(route_stats["valid_q_region_count"])
                 optimizer.zero_grad(set_to_none=True)
                 losses["total"].backward()
                 succeeded = perform_optimizer_step(optimizer, model.parameters())
                 if not succeeded:
-                    print(f"step={global_step} skipped: non-finite gradients; batch will be retried")
+                    rollback_step_transaction(
+                        transaction, modules=[model], omega_generator=omega_generator,
+                        dataloader_generators={"source": source_loader_generator},
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    source_loader_generator.set_state(source_iterator_state_before)
+                    source_failed_step_streak += 1
+                    if source_failed_step_streak >= args.max_consecutive_failed_steps:
+                        raise RuntimeError(
+                            "source optimizer failed repeatedly; "
+                            f"step={global_step}, failed_streak={source_failed_step_streak}, "
+                            f"loss={float(losses['total'].detach())}, "
+                            f"nonfinite_gradients=True, sampler_position={sampler.next_sample_position}, "
+                            f"batch_size={hazy.shape[0]}, grad_scaler_scale=None"
+                        )
+                    print(f"step={global_step} skipped: transaction rolled back; batch will be retried")
                     step_failed = True
                     break
+                source_failed_step_streak = 0
                 sampler.commit(hazy.shape[0])
                 empty_omega_streak = update_empty_omega_streak(
                     empty_omega_streak,
                     effective_lambda_route=args.lambda_router * state["lambda_route"],
-                    valid_omega_count=valid_omega_count,
+                    valid_omega_count=valid_q_region_count,
                     step_succeeded=True,
                 )
                 if empty_omega_streak >= args.max_consecutive_empty_omega_steps:
@@ -148,7 +176,9 @@ def main(argv=None):
                         f"streak={empty_omega_streak}, statuses={statuses}, "
                         f"density_min={density.min().item():.5f}, density_max={density.max().item():.5f}, "
                         f"density_mean={density.mean().item():.5f}, density_std={density.std().item():.5f}, "
-                        f"omega_area=[{args.omega_min_area},{args.omega_max_area}], "
+                        f"sampled_omega_count={route_stats['sampled_omega_count']}, "
+                        f"valid_q_region_count={valid_q_region_count}, "
+                        f"valid_route_pixel_count={route_stats['valid_route_pixel_count']}, "
                         f"effective_lambda_route={args.lambda_router * state['lambda_route']:.6f}"
                     )
                 global_step += 1
@@ -174,7 +204,10 @@ def main(argv=None):
             checkpoint = build_source_checkpoint(
                 model.state_dict(), optimizer.state_dict(), None, global_step, epoch,
                 vars(args), args.density_gt_semantics,
-                capture_rng_state(omega_generator=omega_generator),
+                capture_rng_state(
+                    omega_generator=omega_generator,
+                    dataloader_generators={"source": source_loader_generator},
+                ),
                 sampler_states={"source": sampler.state_dict()},
                 empty_omega_streaks={"source": empty_omega_streak},
                 manifest_fingerprints={"source": dataset.manifest_fingerprint()},

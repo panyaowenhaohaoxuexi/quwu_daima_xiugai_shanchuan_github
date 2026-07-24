@@ -273,3 +273,30 @@
 - Final verification: `D:\anaconda\envs\CoA\python.exe -m pytest -q` ->
   `141 passed, 5 warnings in 17.75s`. Warnings are four upstream torchvision
   Pillow deprecations and the existing `TestDataset` collection warning.
+
+## 2026-07-24 -- failed-step rollback and valid-q route supervision
+
+- Baseline HEAD: `9d03e61a0e99d6c8397a5dd0fe4cb933cd49b06a`; baseline regression:
+  `141 passed, 5 warnings`. Existing untracked user resources were preserved.
+- Added buffer-only step transactions. Failed source attempts restore every
+  source-model named buffer and failed EMA attempts restore every student and
+  teacher named buffer using in-place `copy_()`. Parameters and optimizer state
+  are not copied or restored because a failed optimizer step commits neither.
+- Transactions restore Python/NumPy/Torch CPU/CUDA, Omega, geometry and named
+  DataLoader-generator states. GradScaler state is intentionally excluded: an
+  AMP overflow's reduced scale survives and is used by the retry.
+- Source/real/source-anchor DataLoaders use independent seeds `+301/+302/+303`.
+  Iterator pre-creation generator state is retained and restored before retry,
+  preventing a failed iterator rebuild from consuming an extra worker base seed.
+  Checkpoint capture/restore now carries the corresponding named generators.
+- Source and EMA use independent runtime-only failed-step streaks (limit 20).
+  These are not persisted because checkpoints are emitted only after completed
+  successful epochs.
+- Route supervision now records sampled Omega regions, valid-q regions and
+  valid route pixels. Source and EMA empty-Omega protection uses valid-q
+  region count rather than sampled region count.
+- Regression coverage includes buffer/RNG transaction rollback, all-invalid and
+  mixed valid-q accounting, source failed-once retry and EMA failed-once retry.
+  Both retry tests match no-failure reference Omega/DataLoader generator states.
+- Final command: `D:\anaconda\envs\CoA\python.exe -m pytest -q -p no:cacheprovider`
+  with `PYTHONDONTWRITEBYTECODE=1` -> `145 passed, 5 warnings in 36.85s`.

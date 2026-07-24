@@ -31,3 +31,44 @@ def test_source_step_produces_single_graph_loss_and_counterfactual_q():
     assert result["losses"]["total"].requires_grad
     assert result["q"].requires_grad is False
     assert result["output"]["pred_clear"].shape == batch[0].shape
+    assert set(result["route_supervision"]) == {
+        "sampled_omega_count", "valid_q_region_count", "valid_route_pixel_count",
+    }
+
+
+def test_route_supervision_counts_only_regions_with_valid_q(monkeypatch):
+    import training.source_step as source_step
+
+    model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
+    batch = tuple(torch.rand(1, channels, 32, 32) for channels in (3, 3, 3, 1))
+    supports = torch.zeros(3, 1, 32, 32)
+    supports[0, ..., 2:4, 2:4] = 1
+    supports[1, ..., 6:8, 6:8] = 1
+    supports[2, ..., 10:12, 10:12] = 1
+
+    class _Omega:
+        def sample(self, *_args, **_kwargs):
+            return {
+                "owner_index": torch.tensor([0, 0, 0]), "omega_support": supports,
+                "omega_weight": torch.ones_like(supports), "status": ["ok"] * 3,
+            }
+
+    def fake_candidates(_model, _context, _owners, _supports, *_args):
+        output = {"pred_clear": torch.zeros(3, 3, 32, 32)}
+        return output, output
+
+    def fake_q(*_args, **_kwargs):
+        valid = torch.zeros_like(supports)
+        valid[0, ..., 2:4, 2:4] = 1
+        valid[2, ..., 10:12, 10:12] = 1
+        return torch.full_like(valid, 0.5), valid
+
+    monkeypatch.setattr(source_step, "run_counterfactual_chunks", fake_candidates)
+    monkeypatch.setattr(source_step, "compute_q", fake_q)
+    result = source_step.compute_source_batch_losses(model, batch, _args(), _Omega(), global_step=1)
+
+    assert result["route_supervision"] == {
+        "sampled_omega_count": 3,
+        "valid_q_region_count": 2,
+        "valid_route_pixel_count": 8,
+    }

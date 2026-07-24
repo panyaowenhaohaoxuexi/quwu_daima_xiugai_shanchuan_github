@@ -150,7 +150,8 @@ def build_ema_checkpoint(student, teacher, optimizer, scheduler, source_global_s
 
 
 def restore_source_training_state(checkpoint, model, optimizer, sampler, density_semantics,
-                                  scheduler=None, manifest_fingerprint=None, omega_generator=None):
+                                  scheduler=None, manifest_fingerprint=None, omega_generator=None,
+                                  dataloader_generators=None):
     """Strictly restore a source checkpoint before creating the next iterator."""
     validate_checkpoint_metadata(checkpoint, "source", density_semantics)
     model.load_state_dict(checkpoint["model"], strict=True)
@@ -163,7 +164,10 @@ def restore_source_training_state(checkpoint, model, optimizer, sampler, density
     sampler.load_state_dict(source_state)
     if manifest_fingerprint is not None and checkpoint.get("manifest_fingerprints", {}).get("source") != manifest_fingerprint:
         raise ValueError("source dataset manifest fingerprint mismatch")
-    restore_rng_state(checkpoint["rng_state"], omega_generator=omega_generator)
+    restore_rng_state(
+        checkpoint["rng_state"], omega_generator=omega_generator,
+        dataloader_generators=dataloader_generators,
+    )
     return {
         "global_step": int(checkpoint["global_step"]),
         "epoch": int(checkpoint["epoch"]),
@@ -174,7 +178,7 @@ def restore_source_training_state(checkpoint, model, optimizer, sampler, density
 def restore_ema_training_state(checkpoint, student, teacher, optimizer, source_sampler,
                                real_sampler, density_semantics, scheduler=None,
                                manifest_fingerprints=None, omega_generator=None,
-                               geometry_generator=None):
+                               geometry_generator=None, dataloader_generators=None):
     """Strictly restore the paired EMA state before either iterator is created."""
     validate_checkpoint_metadata(checkpoint, "ema", density_semantics)
     student.load_state_dict(checkpoint["student"], strict=True)
@@ -195,7 +199,7 @@ def restore_ema_training_state(checkpoint, student, teacher, optimizer, source_s
             raise ValueError("EMA dataset manifest fingerprint mismatch")
     restore_rng_state(
         checkpoint["rng_state"], omega_generator=omega_generator,
-        geometry_generator=geometry_generator,
+        geometry_generator=geometry_generator, dataloader_generators=dataloader_generators,
     )
     streaks = checkpoint.get("empty_omega_streaks", {})
     return {

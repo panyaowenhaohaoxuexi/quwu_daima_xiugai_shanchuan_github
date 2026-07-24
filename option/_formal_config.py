@@ -79,6 +79,7 @@ def add_training_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--omega_min_area", type=int, default=16)
     parser.add_argument("--omega_max_area", type=int, default=256)
     parser.add_argument("--max_consecutive_empty_omega_steps", type=int, default=100)
+    parser.add_argument("--max_consecutive_failed_steps", type=int, default=20)
     parser.add_argument("--density_smooth_l1_beta", type=float, default=0.1)
     parser.add_argument("--rec_l1_weight", type=float, default=1.0)
     parser.add_argument("--rec_gradient_weight", type=float, default=0.0)
@@ -127,8 +128,8 @@ def validate_common(args):
     for name in ("memory_reliable_ratio_threshold", "memory_confidence_threshold"):
         if not 0 <= getattr(args, name) <= 1:
             raise ValueError(f"{name} must be in [0,1]")
-    if args.boundary_width < 1 or args.max_consecutive_empty_omega_steps < 1:
-        raise ValueError("boundary_width and max_consecutive_empty_omega_steps must be >= 1")
+    if args.boundary_width < 1 or args.max_consecutive_empty_omega_steps < 1 or args.max_consecutive_failed_steps < 1:
+        raise ValueError("boundary_width and consecutive-step limits must be >= 1")
     if any(getattr(args, name) < 0 for name in vars(args) if name.startswith("lambda_")):
         raise ValueError("lambda coefficients must be non-negative")
     if args.tir_normalization == "fixed_range" and not (args.tir_fixed_max > args.tir_fixed_min):

@@ -60,6 +60,16 @@ def compute_source_batch_losses(model, source_batch, args, omega_sampler, global
         omega_weight.index_add_(0, owners, omega["omega_weight"])
     q = q_sum / q_valid_sum.clamp_min(1.0)
     route_support = (omega_support * (q_valid_sum > 0).to(omega_support.dtype)).detach()
+    candidate_has_valid_q = (
+        candidate_valid.flatten(1).gt(0).any(dim=1)
+        if state["execute_counterfactual"] and supports.numel()
+        else torch.zeros(0, device=density.device, dtype=torch.bool)
+    )
+    route_supervision = {
+        "sampled_omega_count": int(supports.shape[0]),
+        "valid_q_region_count": int(candidate_has_valid_q.sum().item()),
+        "valid_route_pixel_count": int((route_support > 0).sum().item()),
+    }
     losses = compute_source_objective(
         output["pred_clear"], clear, output["density_map"], density,
         output["route_soft"], output["boundary_map"], q, route_support, omega_weight,
@@ -76,4 +86,4 @@ def compute_source_batch_losses(model, source_batch, args, omega_sampler, global
     )
     return {"context": context, "output": output, "losses": losses, "q": q,
             "q_valid_sum": q_valid_sum, "route_support": route_support,
-            "omega": omega, "state": state}
+            "route_supervision": route_supervision, "omega": omega, "state": state}
