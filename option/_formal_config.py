@@ -12,6 +12,8 @@ def tir_normalization_config_from_args(args):
         "percentile_low": args.tir_percentile_low,
         "percentile_high": args.tir_percentile_high,
         "percentile_scope": args.tir_percentile_scope,
+        "dataset_percentile_low_value": args.tir_dataset_percentile_low_value,
+        "dataset_percentile_high_value": args.tir_dataset_percentile_high_value,
         "channel_tolerance_code_values": args.tir_channel_tolerance_code_values,
         "channel_tolerance_float": args.tir_channel_tolerance_float,
     }
@@ -49,6 +51,8 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--tir_percentile_low", type=float, default=1.0)
     parser.add_argument("--tir_percentile_high", type=float, default=99.0)
     parser.add_argument("--tir_percentile_scope", choices=("per_image", "dataset"), default="per_image")
+    parser.add_argument("--tir_dataset_percentile_low_value", type=float)
+    parser.add_argument("--tir_dataset_percentile_high_value", type=float)
     parser.add_argument("--tir_channel_tolerance_code_values", type=int, default=1)
     parser.add_argument("--tir_channel_tolerance_float", type=float, default=1e-5)
     parser.add_argument("--pair_alignment_policy", choices=("strict", "resize_tir_to_rgb"), default="strict")
@@ -131,6 +135,11 @@ def validate_common(args):
         raise ValueError("TIR fixed max must exceed min")
     if not (0 <= args.tir_percentile_low < args.tir_percentile_high <= 100):
         raise ValueError("invalid TIR percentiles")
+    if args.tir_normalization == "percentile" and args.tir_percentile_scope == "dataset":
+        if args.tir_dataset_percentile_low_value is None or args.tir_dataset_percentile_high_value is None:
+            raise ValueError("dataset TIR percentile scope requires calibrated low/high values")
+        if not args.tir_dataset_percentile_high_value > args.tir_dataset_percentile_low_value:
+            raise ValueError("dataset TIR percentile high value must exceed low value")
     if args.density_map_normalization == "fixed_range" and not (args.density_fixed_max > args.density_fixed_min):
         raise ValueError("density fixed max must exceed min")
     if args.density_map_normalization == "dataset_calibrated_range" and not (args.density_calibrated_max > args.density_calibrated_min):

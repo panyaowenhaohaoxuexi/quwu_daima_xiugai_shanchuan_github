@@ -10,7 +10,7 @@ def test_eval_saves_prediction_and_aux_at_original_size(tmp_path):
     config = {
         "base_channels": 8, "router_hidden_channels": 8, "deform_num_samples": 4,
         "deform_max_offset": 2.0, "num_structure_renderers": 2, "memory_max_tokens": 16,
-        "memory_topk": 2, "memory_attention_temperature": 0.07,
+        "memory_topk": 2, "memory_query_chunk_size": 1024, "memory_attention_temperature": 0.07,
         "memory_reliability_epsilon": 1e-6, "memory_reliable_ratio_threshold": 0.01,
         "memory_confidence_threshold": 0.1, "memory_exclusion_extra_margin": 0,
         "boundary_width": 1, "route_tau_end": 0.2,
@@ -38,7 +38,7 @@ def test_eval_rejects_mismatched_tir_under_strict_checkpoint_alignment(tmp_path)
     config = {
         "base_channels": 8, "router_hidden_channels": 8, "deform_num_samples": 4,
         "deform_max_offset": 2.0, "num_structure_renderers": 2, "memory_max_tokens": 16,
-        "memory_topk": 2, "memory_attention_temperature": 0.07,
+        "memory_topk": 2, "memory_query_chunk_size": 1024, "memory_attention_temperature": 0.07,
         "memory_reliability_epsilon": 1e-6, "memory_reliable_ratio_threshold": 0.01,
         "memory_confidence_threshold": 0.1, "memory_exclusion_extra_margin": 0,
         "boundary_width": 1, "route_tau_end": 0.2, "pair_alignment_policy": "strict",
@@ -65,7 +65,7 @@ def test_eval_honors_requested_output_format(tmp_path):
     config = {
         "base_channels": 8, "router_hidden_channels": 8, "deform_num_samples": 4,
         "deform_max_offset": 2.0, "num_structure_renderers": 2, "memory_max_tokens": 16,
-        "memory_topk": 2, "memory_attention_temperature": 0.07,
+        "memory_topk": 2, "memory_query_chunk_size": 1024, "memory_attention_temperature": 0.07,
         "memory_reliability_epsilon": 1e-6, "memory_reliable_ratio_threshold": 0.01,
         "memory_confidence_threshold": 0.1, "memory_exclusion_extra_margin": 0,
         "boundary_width": 1, "route_tau_end": 0.2, "pair_alignment_policy": "strict",

@@ -32,8 +32,21 @@ def _set_model_init_seed(seed):
     torch.manual_seed(seed)
 
 
+def _log_loss_components(args):
+    print("q components:", f"l1={args.q_l1_weight}", f"gradient={args.q_gradient_weight}", f"ssim={args.q_ssim_weight}")
+    print("reconstruction components:", f"l1={args.rec_l1_weight}", f"gradient={args.rec_gradient_weight}", f"ssim={args.rec_ssim_weight}")
+    print("boundary components:", f"l1={args.boundary_l1_weight}", f"gradient={args.boundary_gradient_weight}")
+    if args.q_gradient_weight == 0 and args.q_ssim_weight == 0:
+        print("WARNING: q supervision is L1-only")
+    if args.rec_gradient_weight == 0 and args.rec_ssim_weight == 0:
+        print("WARNING: reconstruction is L1-only")
+    if args.boundary_gradient_weight == 0:
+        print("WARNING: boundary loss has no gradient component")
+
+
 def main(argv=None):
     args = validate_config(build_parser().parse_args(argv))
+    _log_loss_components(args)
     validate_single_process_world()
     prepare_experiment_dirs(args)
     save_config(args)
@@ -92,35 +105,35 @@ def main(argv=None):
             # saved deterministic permutation, never from an exhausted cursor.
             sampler.advance_epoch()
             dataset.set_sampler_epoch(sampler.epoch)
-    for _epoch in range(start_epoch, args.epochs):
-        for hazy, clear, tir, density in loader:
-            if hazy.numel() == 0:
-                continue
-            hazy, clear, tir, density = (value.to(device) for value in (hazy, clear, tir, density))
-            if not density_batch_logged:
-                print(
-                    "[density] first_batch converted "
-                    f"min={density.min().item():.6f} max={density.max().item():.6f} "
-                    f"mean={density.mean().item():.6f}"
+    epoch = start_epoch
+    while epoch < args.epochs:
+        epoch_completed = False
+        while not epoch_completed:
+            step_failed = False
+            for hazy, clear, tir, density in iter(loader):
+                if hazy.numel() == 0:
+                    continue
+                hazy, clear, tir, density = (value.to(device) for value in (hazy, clear, tir, density))
+                if not density_batch_logged:
+                    print(
+                        "[density] first_batch converted "
+                        f"min={density.min().item():.6f} max={density.max().item():.6f} "
+                        f"mean={density.mean().item():.6f}"
+                    )
+                    density_batch_logged = True
+                source_result = compute_source_batch_losses(
+                    model, (hazy, clear, tir, density), args, omega_sampler, global_step,
+                    omega_generator=omega_generator,
                 )
-                density_batch_logged = True
-            source_result = compute_source_batch_losses(
-                model, (hazy, clear, tir, density), args, omega_sampler, global_step,
-                omega_generator=omega_generator,
-            )
-            losses, state = source_result["losses"], source_result["state"]
-            valid_omega_count = int(source_result["omega"]["omega_support"].shape[0])
-            optimizer.zero_grad(set_to_none=True)
-            losses["total"].backward()
-            succeeded = perform_optimizer_step(optimizer, model.parameters())
-            if not succeeded:
-                # The committed sampler cursor deliberately remains unchanged.
-                # Stop this iterator so a fresh iterator replays the exact
-                # uncommitted batch instead of committing a later batch under
-                # the earlier cursor position.
-                print(f"step={global_step} skipped: non-finite gradients; batch will be retried")
-                break
-            if succeeded:
+                losses, state = source_result["losses"], source_result["state"]
+                valid_omega_count = int(source_result["omega"]["omega_support"].shape[0])
+                optimizer.zero_grad(set_to_none=True)
+                losses["total"].backward()
+                succeeded = perform_optimizer_step(optimizer, model.parameters())
+                if not succeeded:
+                    print(f"step={global_step} skipped: non-finite gradients; batch will be retried")
+                    step_failed = True
+                    break
                 sampler.commit(hazy.shape[0])
                 empty_omega_streak = update_empty_omega_streak(
                     empty_omega_streak,
@@ -153,12 +166,13 @@ def main(argv=None):
                         q=source_result["q"],
                     )
                     panel.save(Path(args.saved_data_dir) / f"source_step_{global_step:08d}.png")
-        if sampler.next_sample_position >= len(dataset) and _epoch + 1 < args.epochs:
-            sampler.advance_epoch()
-            dataset.set_sampler_epoch(sampler.epoch)
+            epoch_completed = sampler.next_sample_position >= len(dataset)
+            if step_failed:
+                continue
+        epoch += 1
         if args.saved_model_dir:
             checkpoint = build_source_checkpoint(
-                model.state_dict(), optimizer.state_dict(), None, global_step, _epoch + 1,
+                model.state_dict(), optimizer.state_dict(), None, global_step, epoch,
                 vars(args), args.density_gt_semantics,
                 capture_rng_state(omega_generator=omega_generator),
                 sampler_states={"source": sampler.state_dict()},
@@ -166,6 +180,9 @@ def main(argv=None):
                 manifest_fingerprints={"source": dataset.manifest_fingerprint()},
             )
             torch.save(checkpoint, Path(args.saved_model_dir) / "source_last.pt")
+        if epoch < args.epochs:
+            sampler.advance_epoch()
+            dataset.set_sampler_epoch(sampler.epoch)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 import torch
 import inspect
 
-from model.fog_routed_dehazer import FogRoutedRGBTIRDehazer
+from model.fog_routed_dehazer import FogRoutedRGBTIRDehazer, appearance_receptive_field_radius_by_scale
 
 
 def test_tiny_model_cpu_supports_split_context_and_original_output_size():
@@ -118,3 +118,56 @@ def test_debug_memory_statistics_are_scale_local_while_formal_statistics_are_h2(
     assert set(stats) == {"h2", "h4", "h8", "h16"}
     assert torch.equal(output["memory_reliable_mass"], stats["h2"]["reliable_mass"])
     assert torch.equal(output["memory_reliable_ratio"], stats["h2"]["reliable_ratio"])
+
+
+def test_memory_query_chunks_match_unchunked_and_bound_score_rows(monkeypatch):
+    torch.manual_seed(9)
+    reference = FogRoutedRGBTIRDehazer(
+        base_channels=8, memory_max_tokens=16, memory_topk=2, memory_query_chunk_size=10_000,
+    ).eval()
+    chunked = FogRoutedRGBTIRDehazer(
+        base_channels=8, memory_max_tokens=16, memory_topk=2, memory_query_chunk_size=7,
+    ).eval()
+    chunked.load_state_dict(reference.state_dict())
+    hazy, tir = torch.rand(1, 3, 31, 47), torch.rand(1, 3, 31, 47)
+    max_rows = []
+    original_topk = torch.topk
+
+    def checked_topk(value, *args, **kwargs):
+        if value.ndim == 2:
+            max_rows.append(value.shape[0])
+        return original_topk(value, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "topk", checked_topk)
+    actual = chunked(hazy, tir, route_mode="soft")
+    actual_max_rows = max(max_rows)
+    monkeypatch.setattr(torch, "topk", original_topk)
+    expected = reference(hazy, tir, route_mode="soft")
+
+    assert actual_max_rows <= 7
+    for key in ("pred_clear", "memory_confidence", "memory_fallback_mask", "memory_reliable_mass", "memory_reliable_ratio"):
+        assert torch.allclose(actual[key], expected[key], atol=1e-6)
+
+
+def test_boundary_gradient_uses_effective_hard_override_route():
+    model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2).eval()
+    context = model.encode_context(torch.rand(1, 3, 32, 32), torch.rand(1, 3, 32, 32))
+    full = torch.ones(1, 1, 32, 32)
+    seen = []
+    handle = model.boundary["h2"][0].register_forward_pre_hook(lambda _m, values: seen.append(values[0][:, -1:].detach()))
+    try:
+        model.decode_with_route(
+            context, route_mode="hard", boundary_mode="hard",
+            route_override_value=torch.zeros_like(full), route_override_mask=full,
+        )
+    finally:
+        handle.remove()
+
+    assert seen
+    assert torch.equal(seen[0], torch.zeros_like(seen[0]))
+
+
+def test_memory_exclusion_radius_is_derived_from_the_actual_appearance_stack():
+    radii = appearance_receptive_field_radius_by_scale(deform_max_offset=2.0, extra_margin=1)
+
+    assert radii == {"h2": 9, "h4": 10, "h8": 11, "h16": 11}

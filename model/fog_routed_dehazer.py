@@ -22,6 +22,28 @@ def _groups(channels):
     return 1
 
 
+def appearance_receptive_field_radius_by_scale(deform_max_offset, extra_margin=0):
+    """Conservative RGB-value receptive-field radii in each token grid.
+
+    The recurrence follows ``PyramidEncoder`` exactly: stem 3x3, one stride-2
+    3x3 downsample, then the two 3x3 layers in each residual block.  A value
+    can additionally travel through the local sampler, a 3x3 renderer and the
+    two 3x3 fusion-residual layers.  The 1x1 appearance projection contributes
+    no spatial radius.
+    """
+    radius_full, stride = 1, 1  # RGB encoder stem.
+    result = {}
+    for name in ("h2", "h4", "h8", "h16"):
+        radius_full += stride  # stride-2 downsample 3x3
+        stride *= 2
+        radius_full += 2 * stride  # two residual 3x3 layers
+        encoder_token_radius = int(math.ceil(radius_full / stride))
+        result[name] = (
+            encoder_token_radius + int(math.ceil(deform_max_offset)) + 1 + 2 + int(extra_margin)
+        )
+    return result
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -126,7 +148,7 @@ class LocalCrossAttention(nn.Module):
 
 class MemoryRetriever(nn.Module):
     def __init__(self, channels, structure_channels, max_tokens, topk, attention_temperature,
-                 reliability_epsilon, ratio_threshold, confidence_threshold):
+                 reliability_epsilon, ratio_threshold, confidence_threshold, query_chunk_size=1024):
         super().__init__()
         self.max_tokens = int(max_tokens)
         self.topk = int(topk)
@@ -134,6 +156,9 @@ class MemoryRetriever(nn.Module):
         self.reliability_epsilon = float(reliability_epsilon)
         self.ratio_threshold = float(ratio_threshold)
         self.confidence_threshold = float(confidence_threshold)
+        self.query_chunk_size = int(query_chunk_size)
+        if self.query_chunk_size < 1:
+            raise ValueError("query_chunk_size must be >= 1")
         self.key = nn.Conv2d(structure_channels, channels, 1)
         self.query = nn.Conv2d(structure_channels, channels, 1)
         self.context_key = nn.Linear(structure_channels, channels, bias=False)
@@ -168,18 +193,24 @@ class MemoryRetriever(nn.Module):
             item_key = key[item, valid_indices]
             item_value = value_flat[item, valid_indices]
             item_reliability = reliability_flat[item, valid_indices]
-            scores = query[item] @ item_key.t() / self.attention_temperature
-            scores = scores + item_reliability.clamp_min(self.reliability_epsilon).log().unsqueeze(0)
             top_count = min(self.topk, valid_indices.numel())
-            top_scores, top_indices = torch.topk(scores, k=top_count, dim=-1)
-            attention = torch.softmax(top_scores, dim=-1)
-            retrieved[item] = (attention.unsqueeze(-1) * item_value[top_indices]).sum(dim=1)
-            candidate_count[item].fill_(top_count)
-            if top_count == 1:
-                confidence[item].fill_(1.0)
-            else:
-                entropy = -(attention * attention.clamp_min(1e-8).log()).sum(dim=-1)
-                confidence[item] = (1.0 - entropy / torch.log(torch.tensor(float(top_count), device=value.device))).clamp(0, 1)
+            reliability_bias = item_reliability.clamp_min(self.reliability_epsilon).log().unsqueeze(0)
+            for query_start in range(0, query.shape[1], self.query_chunk_size):
+                query_end = min(query_start + self.query_chunk_size, query.shape[1])
+                query_chunk = query[item, query_start:query_end]
+                scores = query_chunk @ item_key.t() / self.attention_temperature
+                scores = scores + reliability_bias
+                top_scores, top_indices = torch.topk(scores, k=top_count, dim=-1)
+                attention = torch.softmax(top_scores, dim=-1)
+                retrieved[item, query_start:query_end] = (attention.unsqueeze(-1) * item_value[top_indices]).sum(dim=1)
+                candidate_count[item, query_start:query_end].fill_(top_count)
+                if top_count == 1:
+                    confidence[item, query_start:query_end].fill_(1.0)
+                else:
+                    entropy = -(attention * attention.clamp_min(1e-8).log()).sum(dim=-1)
+                    confidence[item, query_start:query_end] = (
+                        1.0 - entropy / torch.log(torch.tensor(float(top_count), device=value.device))
+                    ).clamp(0, 1)
         retrieved = retrieved.transpose(1, 2).reshape(batch, channels, height, width)
         confidence = confidence.reshape(batch, 1, height, width)
         candidate_count = candidate_count.reshape(batch, 1, height, width)
@@ -195,7 +226,7 @@ class FogRoutedRGBTIRDehazer(nn.Module):
                  memory_topk=8, memory_attention_temperature=0.07,
                  memory_reliability_epsilon=1e-6, memory_reliable_ratio_threshold=0.01,
                  memory_confidence_threshold=0.1, memory_exclusion_extra_margin=0,
-                 boundary_width=1):
+                 boundary_width=1, memory_query_chunk_size=1024):
         super().__init__()
         if memory_max_tokens < 1 or not (2 <= memory_topk <= memory_max_tokens):
             raise ValueError("require 2 <= memory_topk <= memory_max_tokens")
@@ -205,8 +236,9 @@ class FogRoutedRGBTIRDehazer(nn.Module):
         self.boundary_width = int(boundary_width)
         self.deform_max_offset = float(deform_max_offset)
         self.memory_exclusion_extra_margin = int(memory_exclusion_extra_margin)
-        if self.memory_exclusion_extra_margin < 0:
-            raise ValueError("memory_exclusion_extra_margin must be >= 0")
+        self.memory_query_chunk_size = int(memory_query_chunk_size)
+        if self.memory_exclusion_extra_margin < 0 or self.memory_query_chunk_size < 1:
+            raise ValueError("memory exclusion margin must be >= 0 and query chunk size must be >= 1")
         self.hde = HDE()
         self.router = MonotonicFogRouter(router_hidden_channels)
         self.rgb_encoder = PyramidEncoder(base_channels)
@@ -239,6 +271,7 @@ class FogRoutedRGBTIRDehazer(nn.Module):
             self.memory[name] = MemoryRetriever(
                 rgb_width, rgb_width, memory_max_tokens, memory_topk, memory_attention_temperature,
                 memory_reliability_epsilon, memory_reliable_ratio_threshold, memory_confidence_threshold,
+                memory_query_chunk_size,
             )
         h2_channels = rgb_widths[0]
         self.decoder_cross = nn.ModuleDict({
@@ -294,7 +327,9 @@ class FogRoutedRGBTIRDehazer(nn.Module):
         local RGB into a completion counterfactual.
         """
         exclusion = self._scale_mask(exclusion_full, size, conservative=True)
-        radius = int(math.ceil(self.deform_max_offset)) + 2 + scale_index + self.memory_exclusion_extra_margin
+        radius = appearance_receptive_field_radius_by_scale(
+            self.deform_max_offset, self.memory_exclusion_extra_margin,
+        )[self.scale_names[scale_index]]
         if radius > 0:
             exclusion = F.max_pool2d(exclusion, 2 * radius + 1, stride=1, padding=radius)
         return exclusion.clamp(0, 1)
@@ -376,8 +411,11 @@ class FogRoutedRGBTIRDehazer(nn.Module):
             magnitude = torch.sigmoid(self.magnitude[name](density))
             fusion_candidate = self.fusion_residual[name](A + magnitude * delta)
             completion_candidate = self.completion[name](tir)
+            route_for_boundary_gradient = soft_for_boundary if boundary_mode == "soft" else hard_for_boundary
             boundary = self._boundary(soft_for_boundary, hard_for_boundary, boundary_mode)
-            boundary_feature = boundary * self.boundary[name](torch.cat((fusion_candidate, completion_candidate, self._route_gradient(soft)), dim=1))
+            boundary_feature = boundary * self.boundary[name](torch.cat((
+                fusion_candidate, completion_candidate, self._route_gradient(route_for_boundary_gradient),
+            ), dim=1))
             structures[name] = self.merge[name](torch.cat(((1 - route) * fusion_candidate, route * completion_candidate, boundary_feature), dim=1))
             reliability = ((1.0 - route).detach() * valid * (1.0 - exclusion))
             retrieved, confidence, fallback, mass, ratio, count = self.memory[name](S, fusion_candidate, reliability, valid)

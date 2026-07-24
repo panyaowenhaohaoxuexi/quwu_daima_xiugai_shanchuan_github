@@ -29,13 +29,13 @@ def test_counterfactual_pair_uses_detached_context_and_q_prefers_lower_completio
     clear = torch.rand(1, 3, 32, 32)
 
     fuse, completion = run_counterfactual_pair(model, context, omega)
-    q = compute_q(clear, fuse["pred_clear"], completion["pred_clear"], omega, temperature=0.1)
+    q, _ = compute_q(clear, fuse["pred_clear"], completion["pred_clear"], omega, temperature=0.1)
 
     assert not fuse["pred_clear"].requires_grad
     assert not completion["pred_clear"].requires_grad
     assert not q.requires_grad
     assert torch.all((q >= 0) & (q <= 1))
-    perfect_completion = compute_q(clear, clear + 0.3, clear, omega, temperature=0.1)
+    perfect_completion, _ = compute_q(clear, clear + 0.3, clear, omega, temperature=0.1)
     assert perfect_completion[omega.bool()].mean() > 0.5
 
 
@@ -49,8 +49,8 @@ def test_q_local_error_ignores_pixels_outside_omega_support():
     completion_b[..., 0, :] = 100.0
     completion_b[..., :, 0] = 100.0
 
-    q_a = compute_q(clear, fusion, completion_a, omega, 0.1, window_size=3, min_valid_support=2)
-    q_b = compute_q(clear, fusion, completion_b, omega, 0.1, window_size=3, min_valid_support=2)
+    q_a, _ = compute_q(clear, fusion, completion_a, omega, 0.1, window_size=3, min_valid_support=2)
+    q_b, _ = compute_q(clear, fusion, completion_b, omega, 0.1, window_size=3, min_valid_support=2)
 
     assert torch.allclose(q_a, q_b)
 
@@ -59,11 +59,28 @@ def test_q_ssim_term_is_finite_with_small_valid_support():
     clear = torch.zeros(1, 3, 5, 5)
     omega = torch.zeros(1, 1, 5, 5)
     omega[..., 2, 2] = 1
-    q = compute_q(clear, clear, clear, omega, 0.1, window_size=3,
-                  min_valid_support=4, ssim_weight=1.0)
+    q, q_valid = compute_q(clear, clear, clear, omega, 0.1, window_size=3,
+                           min_valid_support=4, ssim_weight=1.0)
 
     assert torch.isfinite(q).all()
     assert q.sum() == 0
+    assert q_valid.sum() == 0
+
+
+def test_q_keeps_l1_supervision_when_ssim_or_gradient_is_invalid():
+    clear = torch.zeros(1, 3, 5, 5)
+    omega = torch.zeros(1, 1, 5, 5)
+    omega[..., 2, 2] = 1
+    fusion = clear + 0.4
+    completion = clear
+
+    q, valid = compute_q(
+        clear, fusion, completion, omega, 0.1, window_size=3, min_valid_support=1,
+        l1_weight=1.0, gradient_weight=1.0, ssim_weight=1.0,
+    )
+
+    assert valid[omega.bool()].all()
+    assert q[omega.bool()].mean() > 0.5
 
 
 def test_gather_context_selects_only_region_owners_without_reencoding():

@@ -41,6 +41,18 @@ def initialize_teacher(student):
     return teacher
 
 
+def _log_loss_components(args):
+    print("q components:", f"l1={args.q_l1_weight}", f"gradient={args.q_gradient_weight}", f"ssim={args.q_ssim_weight}")
+    print("reconstruction components:", f"l1={args.rec_l1_weight}", f"gradient={args.rec_gradient_weight}", f"ssim={args.rec_ssim_weight}")
+    print("boundary components:", f"l1={args.boundary_l1_weight}", f"gradient={args.boundary_gradient_weight}")
+    if args.q_gradient_weight == 0 and args.q_ssim_weight == 0:
+        print("WARNING: q supervision is L1-only")
+    if args.rec_gradient_weight == 0 and args.rec_ssim_weight == 0:
+        print("WARNING: reconstruction is L1-only")
+    if args.boundary_gradient_weight == 0:
+        print("WARNING: boundary loss has no gradient component")
+
+
 def run_ema_views(teacher, student, hazy_rgb, tir, generator, route_temperature,
                   sigma_j, sigma_m, sigma_r, minimum_weight):
     """Run independent batch-level A/B/S views and return aligned EMA losses."""
@@ -85,6 +97,7 @@ def run_ema_epoch(student, teacher, optimizer, real_loader, source_loader, args,
     teacher.eval()
     set_batchnorm_eval(teacher)
     source_iterator = iter(source_loader)
+    step_failed = False
     for real_batch in real_loader:
         try:
             source_batch = next(source_iterator)
@@ -124,6 +137,7 @@ def run_ema_epoch(student, teacher, optimizer, real_loader, source_loader, args,
             # Neither sampler cursor is committed.  Leave this iterator so
             # the next epoch/restart begins from the same uncommitted pair.
             print(f"ema_step={ema_global_step} skipped: non-finite gradients; pair will be retried")
+            step_failed = True
             break
         if result["step_succeeded"]:
             if real_sampler is not None:
@@ -151,11 +165,18 @@ def run_ema_epoch(student, teacher, optimizer, real_loader, source_loader, args,
                     f"L_real={result['L_real'].item():.5f} L_src={result['L_src'].item():.5f} "
                     f"anchor={args.lambda_anchor * result['L_src'].item():.5f}"
                 )
-    return source_global_step, ema_global_step, anchor_empty_omega_streak
+    return {
+        "epoch_completed": bool(real_sampler is not None and real_sampler.next_sample_position >= real_sampler.data_source_size),
+        "step_failed": step_failed,
+        "source_global_step": source_global_step,
+        "ema_global_step": ema_global_step,
+        "anchor_empty_omega_streak": anchor_empty_omega_streak,
+    }
 
 
 def main(argv=None):
     args = validate_config(build_parser().parse_args(argv))
+    _log_loss_components(args)
     validate_single_process_world()
     prepare_experiment_dirs(args)
     random.seed(args.model_init_seed)
@@ -253,21 +274,25 @@ def main(argv=None):
         if start_epoch < args.epochs and source_sampler.next_sample_position >= len(source_dataset):
             source_sampler.advance_epoch()
             source_dataset.set_sampler_epoch(source_sampler.epoch)
-    for _epoch in range(start_epoch, args.epochs):
-        source_global_step, ema_global_step, anchor_empty_omega_streak = run_ema_epoch(
+    epoch = start_epoch
+    while epoch < args.epochs:
+        epoch_result = run_ema_epoch(
             student, teacher, optimizer, real_loader, source_loader, args,
             source_global_step, ema_global_step, real_sampler, source_sampler, anchor_empty_omega_streak,
             geometry_generator=geometry_generator, omega_generator=omega_generator,
         )
-        if real_sampler.next_sample_position >= len(real_dataset) and _epoch + 1 < args.epochs:
-            real_sampler.advance_epoch()
-        if source_sampler.next_sample_position >= len(source_dataset) and _epoch + 1 < args.epochs:
-            source_sampler.advance_epoch()
-            source_dataset.set_sampler_epoch(source_sampler.epoch)
+        source_global_step = epoch_result["source_global_step"]
+        ema_global_step = epoch_result["ema_global_step"]
+        anchor_empty_omega_streak = epoch_result["anchor_empty_omega_streak"]
+        if epoch_result["step_failed"]:
+            continue
+        if not epoch_result["epoch_completed"]:
+            continue
+        epoch += 1
         if args.saved_model_dir:
             checkpoint = build_ema_checkpoint(
                 student.state_dict(), teacher.state_dict(), optimizer.state_dict(), None,
-                source_global_step, ema_global_step, _epoch + 1, ema_checkpoint_config,
+                source_global_step, ema_global_step, epoch, ema_checkpoint_config,
                 args.density_gt_semantics,
                 capture_rng_state(omega_generator=omega_generator, geometry_generator=geometry_generator),
                 sampler_states={"source": source_sampler.state_dict(), "real": real_sampler.state_dict()},
@@ -278,6 +303,11 @@ def main(argv=None):
                 },
             )
             torch.save(checkpoint, Path(args.saved_model_dir) / "ema_last.pt")
+        if epoch < args.epochs:
+            real_sampler.advance_epoch()
+            if source_sampler.next_sample_position >= len(source_dataset):
+                source_sampler.advance_epoch()
+                source_dataset.set_sampler_epoch(source_sampler.epoch)
     return student, teacher
 
 

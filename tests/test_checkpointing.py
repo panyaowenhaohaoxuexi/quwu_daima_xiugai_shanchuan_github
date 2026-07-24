@@ -206,6 +206,7 @@ def test_tir_loader_configuration_is_recovered_from_checkpoint_semantics():
         "tir_normalization": "percentile", "tir_fixed_min": None, "tir_fixed_max": None,
         "tir_percentile_low": 2.0, "tir_percentile_high": 98.0,
         "tir_percentile_scope": "dataset", "tir_channel_tolerance_code_values": 2,
+        "tir_dataset_percentile_low_value": 100.0, "tir_dataset_percentile_high_value": 900.0,
         "tir_channel_tolerance_float": 1e-4,
     }
     restored = tir_normalization_config_from_checkpoint(config)
@@ -213,3 +214,4 @@ def test_tir_loader_configuration_is_recovered_from_checkpoint_semantics():
     assert restored["normalization"] == "percentile"
     assert restored["percentile_scope"] == "dataset"
     assert restored["channel_tolerance_code_values"] == 2
+    assert restored["dataset_percentile_high_value"] == 900.0

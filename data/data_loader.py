@@ -127,13 +127,36 @@ def load_tir_as_float_tensor(path, normalization_config: Optional[Mapping] = Non
     config = dict(normalization_config or {})
     normalization = config.get("normalization", "dtype_range")
     mode, array, known_bits = _open_preserving_known_bit_depth(path)
+    def normalize_one_channel(raw):
+        raw = np.asarray(raw)
+        if not np.isfinite(raw).all():
+            raise ValueError(f"non-finite values in {path}")
+        if normalization != "percentile":
+            return _array_to_unit_float(
+                raw, path=path, normalization=normalization,
+                fixed_min=config.get("fixed_min"), fixed_max=config.get("fixed_max"),
+                calibrated_min=config.get("calibrated_min"), calibrated_max=config.get("calibrated_max"),
+                known_integer_bits=known_bits,
+            )
+        value = torch.tensor(np.array(raw, copy=True), dtype=torch.float32)
+        scope = config.get("percentile_scope", "per_image")
+        if scope == "per_image":
+            low = torch.quantile(value, float(config.get("percentile_low", 1.0)) / 100.0)
+            high = torch.quantile(value, float(config.get("percentile_high", 99.0)) / 100.0)
+            if not bool(high > low):
+                return torch.zeros_like(value)
+        elif scope == "dataset":
+            low_value = config.get("dataset_percentile_low_value")
+            high_value = config.get("dataset_percentile_high_value")
+            if low_value is None or high_value is None or not float(high_value) > float(low_value):
+                raise ValueError("dataset percentile requires high value > low value")
+            low, high = value.new_tensor(float(low_value)), value.new_tensor(float(high_value))
+        else:
+            raise ValueError(f"unsupported TIR percentile scope={scope!r}")
+        return ((value - low) / (high - low)).clamp(0.0, 1.0)
+
     if array.ndim == 2:
-        one_channel = _array_to_unit_float(
-            array, path=path, normalization=normalization,
-            fixed_min=config.get("fixed_min"), fixed_max=config.get("fixed_max"),
-            calibrated_min=config.get("calibrated_min"), calibrated_max=config.get("calibrated_max"),
-            known_integer_bits=known_bits,
-        ).unsqueeze(0)
+        one_channel = normalize_one_channel(array).unsqueeze(0)
     elif array.ndim == 3 and array.shape[2] in (3, 4):
         rgb = array[..., :3]
         if np.issubdtype(rgb.dtype, np.integer):
@@ -142,28 +165,27 @@ def load_tir_as_float_tensor(path, normalization_config: Optional[Mapping] = Non
                            int(np.abs(rgb[..., 1].astype(np.int64) - rgb[..., 2].astype(np.int64)).max()))
             tolerance = int(config.get("channel_tolerance_code_values", 1))
         else:
-            normalized = _array_to_unit_float(
-                rgb, path=path, normalization=normalization,
-                fixed_min=config.get("fixed_min"), fixed_max=config.get("fixed_max"),
-                calibrated_min=config.get("calibrated_min"), calibrated_max=config.get("calibrated_max"),
-                known_integer_bits=known_bits,
-            )
-            differences = (float((normalized[..., 0] - normalized[..., 1]).abs().max()),
-                           float((normalized[..., 0] - normalized[..., 2]).abs().max()),
-                           float((normalized[..., 1] - normalized[..., 2]).abs().max()))
+            differences = (float(np.abs(rgb[..., 0] - rgb[..., 1]).max()),
+                           float(np.abs(rgb[..., 0] - rgb[..., 2]).max()),
+                           float(np.abs(rgb[..., 1] - rgb[..., 2]).max()))
             tolerance = float(config.get("channel_tolerance_float", 1e-5))
         if max(differences) > tolerance:
             raise ValueError(
                 f"TIR channel tolerance exceeded: path={path}, mode={mode}, dtype={rgb.dtype}, "
                 f"max_diffs={differences}, tolerance={tolerance}"
             )
-        rgb_float = _array_to_unit_float(
-            rgb, path=path, normalization=normalization,
-            fixed_min=config.get("fixed_min"), fixed_max=config.get("fixed_max"),
-            calibrated_min=config.get("calibrated_min"), calibrated_max=config.get("calibrated_max"),
-            known_integer_bits=known_bits,
-        )
-        one_channel = rgb_float.mean(dim=2, keepdim=False).unsqueeze(0)
+        if normalization == "percentile":
+            # Percentile statistics must see the physical one-channel signal,
+            # never three independently normalized channels.
+            one_channel = normalize_one_channel(rgb.astype(np.float64).mean(axis=2)).unsqueeze(0)
+        else:
+            rgb_float = _array_to_unit_float(
+                rgb, path=path, normalization=normalization,
+                fixed_min=config.get("fixed_min"), fixed_max=config.get("fixed_max"),
+                calibrated_min=config.get("calibrated_min"), calibrated_max=config.get("calibrated_max"),
+                known_integer_bits=known_bits,
+            )
+            one_channel = rgb_float.mean(dim=2, keepdim=False).unsqueeze(0)
     else:
         raise ValueError(f"unsupported TIR shape in {path}: mode={mode}, shape={array.shape}")
     return one_channel.repeat(3, 1, 1).contiguous()
@@ -1033,23 +1055,45 @@ class SynthMultiModalDataset(data.Dataset):
     def _resize_tensor(tensor, size):
         return F.interpolate(tensor.unsqueeze(0), size=size, mode="bilinear", align_corners=False).squeeze(0)
 
-    def _target_size(self, tensor):
-        if self.size in (None, "full"):
-            return tuple(tensor.shape[-2:])
-        if isinstance(self.size, int):
-            return self.size, self.size
-        return tuple(self.size)
-
-    def _sync_augment(self, tensors, index):
-        if not self.train:
-            return tensors
+    def geometry_description(self, index, original_size):
+        """Return the deterministic float-tensor geometry for one training item."""
+        height, width = map(int, original_size)
+        if not self.train or self.size in (None, "full"):
+            return {
+                "resized_height": height, "resized_width": width,
+                "crop_top": 0, "crop_left": 0, "crop_height": height, "crop_width": width,
+                "horizontal_flip": False, "rot90_turns": 0,
+            }
+        if not isinstance(self.size, int):
+            raise ValueError("formal training size must be an integer or 'full'")
+        train_size = int(self.size)
+        scale = max(1.0, float(train_size) / float(min(height, width)))
+        resized_height = max(train_size, int(round(height * scale)))
+        resized_width = max(train_size, int(round(width * scale)))
         generator = torch.Generator()
         generator.manual_seed(stable_seed_mixer(self.augmentation_seed_base, self.sampler_epoch, index))
-        if int(torch.randint(0, 2, (), generator=generator)):
+        crop_top = int(torch.randint(0, resized_height - train_size + 1, (), generator=generator))
+        crop_left = int(torch.randint(0, resized_width - train_size + 1, (), generator=generator))
+        return {
+            "resized_height": resized_height, "resized_width": resized_width,
+            "crop_top": crop_top, "crop_left": crop_left,
+            "crop_height": train_size, "crop_width": train_size,
+            "horizontal_flip": bool(torch.randint(0, 2, (), generator=generator)),
+            "rot90_turns": int(torch.randint(0, 4, (), generator=generator)),
+        }
+
+    @staticmethod
+    def _apply_geometry(tensors, description):
+        size = (description["resized_height"], description["resized_width"])
+        resized = [F.interpolate(value.unsqueeze(0), size=size, mode="bilinear", align_corners=False)[0]
+                   for value in tensors]
+        top, left = description["crop_top"], description["crop_left"]
+        crop_h, crop_w = description["crop_height"], description["crop_width"]
+        tensors = [value[..., top:top + crop_h, left:left + crop_w] for value in resized]
+        if description["horizontal_flip"]:
             tensors = [torch.flip(value, dims=(-1,)) for value in tensors]
-        turns = int(torch.randint(0, 4, (), generator=generator))
-        if turns:
-            tensors = [torch.rot90(value, turns, dims=(-2, -1)) for value in tensors]
+        if description["rot90_turns"]:
+            tensors = [torch.rot90(value, description["rot90_turns"], dims=(-2, -1)) for value in tensors]
         return tensors
 
     def _load_density(self, path):
@@ -1083,17 +1127,13 @@ class SynthMultiModalDataset(data.Dataset):
         clear_vis = self._load_rgb(sample["clear_path"])
         infrared = load_tir_as_float_tensor(sample["ir_path"], self.tir_normalization_config)
         density_gt = self._load_density(sample["density_path"])
-        target_size = self._target_size(hazy_vis)
-        if tuple(hazy_vis.shape[-2:]) != target_size:
-            hazy_vis = self._resize_tensor(hazy_vis, target_size)
-            clear_vis = self._resize_tensor(clear_vis, target_size)
-            infrared = self._resize_tensor(infrared, target_size)
-            density_gt = self._resize_tensor(density_gt, target_size).clamp(0.0, 1.0)
-        elif tuple(infrared.shape[-2:]) != target_size:
-            infrared = self._resize_tensor(infrared, target_size)
-        hazy_vis, clear_vis, infrared, density_gt = self._sync_augment(
-            [hazy_vis, clear_vis, infrared, density_gt], index
-        )
+        if tuple(infrared.shape[-2:]) != tuple(hazy_vis.shape[-2:]):
+            infrared = self._resize_tensor(infrared, tuple(hazy_vis.shape[-2:]))
+        description = self.geometry_description(index, hazy_vis.shape[-2:])
+        if self.train:
+            hazy_vis, clear_vis, infrared, density_gt = self._apply_geometry(
+                [hazy_vis, clear_vis, infrared, density_gt], description
+            )
         return hazy_vis, clear_vis, infrared, density_gt.clamp(0.0, 1.0)
 
     def manifest_fingerprint(self):

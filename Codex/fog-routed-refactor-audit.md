@@ -238,3 +238,38 @@
   then wrote prediction, density, soft/hard-route and boundary outputs, all at
   exactly `1024x768`.  These smoke runs did not perform any full training.
 - Latest full CoA regression: `133 passed` (`D:\anaconda\envs\CoA\python.exe -m pytest -q`).
+
+## 2026-07-24 -- completion fixes: bounded memory, valid q, transactional epochs and geometry
+
+- Baseline HEAD was `363a74d27114f56062b1816098c4eafa203c2b93`; the initial full CoA
+  regression was `133 passed, 5 warnings`. Existing user untracked resources
+  were retained throughout.
+- `memory_query_chunk_size` is now a strict model construction/checkpoint
+  semantic. Every per-sample score matrix is constructed with at most that
+  many query rows; instrumentation regression exercised seven-row chunks and
+  an unchunked reference with identical retrieved output, confidence,
+  fallback, reliable mass and ratio.
+- TIR percentile loading now validates channels in raw code-value space, then
+  averages to one channel before normalizing. Per-image percentiles return a
+  finite zero tensor for a degenerate range; dataset scope uses the persisted
+  calibrated low/high values and rejects missing or inverted values.
+- `compute_q` returns detached `(q, q_valid_mask)`. L1, gradient and local
+  SSIM are normalized over the components actually valid for each candidate;
+  route BCE receives only pixels with a valid q comparison. Training prints
+  the q/reconstruction/boundary component weights and explicitly warns about
+  L1-only defaults.
+- Failed source and EMA optimizer steps now rebuild the iterator without
+  committing sampler position, global/EMA step, teacher, scheduler, streak or
+  epoch. Epoch checkpoints are written only after the sampler has truly
+  completed the epoch.
+- Source training uses a deterministic geometry description containing resize,
+  crop, flip and rot90 settings. It scales only the short edge to `train_size`,
+  crops all four float tensors together, clamps resized density, and leaves
+  evaluation at original resolution.
+- Memory exclusion radii are derived from the stem/downsample/residual
+  recurrence plus local-offset, renderer, fusion-residual and configured
+  margin. With `deform_max_offset=2` and margin `1`, h2/h4/h8/h16 token-grid
+  radii are `9/10/11/11`.
+- Final verification: `D:\anaconda\envs\CoA\python.exe -m pytest -q` ->
+  `141 passed, 5 warnings in 17.75s`. Warnings are four upstream torchvision
+  Pillow deprecations and the existing `TestDataset` collection warning.

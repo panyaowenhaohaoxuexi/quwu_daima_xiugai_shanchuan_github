@@ -178,6 +178,10 @@ def compute_q(clear_rgb, pred_fusion, pred_completion, omega_support, temperatur
     error_completion, valid_completion = _local_supported_l1(
         pred_completion, clear_rgb, support, window_size, min_valid_support
     )
+    fusion_weighted = l1_weight * error_fusion * valid_fusion
+    completion_weighted = l1_weight * error_completion * valid_completion
+    fusion_available = l1_weight * valid_fusion
+    completion_available = l1_weight * valid_completion
     if gradient_weight:
         gradient_fusion, gradient_valid_fusion = _local_supported_gradient(
             pred_fusion.detach(), clear_rgb.detach(), support, window_size, min_valid_support
@@ -185,12 +189,10 @@ def compute_q(clear_rgb, pred_fusion, pred_completion, omega_support, temperatur
         gradient_completion, gradient_valid_completion = _local_supported_gradient(
             pred_completion.detach(), clear_rgb.detach(), support, window_size, min_valid_support
         )
-        error_fusion = l1_weight * error_fusion + gradient_weight * gradient_fusion
-        error_completion = l1_weight * error_completion + gradient_weight * gradient_completion
-        valid_fusion = valid_fusion * gradient_valid_fusion
-        valid_completion = valid_completion * gradient_valid_completion
-    else:
-        error_fusion, error_completion = l1_weight * error_fusion, l1_weight * error_completion
+        fusion_weighted = fusion_weighted + gradient_weight * gradient_fusion * gradient_valid_fusion
+        completion_weighted = completion_weighted + gradient_weight * gradient_completion * gradient_valid_completion
+        fusion_available = fusion_available + gradient_weight * gradient_valid_fusion
+        completion_available = completion_available + gradient_weight * gradient_valid_completion
     if ssim_weight:
         ssim_fusion, ssim_valid_fusion = _local_supported_ssim_error(
             pred_fusion, clear_rgb, support, window_size, min_valid_support
@@ -198,10 +200,12 @@ def compute_q(clear_rgb, pred_fusion, pred_completion, omega_support, temperatur
         ssim_completion, ssim_valid_completion = _local_supported_ssim_error(
             pred_completion, clear_rgb, support, window_size, min_valid_support
         )
-        error_fusion = error_fusion + ssim_weight * ssim_fusion
-        error_completion = error_completion + ssim_weight * ssim_completion
-        valid_fusion = valid_fusion * ssim_valid_fusion
-        valid_completion = valid_completion * ssim_valid_completion
-    valid = (valid_fusion * valid_completion).detach()
+        fusion_weighted = fusion_weighted + ssim_weight * ssim_fusion * ssim_valid_fusion
+        completion_weighted = completion_weighted + ssim_weight * ssim_completion * ssim_valid_completion
+        fusion_available = fusion_available + ssim_weight * ssim_valid_fusion
+        completion_available = completion_available + ssim_weight * ssim_valid_completion
+    error_fusion = fusion_weighted / fusion_available.clamp_min(1e-6)
+    error_completion = completion_weighted / completion_available.clamp_min(1e-6)
+    valid = ((fusion_available > 0) * (completion_available > 0) * support).detach()
     q = torch.sigmoid((error_fusion - error_completion) / float(temperature))
-    return (q * valid).detach()
+    return (q * valid).detach(), valid

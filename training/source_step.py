@@ -35,7 +35,8 @@ def compute_source_batch_losses(model, source_batch, args, omega_sampler, global
     output = model.decode_with_route(
         context, route_mode=state["route_mode"], boundary_mode="soft"
     )
-    q = torch.zeros_like(density)
+    q_sum = torch.zeros_like(density)
+    q_valid_sum = torch.zeros_like(density)
     omega_support, omega_weight = torch.zeros_like(density), torch.zeros_like(density)
     edge = context["tir_structure_pyramid"]["h2"].detach().abs().mean(dim=1, keepdim=True)
     edge = F.interpolate(edge, size=density.shape[-2:], mode="bilinear", align_corners=False)
@@ -45,7 +46,7 @@ def compute_source_batch_losses(model, source_batch, args, omega_sampler, global
         fusion, completion = run_counterfactual_chunks(
             model, context, owners, supports, args.counterfactual_chunk_size, state["route_mode"]
         )
-        candidate_q = compute_q(
+        candidate_q, candidate_valid = compute_q(
             clear.index_select(0, owners), fusion["pred_clear"], completion["pred_clear"],
             supports, args.q_temperature, window_size=getattr(args, "q_window_size", 1),
             min_valid_support=getattr(args, "q_min_valid_support", 1),
@@ -53,12 +54,15 @@ def compute_source_batch_losses(model, source_batch, args, omega_sampler, global
             gradient_weight=getattr(args, "q_gradient_weight", 0.0),
             ssim_weight=getattr(args, "q_ssim_weight", 0.0),
         )
-        q.index_add_(0, owners, candidate_q)
+        q_sum.index_add_(0, owners, candidate_q * candidate_valid)
+        q_valid_sum.index_add_(0, owners, candidate_valid)
         omega_support.index_add_(0, owners, supports)
         omega_weight.index_add_(0, owners, omega["omega_weight"])
+    q = q_sum / q_valid_sum.clamp_min(1.0)
+    route_support = (omega_support * (q_valid_sum > 0).to(omega_support.dtype)).detach()
     losses = compute_source_objective(
         output["pred_clear"], clear, output["density_map"], density,
-        output["route_soft"], output["boundary_map"], q, omega_support, omega_weight,
+        output["route_soft"], output["boundary_map"], q, route_support, omega_weight,
         density_beta=args.density_smooth_l1_beta, lambda_global=args.lambda_global,
         lambda_fuse=args.lambda_fuse, lambda_comp=args.lambda_comp,
         lambda_boundary=args.lambda_boundary, lambda_router=args.lambda_router,
@@ -71,4 +75,5 @@ def compute_source_batch_losses(model, source_batch, args, omega_sampler, global
         min_valid_support=args.reconstruction_min_valid_support,
     )
     return {"context": context, "output": output, "losses": losses, "q": q,
+            "q_valid_sum": q_valid_sum, "route_support": route_support,
             "omega": omega, "state": state}
