@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.ops import DeformConv2d
+
+from .deform_sampler import ModulatedDeformSampler
 
 
 class IRDifferenceStructureEncoder(nn.Module):
@@ -69,9 +70,9 @@ class HDE(nn.Module):
     Inputs:
         x_vis_01: (B, 3, H, W), de-normalized visible image in [0, 1].
         x_ir_01:  (B, 3, H, W), de-normalized infrared image in [0, 1].
-    Outputs:
-        density_map: (B, 1, H, W), high values indicate dense haze.
-        density_feat: (B, 96, H, W), visible-only feature for mask_head.
+    Formal output is a named dictionary.  ``return_feat=True`` is retained only
+    as an explicit legacy inspection mode while the old training entry points
+    are migrated.
     """
 
     def __init__(self):
@@ -87,13 +88,33 @@ class HDE(nn.Module):
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
+        self.structure_h2 = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        self.structure_h4 = nn.Sequential(
+            nn.Conv2d(32, 48, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(48),
+            nn.ReLU(inplace=True),
+        )
+        self.structure_h8 = nn.Sequential(
+            nn.Conv2d(48, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.structure_h16 = nn.Sequential(
+            nn.Conv2d(64, 96, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(96),
+            nn.ReLU(inplace=True),
+        )
 
         # Offset channels = 2 * 3 * 3 = 18. IR-guided heads consume both streams.
         self.offset_conv1_vis = nn.Conv2d(32, 18, kernel_size=3, padding=1, bias=True)
         self.offset_conv1_ir = nn.Conv2d(64, 18, kernel_size=3, padding=1, bias=True)
         self.mask_conv1_vis = nn.Conv2d(32, 9, kernel_size=3, padding=1, bias=True)
         self.mask_conv1_ir = nn.Conv2d(64, 9, kernel_size=3, padding=1, bias=True)
-        self.deform_conv1 = DeformConv2d(32, 64, kernel_size=3, padding=1, bias=False)
+        self.deform_conv1 = ModulatedDeformSampler(32, 64, kernel_size=3, padding=1, bias=False)
         self.bn_relu1 = nn.Sequential(
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
@@ -103,7 +124,7 @@ class HDE(nn.Module):
         self.offset_conv2_ir = nn.Conv2d(128, 18, kernel_size=3, padding=1, bias=True)
         self.mask_conv2_vis = nn.Conv2d(64, 9, kernel_size=3, padding=1, bias=True)
         self.mask_conv2_ir = nn.Conv2d(128, 9, kernel_size=3, padding=1, bias=True)
-        self.deform_conv2 = DeformConv2d(64, 64, kernel_size=3, padding=1, bias=False)
+        self.deform_conv2 = ModulatedDeformSampler(64, 64, kernel_size=3, padding=1, bias=False)
         self.bn_relu2 = nn.Sequential(
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
@@ -145,6 +166,10 @@ class HDE(nn.Module):
 
     def _apply_deform(self, deform, x, offset, mask):
         return deform(x, offset, mask)
+
+    @staticmethod
+    def _downsample(feature):
+        return F.avg_pool2d(feature, kernel_size=2, stride=2, ceil_mode=True)
 
     def forward(self, x_vis_01, x_ir_01=None, return_feat=False, return_debug=False):
         if x_ir_01 is None:
@@ -203,6 +228,12 @@ class HDE(nn.Module):
         )
         density_map = torch.sigmoid(self.attn_conv(attn_input))
 
+        h2 = self.structure_h2(self._downsample(ir_struct))
+        h4 = self.structure_h4(self._downsample(h2))
+        h8 = self.structure_h8(self._downsample(h4))
+        h16 = self.structure_h16(self._downsample(h8))
+        structure_pyramid = {"h2": h2, "h4": h4, "h8": h8, "h16": h16}
+
         if return_debug:
             debug = {
                 "ir_struct": ir_struct,
@@ -223,7 +254,15 @@ class HDE(nn.Module):
             }
             if return_feat:
                 return density_map, fm_vis, debug
-            return density_map, debug
+            return {
+                "density_map": density_map,
+                "tir_structure_pyramid": structure_pyramid,
+                "debug": debug,
+            }
         if return_feat:
             return density_map, fm_vis
-        return density_map
+        return {
+            "density_map": density_map,
+            "tir_structure_pyramid": structure_pyramid,
+            "debug": None,
+        }

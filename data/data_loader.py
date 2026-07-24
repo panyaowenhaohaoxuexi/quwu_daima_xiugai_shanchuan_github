@@ -11,16 +11,167 @@ RESIDE_Dataset 和 RESIDE_Dataset_2 都是为加载成对的（有雾图像, 清
 
 import os
 import random
+import hashlib
+from typing import Mapping, Optional, Sequence, Tuple
+
+import numpy as np
 import torch
 import torch.utils.data as data
+import torch.nn.functional as F
 from torch.utils.data.dataloader import default_collate
 from PIL import Image
 from torchvision.transforms import Normalize, ToTensor, RandomCrop, RandomHorizontalFlip, Resize
 from torchvision.transforms import functional as FF  # 导入 torchvision 的 functional 接口，用于更灵活的变换
+from .stateful_sampler import manifest_fingerprint
 
 
 COMMON_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 DEFAULT_HAZE_LEVELS = ("mist", "middle", "dense")
+
+
+def _normalization_bounds(normalization, fixed_min=None, fixed_max=None,
+                          calibrated_min=None, calibrated_max=None):
+    if normalization == "fixed_range":
+        lower, upper = fixed_min, fixed_max
+    elif normalization == "dataset_calibrated_range":
+        lower, upper = calibrated_min, calibrated_max
+    else:
+        return None
+    if lower is None or upper is None or not float(upper) > float(lower):
+        raise ValueError("normalization range requires max > min")
+    return float(lower), float(upper)
+
+
+def _array_to_unit_float(array, *, path, normalization="dtype_range", fixed_min=None,
+                         fixed_max=None, calibrated_min=None, calibrated_max=None,
+                         permit_int32_dtype_range=False, known_integer_bits=None):
+    """Convert a scalar or image array to finite float32 values in [0, 1]."""
+    array = np.asarray(array)
+    if array.size == 0:
+        raise ValueError(f"empty image: {path}")
+    if not np.isfinite(array).all():
+        raise ValueError(f"non-finite values in {path}")
+    if normalization not in ("dtype_range", "fixed_range", "dataset_calibrated_range"):
+        raise ValueError(f"unsupported normalization={normalization!r}")
+
+    if normalization == "dtype_range":
+        if np.issubdtype(array.dtype, np.uint8):
+            output = array.astype(np.float32) / 255.0
+        elif np.issubdtype(array.dtype, np.uint16):
+            output = array.astype(np.float32) / 65535.0
+        elif np.issubdtype(array.dtype, np.signedinteger):
+            if known_integer_bits == 16 and array.min() >= 0 and array.max() <= 65535:
+                output = array.astype(np.float32) / 65535.0
+            elif not permit_int32_dtype_range:
+                raise ValueError(
+                    f"integer mode with unknown physical range in {path}; use fixed_range"
+                )
+            else:
+                info = np.iinfo(array.dtype)
+                output = (array.astype(np.float32) - info.min) / float(info.max - info.min)
+        elif np.issubdtype(array.dtype, np.floating):
+            output = array.astype(np.float32)
+            if output.min() < 0.0 or output.max() > 1.0:
+                raise ValueError(f"float image outside [0,1] in {path}; use fixed_range")
+        else:
+            raise ValueError(f"unsupported image dtype {array.dtype} in {path}")
+    else:
+        lower, upper = _normalization_bounds(
+            normalization, fixed_min, fixed_max, calibrated_min, calibrated_max
+        )
+        output = (array.astype(np.float32) - lower) / (upper - lower)
+    return torch.from_numpy(np.ascontiguousarray(output)).float().clamp(0.0, 1.0)
+
+
+def _open_preserving_known_bit_depth(path):
+    """Pillow exposes some 16-bit PNGs as mode I/int32; recover only known metadata."""
+    with Image.open(path) as image:
+        array = np.asarray(image)
+        known_bits = None
+        if image.format == "PNG":
+            with open(path, "rb") as handle:
+                header = handle.read(25)
+            if header[:8] == b"\x89PNG\r\n\x1a\n" and len(header) >= 25 and header[24] == 16:
+                known_bits = 16
+        elif image.format == "TIFF":
+            bits = image.tag_v2.get(258)
+            if isinstance(bits, tuple):
+                bits = bits[0]
+            if bits == 16:
+                known_bits = 16
+        return image.mode, array, known_bits
+
+
+def load_scalar_map_as_float_tensor(path, normalization="dtype_range", *, fixed_min=None,
+                                    fixed_max=None, calibrated_min=None, calibrated_max=None):
+    """Load a scalar density/transmission map without lossy PIL conversion."""
+    _, array, known_bits = _open_preserving_known_bit_depth(path)
+    if array.ndim != 2:
+        raise ValueError(f"scalar map must be single channel: {path}, shape={array.shape}")
+    tensor = _array_to_unit_float(
+        array, path=path, normalization=normalization, fixed_min=fixed_min,
+        fixed_max=fixed_max, calibrated_min=calibrated_min, calibrated_max=calibrated_max,
+        known_integer_bits=known_bits,
+    )
+    return tensor.unsqueeze(0)
+
+
+def convert_density_semantics(raw_map, density_gt_semantics="transmission"):
+    if density_gt_semantics not in ("transmission", "density"):
+        raise ValueError(f"unsupported density_gt_semantics={density_gt_semantics!r}")
+    return (1.0 - raw_map if density_gt_semantics == "transmission" else raw_map).clamp(0.0, 1.0)
+
+
+def load_tir_as_float_tensor(path, normalization_config: Optional[Mapping] = None):
+    """Load TIR preserving its original precision and expose a replicated 3-channel tensor."""
+    config = dict(normalization_config or {})
+    normalization = config.get("normalization", "dtype_range")
+    mode, array, known_bits = _open_preserving_known_bit_depth(path)
+    if array.ndim == 2:
+        one_channel = _array_to_unit_float(
+            array, path=path, normalization=normalization,
+            fixed_min=config.get("fixed_min"), fixed_max=config.get("fixed_max"),
+            calibrated_min=config.get("calibrated_min"), calibrated_max=config.get("calibrated_max"),
+            known_integer_bits=known_bits,
+        ).unsqueeze(0)
+    elif array.ndim == 3 and array.shape[2] in (3, 4):
+        rgb = array[..., :3]
+        if np.issubdtype(rgb.dtype, np.integer):
+            differences = (int(np.abs(rgb[..., 0].astype(np.int64) - rgb[..., 1].astype(np.int64)).max()),
+                           int(np.abs(rgb[..., 0].astype(np.int64) - rgb[..., 2].astype(np.int64)).max()),
+                           int(np.abs(rgb[..., 1].astype(np.int64) - rgb[..., 2].astype(np.int64)).max()))
+            tolerance = int(config.get("channel_tolerance_code_values", 1))
+        else:
+            normalized = _array_to_unit_float(
+                rgb, path=path, normalization=normalization,
+                fixed_min=config.get("fixed_min"), fixed_max=config.get("fixed_max"),
+                calibrated_min=config.get("calibrated_min"), calibrated_max=config.get("calibrated_max"),
+                known_integer_bits=known_bits,
+            )
+            differences = (float((normalized[..., 0] - normalized[..., 1]).abs().max()),
+                           float((normalized[..., 0] - normalized[..., 2]).abs().max()),
+                           float((normalized[..., 1] - normalized[..., 2]).abs().max()))
+            tolerance = float(config.get("channel_tolerance_float", 1e-5))
+        if max(differences) > tolerance:
+            raise ValueError(
+                f"TIR channel tolerance exceeded: path={path}, mode={mode}, dtype={rgb.dtype}, "
+                f"max_diffs={differences}, tolerance={tolerance}"
+            )
+        rgb_float = _array_to_unit_float(
+            rgb, path=path, normalization=normalization,
+            fixed_min=config.get("fixed_min"), fixed_max=config.get("fixed_max"),
+            calibrated_min=config.get("calibrated_min"), calibrated_max=config.get("calibrated_max"),
+            known_integer_bits=known_bits,
+        )
+        one_channel = rgb_float.mean(dim=2, keepdim=False).unsqueeze(0)
+    else:
+        raise ValueError(f"unsupported TIR shape in {path}: mode={mode}, shape={array.shape}")
+    return one_channel.repeat(3, 1, 1).contiguous()
+
+
+def stable_seed_mixer(global_augmentation_seed, sampler_epoch, sample_index, sample_occurrence=0):
+    payload = "|".join(map(str, (global_augmentation_seed, sampler_epoch, sample_index, sample_occurrence)))
+    return int.from_bytes(hashlib.blake2b(payload.encode("utf-8"), digest_size=8).digest(), "little")
 
 
 def _is_auto_format(format):
@@ -761,25 +912,41 @@ def _lookup_synth_stem(index, stem):
 
 
 class SynthMultiModalDataset(data.Dataset):
-    """Synthetic-domain five-piece dataset for supervised CMDN Teacher training."""
+    """Formal synthetic RGB--TIR dataset returning (hazy, clear, tir, density)."""
 
-    def __init__(self, root, train=True, size=256, haze_levels=None):
+    def __init__(self, root, train=True, size=256, haze_levels=None,
+                 density_gt_semantics="transmission", density_map_normalization="dtype_range",
+                 density_fixed_min=None, density_fixed_max=None,
+                 density_calibrated_min=None, density_calibrated_max=None,
+                 tir_normalization_config=None, pair_alignment_policy="strict",
+                 augmentation_seed_base=0, sampler_epoch=0):
         super(SynthMultiModalDataset, self).__init__()
         self.root = root
         self.train = train
         self.size = size
         self.haze_levels = tuple(haze_levels or DEFAULT_HAZE_LEVELS)
+        self.density_gt_semantics = density_gt_semantics
+        self.density_map_normalization = density_map_normalization
+        self.density_normalization_kwargs = {
+            "fixed_min": density_fixed_min, "fixed_max": density_fixed_max,
+            "calibrated_min": density_calibrated_min, "calibrated_max": density_calibrated_max,
+        }
+        self.tir_normalization_config = dict(tir_normalization_config or {})
+        self.pair_alignment_policy = pair_alignment_policy
+        self.augmentation_seed_base = int(augmentation_seed_base)
+        self.sampler_epoch = int(sampler_epoch)
+        if pair_alignment_policy not in ("strict", "resize_tir_to_rgb"):
+            raise ValueError("pair_alignment_policy must be 'strict' or 'resize_tir_to_rgb'")
 
         self.clear_dir = os.path.join(root, "clear")
         self.hazy_root = os.path.join(root, "hazy")
         self.ir_dir = os.path.join(root, "ir")
         self.density_root = os.path.join(root, "Transmission_Map_GT")
-        self.mask_root = os.path.join(root, "IR_Completion_Mask_GT")
 
         self.samples = []
         self.level_counts = {level: 0 for level in self.haze_levels}
-        self.missing_counts = {"clear": 0, "ir": 0, "density": 0, "mask": 0}
-        self.ambiguous_counts = {"clear": 0, "ir": 0, "density": 0, "mask": 0}
+        self.missing_counts = {"clear": 0, "ir": 0, "density": 0}
+        self.ambiguous_counts = {"clear": 0, "ir": 0, "density": 0}
         self._build_samples()
 
     def _build_samples(self):
@@ -789,11 +956,6 @@ class SynthMultiModalDataset(data.Dataset):
             level: _build_synth_stem_index(os.path.join(self.density_root, level))
             for level in self.haze_levels
         }
-        mask_indexes = {
-            level: _build_synth_stem_index(os.path.join(self.mask_root, level))
-            for level in self.haze_levels
-        }
-
         for level in self.haze_levels:
             hazy_dir = os.path.join(self.hazy_root, level)
 
@@ -820,15 +982,9 @@ class SynthMultiModalDataset(data.Dataset):
                     self.missing_counts["density"] += 1
                     continue
 
-                mask_path, mask_ambiguous = _lookup_synth_stem(mask_indexes[level], stem)
-                if mask_path is None:
-                    self.missing_counts["mask"] += 1
-                    continue
-
                 self.ambiguous_counts["clear"] += int(clear_ambiguous)
                 self.ambiguous_counts["ir"] += int(ir_ambiguous)
                 self.ambiguous_counts["density"] += int(density_ambiguous)
-                self.ambiguous_counts["mask"] += int(mask_ambiguous)
 
                 self.samples.append({
                     "stem": stem,
@@ -838,7 +994,6 @@ class SynthMultiModalDataset(data.Dataset):
                     "clear_path": clear_path,
                     "ir_path": ir_path,
                     "density_path": density_path,
-                    "mask_path": mask_path,
                 })
                 self.level_counts[level] += 1
 
@@ -852,67 +1007,110 @@ class SynthMultiModalDataset(data.Dataset):
                 f"using priority .png > .jpg > .jpeg. counts={self.ambiguous_counts}"
             )
 
-    def _resize_all(self, hazy_vis, clear_vis, infrared, density_gt, mask_gt):
-        resize_size = [self.size, self.size]
-        hazy_vis = FF.resize(hazy_vis, resize_size, interpolation=FF.InterpolationMode.BILINEAR)
-        clear_vis = FF.resize(clear_vis, resize_size, interpolation=FF.InterpolationMode.BILINEAR)
-        infrared = FF.resize(infrared, resize_size, interpolation=FF.InterpolationMode.BILINEAR)
-        density_gt = FF.resize(density_gt, resize_size, interpolation=FF.InterpolationMode.BILINEAR)
-        mask_gt = FF.resize(mask_gt, resize_size, interpolation=FF.InterpolationMode.NEAREST)
-        return hazy_vis, clear_vis, infrared, density_gt, mask_gt
+    @staticmethod
+    def _load_rgb(path):
+        with Image.open(path) as image:
+            return FF.pil_to_tensor(image.convert("RGB")).float().div_(255.0)
 
-    def _augment_all(self, hazy_vis, clear_vis, infrared, density_gt, mask_gt):
+    @staticmethod
+    def _spatial_size(path):
+        with Image.open(path) as image:
+            return image.size[::-1]
+
+    def _check_alignment(self, sample):
+        sizes = {key: self._spatial_size(sample[f"{key}_path"])
+                 for key in ("hazy", "clear", "ir", "density")}
+        hazy_size = sizes["hazy"]
+        valid = (sizes["clear"] == hazy_size and sizes["density"] == hazy_size and
+                 (sizes["ir"] == hazy_size or self.pair_alignment_policy == "resize_tir_to_rgb"))
+        if not valid:
+            paths = {key: sample[f"{key}_path"] for key in sizes}
+            raise ValueError(
+                f"pair alignment failed policy={self.pair_alignment_policy}, sizes={sizes}, paths={paths}"
+            )
+
+    @staticmethod
+    def _resize_tensor(tensor, size):
+        return F.interpolate(tensor.unsqueeze(0), size=size, mode="bilinear", align_corners=False).squeeze(0)
+
+    def _target_size(self, tensor):
+        if self.size in (None, "full"):
+            return tuple(tensor.shape[-2:])
+        if isinstance(self.size, int):
+            return self.size, self.size
+        return tuple(self.size)
+
+    def _sync_augment(self, tensors, index):
         if not self.train:
-            return hazy_vis, clear_vis, infrared, density_gt, mask_gt
+            return tensors
+        generator = torch.Generator()
+        generator.manual_seed(stable_seed_mixer(self.augmentation_seed_base, self.sampler_epoch, index))
+        if int(torch.randint(0, 2, (), generator=generator)):
+            tensors = [torch.flip(value, dims=(-1,)) for value in tensors]
+        turns = int(torch.randint(0, 4, (), generator=generator))
+        if turns:
+            tensors = [torch.rot90(value, turns, dims=(-2, -1)) for value in tensors]
+        return tensors
 
-        rand_hor = random.randint(0, 1)
-        if rand_hor == 1:
-            hazy_vis = FF.hflip(hazy_vis)
-            clear_vis = FF.hflip(clear_vis)
-            infrared = FF.hflip(infrared)
-            density_gt = FF.hflip(density_gt)
-            mask_gt = FF.hflip(mask_gt)
+    def _load_density(self, path):
+        raw = load_scalar_map_as_float_tensor(
+            path, normalization=self.density_map_normalization, **self.density_normalization_kwargs
+        )
+        return convert_density_semantics(raw, self.density_gt_semantics)
 
-        rand_rot = random.randint(0, 3)
-        if rand_rot > 0:
-            angle = 90 * rand_rot
-            hazy_vis = FF.rotate(hazy_vis, angle, interpolation=FF.InterpolationMode.BILINEAR)
-            clear_vis = FF.rotate(clear_vis, angle, interpolation=FF.InterpolationMode.BILINEAR)
-            infrared = FF.rotate(infrared, angle, interpolation=FF.InterpolationMode.BILINEAR)
-            density_gt = FF.rotate(density_gt, angle, interpolation=FF.InterpolationMode.BILINEAR)
-            mask_gt = FF.rotate(mask_gt, angle, interpolation=FF.InterpolationMode.NEAREST)
-
-        return hazy_vis, clear_vis, infrared, density_gt, mask_gt
+    def inspect_density_sample(self, index=0):
+        if not self.samples:
+            raise RuntimeError("cannot inspect density: no valid samples")
+        sample = self.samples[index]
+        raw = load_scalar_map_as_float_tensor(
+            sample["density_path"], normalization=self.density_map_normalization,
+            **self.density_normalization_kwargs
+        )
+        density = convert_density_semantics(raw, self.density_gt_semantics)
+        return {
+            "path": sample["density_path"], "semantics": self.density_gt_semantics,
+            "raw_min": float(raw.min()), "raw_max": float(raw.max()), "raw_mean": float(raw.mean()),
+            "density_min": float(density.min()), "density_max": float(density.max()),
+            "density_mean": float(density.mean()),
+        }
 
     def __getitem__(self, index):
         sample = self.samples[index]
         sample_name = f"{sample['haze_level']}/{sample['image_name']}"
 
-        try:
-            hazy_vis = Image.open(sample["hazy_path"]).convert("RGB")
-            clear_vis = Image.open(sample["clear_path"]).convert("RGB")
-            infrared = Image.open(sample["ir_path"]).convert("RGB")
-            density_gt = Image.open(sample["density_path"]).convert("L")
-            mask_gt = Image.open(sample["mask_path"]).convert("L")
+        self._check_alignment(sample)
+        hazy_vis = self._load_rgb(sample["hazy_path"])
+        clear_vis = self._load_rgb(sample["clear_path"])
+        infrared = load_tir_as_float_tensor(sample["ir_path"], self.tir_normalization_config)
+        density_gt = self._load_density(sample["density_path"])
+        target_size = self._target_size(hazy_vis)
+        if tuple(hazy_vis.shape[-2:]) != target_size:
+            hazy_vis = self._resize_tensor(hazy_vis, target_size)
+            clear_vis = self._resize_tensor(clear_vis, target_size)
+            infrared = self._resize_tensor(infrared, target_size)
+            density_gt = self._resize_tensor(density_gt, target_size).clamp(0.0, 1.0)
+        elif tuple(infrared.shape[-2:]) != target_size:
+            infrared = self._resize_tensor(infrared, target_size)
+        hazy_vis, clear_vis, infrared, density_gt = self._sync_augment(
+            [hazy_vis, clear_vis, infrared, density_gt], index
+        )
+        return hazy_vis, clear_vis, infrared, density_gt.clamp(0.0, 1.0)
 
-            hazy_vis, clear_vis, infrared, density_gt, mask_gt = self._resize_all(
-                hazy_vis, clear_vis, infrared, density_gt, mask_gt
-            )
-            hazy_vis, clear_vis, infrared, density_gt, mask_gt = self._augment_all(
-                hazy_vis, clear_vis, infrared, density_gt, mask_gt
-            )
+    def manifest_fingerprint(self):
+        return manifest_fingerprint([
+            {
+                "sample": os.path.relpath(item["hazy_path"], self.root).replace("\\", "/"),
+                "clear": os.path.relpath(item["clear_path"], self.root).replace("\\", "/"),
+                "tir": os.path.relpath(item["ir_path"], self.root).replace("\\", "/"),
+                "density": os.path.relpath(item["density_path"], self.root).replace("\\", "/"),
+                "haze_level": item["haze_level"],
+            }
+            for item in self.samples
+        ])
 
-            hazy_vis = preprocess_feature(hazy_vis)
-            clear_vis = ToTensor()(clear_vis)
-            infrared = preprocess_feature(infrared)
-            density_gt = ToTensor()(density_gt).clamp(0.0, 1.0)
-            mask_gt = (ToTensor()(mask_gt) >= 0.5).float()
-
-            return hazy_vis, clear_vis, infrared, density_gt, mask_gt
-
-        except Exception as e:
-            print(f"[SynthMultiModalDataset] failed to load sample {sample_name}: {e}")
-            return None, None, None, None, None
+    def set_sampler_epoch(self, sampler_epoch):
+        """Synchronize stateless augmentation descriptions with sampler state."""
+        self.sampler_epoch = int(sampler_epoch)
 
     def __len__(self):
         return len(self.samples)
@@ -921,8 +1119,78 @@ class SynthMultiModalDataset(data.Dataset):
 def collate_synth(batch):
     batch = [item for item in batch if item is not None and item[0] is not None]
     if not batch:
-        return torch.tensor([]), torch.tensor([]), torch.tensor([]), torch.tensor([]), torch.tensor([])
+        return torch.tensor([]), torch.tensor([]), torch.tensor([]), torch.tensor([])
     return default_collate(batch)
+
+
+def collate_real(batch):
+    """Collate real `(RGB, TIR, metadata)` batches without inventing padding."""
+    if not batch:
+        return torch.tensor([]), torch.tensor([]), []
+    sizes = {tuple(item[0].shape[-2:]) for item in batch}
+    if len(sizes) != 1:
+        raise ValueError("real batch samples must have the same spatial size; use batch_size=1 otherwise")
+    hazy = torch.stack([item[0] for item in batch])
+    tir = torch.stack([item[1] for item in batch])
+    metadata = [item[2] for item in batch]
+    return hazy, tir, metadata
+
+
+class RealMultiModalDataset(data.Dataset):
+    """Formal real-domain EMA dataset: `(hazy_rgb, tir, sample_metadata)` only."""
+
+    def __init__(self, hazy_dir, tir_dir, *, format="auto", pair_alignment_policy="strict",
+                 tir_normalization_config=None):
+        if pair_alignment_policy not in ("strict", "resize_tir_to_rgb"):
+            raise ValueError("pair_alignment_policy must be 'strict' or 'resize_tir_to_rgb'")
+        self.hazy_dir, self.tir_dir = os.fspath(hazy_dir), os.fspath(tir_dir)
+        self.format = format
+        self.pair_alignment_policy = pair_alignment_policy
+        self.tir_normalization_config = dict(tir_normalization_config or {})
+        self.samples = []
+        for name in sorted(os.listdir(self.hazy_dir)):
+            hazy_path = os.path.join(self.hazy_dir, name)
+            if not os.path.isfile(hazy_path) or not _is_image_file(name, format):
+                continue
+            tir_path = _find_matching_image_by_stem(self.tir_dir, name, format)
+            if tir_path is None:
+                raise FileNotFoundError(f"missing TIR pair for real sample: {hazy_path}")
+            self.samples.append((hazy_path, tir_path))
+        if not self.samples:
+            raise ValueError("real dataset has no paired hazy/TIR samples")
+
+    def manifest_fingerprint(self):
+        return manifest_fingerprint([
+            {"sample": os.path.basename(hazy), "tir": os.path.basename(tir)}
+            for hazy, tir in self.samples
+        ])
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        hazy_path, tir_path = self.samples[index]
+        with Image.open(hazy_path) as image:
+            hazy = FF.pil_to_tensor(image.convert("RGB")).float().div_(255.0)
+        tir = load_tir_as_float_tensor(tir_path, self.tir_normalization_config)
+        original_size = tuple(hazy.shape[-2:])
+        if tuple(tir.shape[-2:]) != original_size:
+            if self.pair_alignment_policy != "resize_tir_to_rgb":
+                raise ValueError(
+                    "real RGB/TIR alignment mismatch: "
+                    f"hazy_path={hazy_path}, hazy_size={original_size}, "
+                    f"tir_path={tir_path}, tir_size={tuple(tir.shape[-2:])}, "
+                    f"policy={self.pair_alignment_policy}"
+                )
+            tir = F.interpolate(tir.unsqueeze(0), size=original_size, mode="bilinear", align_corners=False)[0]
+        metadata = {
+            "sample_id": os.path.splitext(os.path.basename(hazy_path))[0],
+            "filename": os.path.basename(hazy_path),
+            "original_size": original_size,
+            "hazy_path": hazy_path,
+            "tir_path": tir_path,
+        }
+        return hazy, tir, metadata
 
 
 class MultiModalCLIPLoader(data.Dataset):

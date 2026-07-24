@@ -13,18 +13,12 @@ def _inputs(requires_grad=False):
     return x_vis, x_ir
 
 
-def test_hde_requires_torchvision_dcn_without_fallback():
+def test_hde_uses_explicit_pure_pytorch_deformable_backend():
     root = Path(__file__).resolve().parents[1]
     source = (root / "model" / "hde.py").read_text(encoding="utf-8")
 
-    assert "from torchvision.ops import DeformConv2d" in source
-    for forbidden in (
-        "_FallbackDeformConv2d",
-        "_TorchvisionDeformConv2d",
-        "except TypeError",
-        "except Exception",
-    ):
-        assert forbidden not in source
+    assert "from .deform_sampler import ModulatedDeformSampler" in source
+    assert "ModulatedDeformSampler(32, 64" in source
 
 
 def test_ir_difference_encoder_uses_fixed_registered_kernels():
@@ -107,7 +101,7 @@ def test_hde_debug_fields_and_zero_initialized_offsets():
         assert torch.allclose(debug[key], torch.zeros_like(debug[key]), atol=1e-6)
 
 
-def test_hde_supports_all_return_modes_and_legacy_ir_fallback():
+def test_hde_supports_formal_named_output_and_explicit_legacy_feature_mode():
     hde = HDE().eval()
     x_vis, x_ir = _inputs()
 
@@ -118,9 +112,10 @@ def test_hde_supports_all_return_modes_and_legacy_ir_fallback():
         density_debug_pair = hde(x_vis, x_ir, return_debug=True)
         density_feat_debug = hde(x_vis, x_ir, return_feat=True, return_debug=True)
 
-    assert density_only.shape == density_with_ir.shape == (2, 1, 32, 32)
+    assert density_only["density_map"].shape == density_with_ir["density_map"].shape == (2, 1, 32, 32)
+    assert tuple(density_only["tir_structure_pyramid"]) == ("h2", "h4", "h8", "h16")
     assert len(density_feat_pair) == 2
-    assert len(density_debug_pair) == 2
+    assert set(density_debug_pair) == {"density_map", "tir_structure_pyramid", "debug"}
     assert len(density_feat_debug) == 3
 
 

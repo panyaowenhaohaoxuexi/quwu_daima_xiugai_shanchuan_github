@@ -1,33 +1,49 @@
-import sys
-import os
+"""Smoke-check the formal four-tensor synthetic RGB--TIR loader."""
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import argparse
+import os
+import sys
 
 import torch
 from torch.utils.data import DataLoader
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from data.data_loader import SynthMultiModalDataset, collate_synth
 
 
-root = r"F:/Dehaze_Paper/2_Dataset/1_main_benchmark/FLIR/train"
-ds = SynthMultiModalDataset(root=root, train=True, size=256)
-print("dataset size:", len(ds))
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data_root", required=True, help="synthetic dataset root containing clear/ir/hazy/Transmission_Map_GT")
+    parser.add_argument("--train_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--density_gt_semantics", choices=("transmission", "density"), default="transmission")
+    parser.add_argument("--pair_alignment_policy", choices=("strict", "resize_tir_to_rgb"), default="strict")
+    return parser
 
-loader = DataLoader(ds, batch_size=4, shuffle=True, num_workers=0, collate_fn=collate_synth)
-hazy, clear, ir, density, mask = next(iter(loader))
 
-print("hazy   ", tuple(hazy.shape), hazy.dtype)
-print("clear  ", tuple(clear.shape), clear.dtype)
-print("ir     ", tuple(ir.shape), ir.dtype)
-print("density", tuple(density.shape), density.dtype, "range", float(density.min()), float(density.max()))
-print("mask   ", tuple(mask.shape), mask.dtype, "unique", torch.unique(mask)[:5].tolist())
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    dataset = SynthMultiModalDataset(
+        root=args.data_root,
+        train=True,
+        size=args.train_size,
+        density_gt_semantics=args.density_gt_semantics,
+        pair_alignment_policy=args.pair_alignment_policy,
+    )
+    if not dataset:
+        raise RuntimeError(f"no valid synthetic samples found under {args.data_root}")
+    print("density inspection:", dataset.inspect_density_sample(0))
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_synth)
+    hazy, clear, tir, density = next(iter(loader))
+    print("hazy   ", tuple(hazy.shape), hazy.dtype, "range", float(hazy.min()), float(hazy.max()))
+    print("clear  ", tuple(clear.shape), clear.dtype, "range", float(clear.min()), float(clear.max()))
+    print("tir    ", tuple(tir.shape), tir.dtype, "range", float(tir.min()), float(tir.max()))
+    print("density", tuple(density.shape), density.dtype, "range", float(density.min()), float(density.max()))
+    assert hazy.shape[1] == clear.shape[1] == tir.shape[1] == 3
+    assert density.shape[1] == 1 and float(density.min()) >= 0.0 and float(density.max()) <= 1.0
+    print("[loader] formal four-tensor check PASSED")
 
-assert len(ds) > 0
-assert hazy.shape[1] == 3 and clear.shape[1] == 3 and ir.shape[1] == 3
-assert density.shape[1] == 1 and mask.shape[1] == 1
-assert float(density.min()) >= 0.0 and float(density.max()) <= 1.0
-assert set(torch.unique(mask).tolist()).issubset({0.0, 1.0})
 
-print("sample0 density mean:", float(density[0].mean()),
-      "| mask positive ratio:", float(mask[0].mean()))
-print("[loader] check PASSED")
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1 @@
+"""Formal training-time utilities."""

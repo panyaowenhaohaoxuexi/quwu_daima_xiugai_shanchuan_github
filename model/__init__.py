@@ -1,8 +1,10 @@
-from .vifnet_basic_modules import *
-from .dsfe import *
-from .hde import *
-from .gumbel_sigmoid import *
+"""Public formal model interface.
 
-from .Teacher import *
-from .Student import *
-from .Student_x import *
+Legacy classes remain importable only through their explicit legacy module path
+for checkpoint inspection; importing :mod:`model` never loads them.
+"""
+
+from .fog_routed_dehazer import FogRoutedRGBTIRDehazer
+from .monotonic_router import MonotonicFogRouter
+
+__all__ = ["FogRoutedRGBTIRDehazer", "MonotonicFogRouter"]

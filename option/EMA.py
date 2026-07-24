@@ -1,64 +1,60 @@
+"""Pure EMA-adaptation configuration module; importing it has no side effects."""
+
 import argparse
 import json
-import os
-import torch
+from pathlib import Path
 
-parser = argparse.ArgumentParser()
-
-parser.add_argument('--device', type=str, default='Automatic detection')
-# 原始参数设置
-# parser.add_argument('--epochs', type=int, default=20)
-# 修改后
-parser.add_argument('--epochs', type=int, default=20)
-parser.add_argument('--iters_per_epoch', type=int, default=1000)
-# 修改后
-parser.add_argument('--finer_eval_step', type=int, default=20000)
-# 原始参数设置
-# parser.add_argument('--start_lr', default=0.0000001, type=float, help='start learning rate')
-# 修改后
-parser.add_argument('--start_lr', default=0.0000001, type=float, help='start learning rate')
-parser.add_argument('--end_lr', default=0.00000001, type=float, help='end learning rate')
-parser.add_argument('--no_lr_sche', action='store_true', help='no lr cos schedule')
-
-parser.add_argument('--w_loss_L1_r', default=1, type=float, help='weight of loss L1_r')
-parser.add_argument('--w_loss_Clip', default=0.5, type=float, help='weight of loss Clip')
-
-# --- [新增] ---
-# 添加一个新的损失权重，用于红外边缘一致性
-parser.add_argument('--w_loss_Edge', default=0.3, type=float, help='weight of IR Edge consistency loss')
-# --- [新增结束] ---
-
-parser.add_argument('--exp_dir', type=str, default='./experiment')
-parser.add_argument('--model_name', type=str, default='THaze')
-parser.add_argument('--saved_model_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/xunlian_EMA/saved_model')
-parser.add_argument('--saved_data_dir', type=str, default='/root/autodl-tmp/CoA-main_daima_xiugai_teacher_v10/xunlian_EMA/saved_data')
-parser.add_argument('--dataset', type=str, default='EMA')
-
-# --- [新增] 训练期间的真实世界测试集路径 ---
-# (请在运行时指定这些路径，或在此处设置你的默认值)
-parser.add_argument('--real_test_hazy_path', type=str, default='/root/autodl-tmp/FLIR_zengqiang/xunlian_guocheng_ceshi/hazy',
-                    help='Path to real-world hazy images (e.g., ./real_test/hazy)')
-parser.add_argument('--real_test_ir_path', type=str, default='/root/autodl-tmp/FLIR_zengqiang/xunlian_guocheng_ceshi/ir',
-                    help='Path to real-world ir images (e.g., ./real_test/ir)')
-# --- [新增结束] ---
+from ._formal_config import add_model_arguments, add_training_arguments, validate_common
 
 
-opt = parser.parse_args()
-opt.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+def build_parser():
+    parser = argparse.ArgumentParser("fog-routed-ema")
+    add_model_arguments(parser)
+    add_training_arguments(parser)
+    parser.add_argument("--real_data_dir", default="")
+    parser.add_argument("--source_checkpoint", default="")
+    parser.add_argument("--resume_checkpoint", default="")
+    parser.add_argument("--real_batch_size", type=int, default=1)
+    parser.add_argument("--source_anchor_batch_size", type=int, default=1)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--ema_sigma_j", type=float, default=0.1)
+    parser.add_argument("--ema_sigma_m", type=float, default=0.1)
+    parser.add_argument("--ema_sigma_r", type=float, default=0.1)
+    parser.add_argument("--ema_stability_min_weight", type=float, default=0.05)
+    parser.add_argument("--lambda_ema_j", type=float, default=1.0)
+    parser.add_argument("--lambda_ema_m", type=float, default=1.0)
+    parser.add_argument("--lambda_ema_r", type=float, default=1.0)
+    parser.add_argument("--lambda_anchor", type=float, default=1.0)
+    parser.add_argument("--allow_ema_training_override", action="store_true")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    return parser
 
-dataset_dir = os.path.join(opt.exp_dir, opt.dataset)
-model_dir = os.path.join(dataset_dir, opt.model_name)
 
-if not os.path.exists(opt.exp_dir):
-    os.mkdir(opt.exp_dir)
-if not os.path.exists(dataset_dir):
-    os.mkdir(dataset_dir)
-if not os.path.exists(model_dir):
-    os.mkdir(model_dir)
-    opt.saved_model_dir = os.path.join(model_dir, 'saved_model')
-    opt.saved_data_dir = os.path.join(model_dir, 'saved_data')
-    os.mkdir(opt.saved_model_dir)
-    os.mkdir(opt.saved_data_dir)
+def validate_config(args):
+    validate_common(args)
+    if not 0 <= args.ema_decay < 1:
+        raise ValueError("ema_decay must be in [0,1)")
+    if min(args.ema_sigma_j, args.ema_sigma_m, args.ema_sigma_r) <= 0:
+        raise ValueError("EMA sigmas must be > 0")
+    if not 0 <= args.ema_stability_min_weight <= 1:
+        raise ValueError("ema_stability_min_weight must be in [0,1]")
+    if args.real_batch_size < 1 or args.source_anchor_batch_size < 1:
+        raise ValueError("EMA batch sizes must be >= 1")
+    if args.epochs < 1 or args.learning_rate <= 0:
+        raise ValueError("epochs and learning_rate must be positive")
+    return args
 
-with open(os.path.join(model_dir, 'args.txt'), 'w') as f:
-    json.dump(opt.__dict__, f, indent=2)
+
+def prepare_experiment_dirs(args):
+    for value in (args.exp_dir, args.saved_model_dir, args.saved_data_dir):
+        if value:
+            Path(value).mkdir(parents=True, exist_ok=True)
+
+
+def save_config(args):
+    if not args.exp_dir:
+        return
+    Path(args.exp_dir).mkdir(parents=True, exist_ok=True)
+    with (Path(args.exp_dir) / "config.json").open("w", encoding="utf-8") as handle:
+        json.dump(vars(args), handle, indent=2, sort_keys=True)

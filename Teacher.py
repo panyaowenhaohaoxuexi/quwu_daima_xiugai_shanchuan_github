@@ -1,905 +1,172 @@
-﻿# -*- coding: utf-8 -*-
-# Teacher.py (Training Script)
+"""Formal source-domain training entry point for fog-routed RGB--TIR dehazing."""
 
-# 导入数学库，用于数学计算，例如余弦函数
-import math
-# 导入操作系统库，用于文件路径操作，例如创建目录
-import os
-# 导入时间库，用于记录时间
-import time
-# 导入 NumPy 库，用于数值计算，特别是数组操作
+import random
+from pathlib import Path
+
 import numpy as np
-# 导入 PyTorch 核心库
 import torch
-# 导入 PyTorch 神经网络函数库，例如 pad (填充)
-import torch.nn.functional as F
-# 导入 PyTorch 数据加载工具
-import torch.utils.data
-# 从 PyTorch 导入优化器 (optim) 和神经网络模块 (nn)
-from torch import optim, nn
-# 导入 PyTorch 的 cuDNN 库，用于加速 GPU 计算
-from torch.backends import cudnn
-# 从 PyTorch 数据加载工具中导入 DataLoader 类，用于批量加载数据
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-# --- [修改] 导入 SSIM 和 ContrastLoss ---
-from loss import SSIM, ContrastLoss
-from loss.teacher_region_loss import compute_teacher_region_loss
-# --- [修改结束] ---
-
-# --- [修改] 导入新的数据集类和模型类 ---
-from data import MultiModalHazeDataset, TestDataset, SynthMultiModalDataset, collate_synth  # TestDataset 现在也支持三模态
-from metric import psnr, ssim
-# from model import DualStreamTeacher # <--- 不再使用原始模型
-from model import VIFNetInconsistencyTeacher  # <--- 使用新的融合模型
-# --- [修改结束] ---
-from option.Teacher import opt  # 导入配置选项
-
-# --- [新增] 导入 Eval.py 所需的模块 ---
-import glob
-from PIL import Image, ImageDraw, ImageFont
-from tqdm import tqdm
-from torchvision.transforms import Compose, ToTensor, Normalize, Resize, InterpolationMode
-
-# --- [新增结束] ---
-from utils.visualize_mask import visualize_epoch_mask
-from utils.visualize_teacher_region import save_teacher_region_visualization
-# --- [新增] 将 device 和 transform 移至全局 ---
-# (以便 dehaze 函数和 train 函数都能访问)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-transform = Compose([
-    ToTensor(),
-    Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
-])
-# --- [新增结束] ---
-
-IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
-REAL_PROBE_COLUMNS = ["Hazy", "IR", "Pred_raw", "Transported_rgb", "Final_pred", "Density_pred", "Mask_prob", "Binary_mask"]
-
-# 训练轮次
-start_time = time.time()
-# 计算总的训练步数 = 每个 epoch 的迭代次数 * 总 epoch 数
-steps = opt.iters_per_epoch * opt.epochs
-# 总步数 T，用于学习率调度
-T = steps
-
-
-# 定义函数 lr_schedule_cosdecay：实现学习率余弦衰减
-def lr_schedule_cosdecay(t, T, init_lr=opt.start_lr, end_lr=opt.end_lr):
-    """
-    计算余弦衰减后的学习率。
-    """
-    lr = end_lr + 0.5 * (init_lr - end_lr) * (1 + math.cos(t * math.pi / T))
-    return lr
-
-
-# 定义函数 collate_fn_skip_none：DataLoader 的整理函数，用于跳过无效样本
-def collate_fn_skip_none(batch):
-    """
-    DataLoader 的 collate_fn，用于过滤掉批次中值为 None 的样本。
-    支持训练/测试返回的 3-item / 4-item / 5-item batch。
-    """
-    # 过滤掉 batch 中第一个元素为 None 的项
-    batch = list(filter(lambda x: x is not None and x[0] is not None, batch))
-    if not batch:
-        # 如果整个批次都无效，根据训练/测试返回不同数量的空值
-        # 假设通过 len(batch[0]) 判断是训练(3)还是测试(4)，但这不可靠
-        # 更稳妥的方式是让调用者处理可能的空 batch
-        # 这里返回适用于训练和测试的最小公倍数或根据需要调整
-        # 返回空元组，让调用者检查
-        return ()  # 返回空元组
-    # 使用 PyTorch 默认的 collate 函数将有效样本整理成批次张量/列表
-    return torch.utils.data.dataloader.default_collate(batch)
-
-
-def find_paired_image(folder, stem):
-    for ext in IMAGE_EXTS:
-        for candidate_ext in (ext, ext.upper()):
-            path = os.path.join(folder, stem + candidate_ext)
-            if os.path.exists(path):
-                return path
-    return None
-
-
-def _list_real_images(folder):
-    files = []
-    for ext in IMAGE_EXTS:
-        files.extend(glob.glob(os.path.join(folder, f"*{ext}")))
-        files.extend(glob.glob(os.path.join(folder, f"*{ext.upper()}")))
-    return sorted(set(files))
-
-
-def _resize_to_model_multiple(haze_vis, haze_ir):
-    h, w = haze_vis.shape[2], haze_vis.shape[3]
-    target_h = max(16, (h // 16) * 16)
-    target_w = max(16, (w // 16) * 16)
-    if h != target_h or w != target_w:
-        resize_fn = Resize((target_h, target_w), interpolation=InterpolationMode.BICUBIC, antialias=True)
-        return resize_fn(haze_vis), resize_fn(haze_ir), h, w
-    return haze_vis, haze_ir, h, w
-
-
-def _denorm_clip(x):
-    mean = torch.tensor(
-        [0.48145466, 0.4578275, 0.40821073],
-        device=x.device,
-        dtype=x.dtype,
-    ).view(1, 3, 1, 1)
-    std = torch.tensor(
-        [0.26862954, 0.26130258, 0.27577711],
-        device=x.device,
-        dtype=x.dtype,
-    ).view(1, 3, 1, 1)
-    return (x * std + mean).clamp(0.0, 1.0)
-
-
-def _panel_3ch(x, size, mode='bilinear'):
-    if mode in ("nearest", "nearest-exact"):
-        x = F.interpolate(x, size=size, mode=mode)
-    else:
-        x = F.interpolate(x, size=size, mode=mode, align_corners=False)
-    x = x.clamp(0.0, 1.0)
-    if x.shape[1] == 1:
-        return x.repeat(1, 3, 1, 1)
-    if x.shape[1] == 3:
-        return x
-    return x[:, :1].repeat(1, 3, 1, 1)
-
-
-def _tensor_to_pil_img(x):
-    x = x.detach().cpu().clamp(0.0, 1.0)
-    x = (x * 255).byte()
-    return Image.fromarray(x.permute(1, 2, 0).numpy())
-
-
-def _text_size(draw, text, font):
-    if hasattr(draw, "textbbox"):
-        box = draw.textbbox((0, 0), text, font=font)
-        return box[2] - box[0], box[3] - box[1]
-    return draw.textsize(text, font=font)
-
-
-def _draw_centered_text(draw, box, text, font, fill=(20, 20, 20)):
-    x0, y0, x1, y1 = box
-    text_w, text_h = _text_size(draw, text, font)
-    x = x0 + max(0, (x1 - x0 - text_w) // 2)
-    y = y0 + max(0, (y1 - y0 - text_h) // 2)
-    draw.text((x, y), text, fill=fill, font=font)
-
-
-def save_real_probe_overview(samples, save_path):
-    panel_size = 192
-    title_h = 32
-    row_label_w = 90
-    padding = 6
-    width = row_label_w + len(REAL_PROBE_COLUMNS) * panel_size
-    height = title_h + len(samples) * panel_size
-    canvas = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(canvas)
-    font = ImageFont.load_default()
-
-    for col, title in enumerate(REAL_PROBE_COLUMNS):
-        x0 = row_label_w + col * panel_size
-        _draw_centered_text(draw, (x0, 0, x0 + panel_size, title_h), title, font)
-
-    for row, panels in enumerate(samples):
-        y0 = title_h + row * panel_size
-        _draw_centered_text(draw, (0, y0, row_label_w, y0 + panel_size), f"Scene {row + 1}", font)
-        for col, title in enumerate(REAL_PROBE_COLUMNS):
-            x0 = row_label_w + col * panel_size
-            image = _tensor_to_pil_img(panels[col].squeeze(0))
-            if padding > 0:
-                resample = Image.NEAREST if title == "Binary_mask" else Image.BILINEAR
-                image = image.resize((panel_size - 2 * padding, panel_size - 2 * padding), resample)
-            canvas.paste(image, (x0 + padding, y0 + padding))
-
-    canvas.save(save_path)
-
-
-def run_real_world_test(model, epoch, hazy_dir, ir_dir):
-    """
-    在训练评估节点执行真实域测试。
-    输入只来自 real_test_hazy_path / real_test_ir_path。
-    输出 6 列 overview: Hazy | IR | Pred | Density_pred | Mask_prob | Binary_mask。
-    保存位置: real_test_output_dir/epoch_{epoch}/overview.png。
-    """
-    if not hazy_dir or not ir_dir:
-        print("[RealTest] hazy_dir or ir_dir is empty, skip real-domain overview.")
-        return
-
-    if not os.path.isdir(hazy_dir) or not os.path.isdir(ir_dir):
-        print(f"[RealTest] invalid dirs: hazy_dir={hazy_dir}, ir_dir={ir_dir}, skip.")
-        return
-
-    output_folder = os.path.join(opt.real_test_output_dir, f"epoch_{epoch}")
-    os.makedirs(output_folder, exist_ok=True)
-    vis_images = _list_real_images(hazy_dir)
-    max_images = getattr(opt, "real_vis_max_images", 8)
-
-    if not vis_images:
-        print(f"[RealTest] warning: no supported images found in {hazy_dir}.")
-        return
-
-    print(f"[RealTest] Epoch {epoch} overview -> {output_folder}")
-    samples = []
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} | {rate_fmt}"
-            for vis_path in tqdm(vis_images, bar_format=bar_format, desc=f"Epoch {epoch} 真实测试"):
-                base_filename = os.path.basename(vis_path)
-                stem = os.path.splitext(base_filename)[0]
-                ir_path = find_paired_image(ir_dir, stem)
-                if ir_path is None:
-                    print(f"\n[RealTest] warning: no paired IR image for {base_filename}; skip.")
-                    continue
-
-                try:
-                    haze_vis = transform(Image.open(vis_path).convert("RGB")).unsqueeze(0).to(device)
-                    haze_ir = transform(Image.open(ir_path).convert("RGB")).unsqueeze(0).to(device)
-                    haze_vis_resized, haze_ir_resized, h, w = _resize_to_model_multiple(haze_vis, haze_ir)
-                    out = model(haze_vis_resized, haze_ir_resized, return_dict=True)
-
-                    pred_clear = F.interpolate(
-                        out["pred_clear"],
-                        size=(h, w),
-                        mode="bicubic",
-                        align_corners=False,
-                    ).clamp(0.0, 1.0)
-                    density_map = F.interpolate(
-                        out["density_map"],
-                        size=(h, w),
-                        mode="bilinear",
-                        align_corners=False,
-                    ).clamp(0.0, 1.0)
-                    mask_prob = F.interpolate(
-                        out["mask_prob"],
-                        size=(h, w),
-                        mode="bilinear",
-                        align_corners=False,
-                    ).clamp(0.0, 1.0)
-                    binary_mask = F.interpolate(
-                        (out["binary_mask"] >= 0.5).float(),
-                        size=(h, w),
-                        mode="nearest",
-                    ).clamp(0.0, 1.0)
-                    pred_raw = F.interpolate(
-                        out.get("pred_raw", out["pred_clear"]),
-                        size=(h, w),
-                        mode="bicubic",
-                        align_corners=False,
-                    ).clamp(0.0, 1.0)
-                    transported_rgb = F.interpolate(
-                        out.get("transported_rgb", out["pred_clear"]),
-                        size=(h, w),
-                        mode="bicubic",
-                        align_corners=False,
-                    ).clamp(0.0, 1.0)
-
-                    panels = [
-                        _panel_3ch(_denorm_clip(haze_vis), (192, 192)),
-                        _panel_3ch(_denorm_clip(haze_ir), (192, 192)),
-                        _panel_3ch(pred_raw, (192, 192), mode="bicubic"),
-                        _panel_3ch(transported_rgb, (192, 192), mode="bicubic"),
-                        _panel_3ch(pred_clear, (192, 192), mode="bicubic"),
-                        _panel_3ch(density_map, (192, 192)),
-                        _panel_3ch(mask_prob, (192, 192)),
-                        _panel_3ch(binary_mask, (192, 192), mode="nearest"),
-                    ]
-                    samples.append(panels)
-                    if max_images > 0 and len(samples) >= max_images:
-                        break
-                except FileNotFoundError as e:
-                    print(f"\n[RealTest] error: missing image file {e}; skip.")
-                except Exception as e:
-                    print(f"\n[RealTest] error processing {base_filename}: {e}; skip.")
-
-            if not samples:
-                print(f"[RealTest] warning: no valid paired hazy/IR samples found in hazy_dir={hazy_dir}, ir_dir={ir_dir}")
-                return
-
-            save_path = os.path.join(output_folder, "overview.png")
-            save_real_probe_overview(samples, save_path)
-            print(f"[RealTest] saved real-domain overview: {save_path}")
-    finally:
-        if was_training:
-            model.train()
-
-
-# --- [新增结束] ---
-
-
-# 定义函数 train：执行模型训练的主要逻辑
-def train(teacher_net, loader_train, loader_test, optim, criterion):
-    """
-    执行合成域 Teacher 区域补全监督训练。
-    """
-    losses = []
-    loss_log = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'cr': [], 'edge': [], 'align': [], 'comp': [], 'comp_perc': [], 'sparse': [], 'ir_tv': [], 'total': []}
-    loss_log_tmp = {'rec': [], 'density': [], 'mask': [], 'ssim': [], 'cr': [], 'edge': [], 'align': [], 'comp': [], 'comp_perc': [], 'sparse': [], 'ir_tv': [], 'total': []}
-    psnr_log = []
-
-    start_step = 0
-    max_ssim = 0
-    max_psnr = 0
-    ssims = []
-    psnrs = []
-    loader_train_iter = iter(loader_train)
-    ssim_loss_module = criterion[1] if criterion and len(criterion) > 1 else None
-    contrast_module = criterion[2] if criterion and len(criterion) > 2 else None
-
-    for step in range(start_step + 1, steps + 1):
-        teacher_net.train()
-        lr = opt.start_lr
-        if not opt.no_lr_sche:
-            lr = lr_schedule_cosdecay(step, T)
-            for param_group in optim.param_groups:
-                param_group["lr"] = lr
-
-        try:
-            batch_data = next(loader_train_iter)
-        except StopIteration:
-            loader_train_iter = iter(loader_train)
-            try:
-                batch_data = next(loader_train_iter)
-            except StopIteration:
-                print("\n警告: 数据加载器在 epoch 开始时意外耗尽。")
-                break
-            except Exception as e:
-                print(f"\n错误: 在步骤 {step} (StopIteration后) 加载数据时出错: {e}。跳过批次。")
-                continue
-        except Exception as e:
-            print(f"\n错误: 在步骤 {step} 加载数据时出错: {e}。跳过批次。")
-            continue
-
-        if not batch_data or len(batch_data) != 5:
-            raise RuntimeError(
-                "New synthetic Teacher training requires hazy_vis, clear_vis, infrared, density_gt, mask_gt."
-            )
-
-        hazy_vis, clear_vis, infrared, density_gt, mask_gt = batch_data
-        if not hazy_vis.numel():
-            print(f"\n警告: 在步骤 {step} 跳过空批次。")
-            continue
-
-        hazy_vis = hazy_vis.to(opt.device, non_blocking=True)
-        clear_vis = clear_vis.to(opt.device, non_blocking=True)
-        infrared = infrared.to(opt.device, non_blocking=True)
-        density_gt = density_gt.to(opt.device, non_blocking=True)
-        mask_gt = mask_gt.to(opt.device, non_blocking=True)
-
-        tau_start = getattr(opt, "gumbel_tau_start", 1.0)
-        tau_end = getattr(opt, "gumbel_tau_end", 0.1)
-        progress = min(1.0, (step - 1) / max(1, steps - 1))
-        tau = tau_start + (tau_end - tau_start) * progress
-        if hasattr(teacher_net, "module"):
-            teacher_net.module.set_gumbel_tau(tau)
-        else:
-            teacher_net.set_gumbel_tau(tau)
-
-        out = teacher_net(hazy_vis, infrared, return_dict=True)
-        pred_image = out["pred_clear"]
-        clip_mean = torch.tensor(
-            [0.48145466, 0.4578275, 0.40821073],
-            device=hazy_vis.device,
-            dtype=hazy_vis.dtype,
-        ).view(1, 3, 1, 1)
-        clip_std = torch.tensor(
-            [0.26862954, 0.26130258, 0.27577711],
-            device=hazy_vis.device,
-            dtype=hazy_vis.dtype,
-        ).view(1, 3, 1, 1)
-        hazy_vis_01 = (hazy_vis * clip_std + clip_mean).clamp(0.0, 1.0)
-        x_ir_01 = (infrared * clip_std + clip_mean).clamp(0.0, 1.0)
-
-        lambda_rec = getattr(opt, "w_loss_rec", 1.0)
-        lambda_density = getattr(opt, "w_loss_density", 1.0)
-        lambda_mask = getattr(opt, "w_loss_mask", 1.0)
-        lambda_ssim = getattr(opt, "w_loss_SSIM", 0.0)
-        lambda_cr = getattr(opt, "w_loss_Cr", 0.0)
-        lambda_edge = getattr(opt, "w_loss_Edge", 0.0)
-        if step < getattr(opt, "color_loss_start_step", 1000):
-            lambda_align = 0.0
-            lambda_comp = 0.0
-            lambda_comp_perc = 0.0
-            lambda_sparse = 0.0
-            lambda_ir_tv = 0.0
-            effective_fp_threshold = 1.0
-        else:
-            color_start_step = getattr(opt, "color_loss_start_step", 1000)
-            lambda_align = getattr(opt, "w_loss_align", 0.1)
-            lambda_comp = getattr(opt, "w_loss_comp", 1.0)
-            lambda_comp_perc = getattr(opt, "w_loss_comp_perc", 0.5)
-            lambda_ir_tv = getattr(opt, "w_loss_ir_tv", 0.05)
-            sparse_target = getattr(opt, "w_loss_sparse", 0.01)
-            sparse_warmup = max(1, getattr(opt, "sparse_warmup_steps", 5000))
-            sparse_progress = min(1.0, (step - color_start_step) / sparse_warmup)
-            lambda_sparse = sparse_target * sparse_progress
-            fp_warmup = max(1, getattr(opt, "infonce_fp_warmup_steps", 5000))
-            fp_progress = min(1.0, max(0.0, (step - color_start_step) / fp_warmup))
-            fp_target = getattr(opt, "infonce_fp_threshold", 0.8)
-            effective_fp_threshold = 1.0 + (fp_target - 1.0) * fp_progress
-
-        loss_dict = compute_teacher_region_loss(
-            pred_clear=pred_image,
-            clear_gt=clear_vis,
-            density_map=out["density_map"],
-            density_gt=density_gt,
-            mask_logits=out["mask_logits"],
-            mask_prob=out["mask_prob"],
-            mask_gt=mask_gt,
-            hazy_vis_01=hazy_vis_01,
-            pred_raw=out.get("pred_raw"),
-            transported_rgb=out.get("transported_rgb"),
-            semantic_ir=out.get("semantic_ir"),
-            semantic_vis=out.get("semantic_vis"),
-            proto_keys=out.get("proto_keys"),
-            proto_values=out.get("proto_values"),
-            proto_attn=out.get("proto_attn"),
-            proto_assign=out.get("proto_assign"),
-            x_ir_01=x_ir_01,
-            binary_mask=out.get("binary_mask"),
-            lambda_rec=lambda_rec,
-            lambda_density=lambda_density,
-            lambda_mask=lambda_mask,
-            lambda_ssim=lambda_ssim,
-            lambda_cr=lambda_cr,
-            lambda_edge=lambda_edge,
-            lambda_align=lambda_align,
-            lambda_comp=lambda_comp,
-            lambda_comp_perc=lambda_comp_perc,
-            lambda_sparse=lambda_sparse,
-            lambda_ir_tv=lambda_ir_tv,
-            ir_tv_edge_lambda=getattr(opt, "ir_tv_edge_lambda", 10.0),
-            align_mode=getattr(opt, "align_mode", "infonce"),
-            align_temperature=getattr(opt, "align_temperature", 0.07),
-            infonce_fp_threshold=effective_fp_threshold,
-            infonce_max_samples=getattr(opt, "infonce_max_samples", 1024),
-            ssim_module=ssim_loss_module,
-            contrast_module=contrast_module,
-        )
-        loss = loss_dict["total"]
-
-        optim.zero_grad()
-        loss.backward()
-        optim.step()
-
-        losses.append(loss.item())
-        for key in ("rec", "density", "mask", "ssim", "cr", "edge", "align", "comp", "comp_perc", "sparse", "ir_tv"):
-            loss_log_tmp[key].append(loss_dict[key].item())
-        loss_log_tmp['total'].append(loss.item())
-
-        with torch.no_grad():
-            train_psnr = psnr(pred_image.detach().clamp(0, 1), clear_vis)
-            train_ssim = ssim(pred_image.detach().clamp(0, 1), clear_vis).item()
-            mask_ratio = out["binary_mask"].mean().item()
-            mask_gt_ratio = mask_gt.float().mean().item()
-            reliable_area_ratio = out.get("reliable_area_ratio", torch.tensor([0.0], device=pred_image.device)).float().mean().item()
-            density_mean = out["density_map"].mean().item()
-            transported = out.get("transported_rgb")
-            transported_mean = transported.mean().item() if transported is not None else 0.0
-            transported_std = transported.std().item() if transported is not None else 0.0
-            proto_attn = out.get("proto_attn")
-            if proto_attn is not None:
-                proto_entropy = (-(proto_attn * torch.log(proto_attn.clamp_min(1e-6))).sum(dim=-1)).mean().item()
-            else:
-                proto_entropy = 0.0
-            max_sim_map = out.get("max_sim_map")
-            max_sim_mean = max_sim_map.mean().item() if max_sim_map is not None else 0.0
-            max_sim_max = max_sim_map.max().item() if max_sim_map is not None else 0.0
-            max_sim_min = max_sim_map.min().item() if max_sim_map is not None else 0.0
-
-        print(
-            f'\rloss:{loss.item():.5f} | rec:{loss_dict["rec"].item():.5f} '
-            f'| density:{loss_dict["density"].item():.5f} | mask:{loss_dict["mask"].item():.5f} '
-            f'| ssim_loss:{loss_dict["ssim"].item():.5f} | cr:{loss_dict["cr"].item():.5f} '
-            f'| edge:{loss_dict["edge"].item():.5f} | align:{loss_dict["align"].item():.5f} '
-            f'| comp:{loss_dict["comp"].item():.5f} | comp_perc:{loss_dict["comp_perc"].item():.5f} '
-            f'| sparse:{loss_dict["sparse"].item():.5f} '
-            f'| ir_tv:{loss_dict["ir_tv"].item():.5f} '
-            f'| mask_ratio:{mask_ratio:.4f} | mask_gt_ratio:{mask_gt_ratio:.4f} '
-            f'| reliable_area:{reliable_area_ratio:.4f} | density_mean:{density_mean:.4f} '
-            f'| transported_mu:{transported_mean:.4f} | transported_std:{transported_std:.4f} '
-            f'| proto_entropy:{proto_entropy:.4f} | max_sim:{max_sim_mean:.4f}/{max_sim_min:.4f}/{max_sim_max:.4f} '
-            f'| tau:{tau:.4f} '
-            f'| PSNR:{train_psnr:.4f} | SSIM:{train_ssim:.4f} '
-            f'| step :{step}/{steps} | lr :{lr :.9f} | time_used :{(time.time() - start_time) / 60 :.1f}',
-            end='', flush=True)
-
-        steps_per_epoch = len(loader_train) if loader_train else 0
-        # Epoch 结束统计
-        if steps_per_epoch > 0 and step % steps_per_epoch == 0:
-            try:
-                loader_train_iter = iter(loader_train)
-            except Exception as e:
-                print(f"\n错误: Epoch结束时重新初始化训练迭代器失败: {e}")
-
-            for key in loss_log.keys():
-                if loss_log_tmp[key]:  # 确保列表不为空
-                    loss_log[key].append(np.mean(np.array(loss_log_tmp[key])))
-                loss_log_tmp[key] = []  # 清空临时记录
-            os.makedirs(opt.saved_data_dir, exist_ok=True)
-            try:
-                np.save(os.path.join(opt.saved_data_dir, 'losses.npy'), losses)
-            except Exception as e:
-                print(f"\n错误: 保存 losses.npy 失败: {e}")
-
-            if getattr(opt, "save_train_batch_region_vis", False):
-                try:
-                    epoch_idx = step // steps_per_epoch
-                    save_teacher_region_visualization(
-                        opt.saved_data_dir,
-                        f"epoch_{epoch_idx}",
-                        hazy_vis.detach().cpu(),
-                        infrared.detach().cpu(),
-                        pred_image.detach().cpu(),
-                        clear_vis.detach().cpu(),
-                        out["density_map"].detach().cpu(),
-                        density_gt.detach().cpu(),
-                        out["mask_prob"].detach().cpu(),
-                        out["binary_mask"].detach().cpu(),
-                        mask_gt.detach().cpu(),
-                        proto_assign=out.get("proto_assign").detach().cpu() if out.get("proto_assign") is not None else None,
-                        proto_attn=out.get("proto_attn").detach().cpu() if out.get("proto_attn") is not None else None,
-                        max_sim_map=out.get("max_sim_map").detach().cpu() if out.get("max_sim_map") is not None else None,
-                    )
-                except Exception as e:
-                    print(f"\n[teacher_region_vis] 可视化失败，跳过: {e}")
-
-        # 确定评估频率 (与之前逻辑保持一致)
-        eval_freq_fine = 5 * steps_per_epoch if steps_per_epoch > 0 else opt.iters_per_epoch
-        eval_freq_coarse = opt.iters_per_epoch if steps_per_epoch > 0 else steps  # 如果 loader_train 为空，则只在最后评估一次
-
-        perform_eval = False
-        current_epoch = 0
-        if eval_freq_coarse > 0 and step <= opt.finer_eval_step:
-            if step % eval_freq_coarse == 0:
-                perform_eval = True
-                current_epoch = step // eval_freq_coarse
-        elif eval_freq_fine > 0 and step > opt.finer_eval_step:
-            if (step - opt.finer_eval_step) % eval_freq_fine == 0:
-                perform_eval = True
-                base_epochs = opt.finer_eval_step // eval_freq_coarse if eval_freq_coarse > 0 else 0
-                current_epoch = base_epochs + (step - opt.finer_eval_step) // eval_freq_fine
-        elif step == steps:  # 确保最后一步进行评估
-            perform_eval = True
-            # 计算最后一个epoch的编号
-            if eval_freq_fine > 0 and step > opt.finer_eval_step:
-                base_epochs = opt.finer_eval_step // eval_freq_coarse if eval_freq_coarse > 0 else 0
-                current_epoch = base_epochs + math.ceil((step - opt.finer_eval_step) / eval_freq_fine)
-            elif eval_freq_coarse > 0:
-                current_epoch = math.ceil(step / eval_freq_coarse)
-            else:
-                current_epoch = opt.epochs  # 或 1
-
-        # 执行评估
-        if perform_eval:
-            # 在评估时不计算梯度
-            with torch.no_grad():
-                if loader_test:
-                    ssim_eval, psnr_eval = test(teacher_net, loader_test)
-                else:
-                    print("\n警告: 测试加载器无效，跳过评估。")
-                    ssim_eval, psnr_eval = 0.0, 0.0
-
-            log = f'\nstep :{step} | epoch: {current_epoch} | ssim:{ssim_eval:.4f}| psnr:{psnr_eval:.4f} | lr:{lr:.12f}'
-            print(log)
-            os.makedirs(opt.saved_data_dir, exist_ok=True)
-            try:
-                with open(os.path.join(opt.saved_data_dir, 'log.txt'), 'a') as f:
-                    f.write(log + '\n')
-            except Exception as e:
-                print(f"\n错误: 写入 log.txt 失败: {e}")
-
-            ssims.append(ssim_eval)
-            psnrs.append(psnr_eval)
-            psnr_log.append(psnr_eval)
-
-            os.makedirs(opt.saved_model_dir, exist_ok=True)
-            try:
-                model_to_save = teacher_net.module if isinstance(teacher_net, nn.DataParallel) else teacher_net
-                state_dict = model_to_save.state_dict()  # 直接获取 state_dict
-
-                if psnr_eval > max_psnr:
-                    max_ssim = max(max_ssim, ssim_eval)
-                    max_psnr = max(max_psnr, psnr_eval)
-                    print(
-                        f'模型在步骤 :{step}| epoch: {current_epoch} 保存 | 最高 psnr:{max_psnr:.4f}| 最高 ssim:{max_ssim:.4f}')
-                    saved_best_model_path = os.path.join(opt.saved_model_dir, 'best.pth')
-                    torch.save(state_dict, saved_best_model_path)
-
-                saved_single_model_path = os.path.join(opt.saved_model_dir, str(current_epoch) + '.pth')
-                torch.save(state_dict, saved_single_model_path)
-            except Exception as e:
-                print(f"\n错误: 保存模型权重失败 (epoch {current_epoch}): {e}")
-
-            if getattr(opt, "run_real_infer_in_teacher", False):
-                run_real_world_test(
-                    teacher_net,
-                    current_epoch,
-                    opt.real_test_hazy_path,
-                    opt.real_test_ir_path
-                )
-
-            os.makedirs(opt.saved_data_dir, exist_ok=True)
-            try:
-                np.save(os.path.join(opt.saved_data_dir, 'ssims.npy'), ssims)
-                np.save(os.path.join(opt.saved_data_dir, 'psnrs.npy'), psnrs)
-            except Exception as e:
-                print(f"\n错误: 保存 ssims.npy 或 psnrs.npy 失败: {e}")
-
-            # 评估后也尝试重置迭代器，以防评估发生在epoch中间
-            try:
-                loader_train_iter = iter(loader_train)
-            except Exception as e:
-                print(f"\n警告: 评估后重新初始化训练迭代器失败: {e}")
-
-
-# 定义函数 pad_img：对图像进行填充以满足特定尺寸要求
-def pad_img(x, patch_size):
-    """
-    对图像进行反射填充，使其高度和宽度成为 patch_size 的整数倍。
-    """
-    _, _, h, w = x.size()
-    mod_pad_h = (patch_size - h % patch_size) % patch_size
-    mod_pad_w = (patch_size - w % patch_size) % patch_size
-    x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
-    return x
-
-
-def pad_mask(x, patch_size):
-    """
-    对二值 mask 做常数 0 padding，使高度和宽度成为 patch_size 的整数倍。
-    mask 不使用 reflect padding，避免把天空区域反射到边界外。
-    """
-    _, _, h, w = x.size()
-    mod_pad_h = (patch_size - h % patch_size) % patch_size
-    mod_pad_w = (patch_size - w % patch_size) % patch_size
-    x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), mode='constant', value=0)
-    return x
-
-
-# 定义函数 test：在测试集上评估模型性能
-def test(net, loader_test):
-    """
-    在测试集上评估模型，计算平均 SSIM 和 PSNR。
-    修改: 使其能处理 TestDataset 返回的4个值并正确调用双流模型。
-    """
-    net.eval()
-    torch.cuda.empty_cache()
-    ssims = []
-    psnrs = []
-
-    if loader_test is None:
-        print("警告: test 函数接收到无效的 loader_test，返回 0 指标。")
-        return 0.0, 0.0
-
-    for i, batch_test in enumerate(loader_test):
-        # 检查 collate_fn 返回的是否为空
-        if not batch_test:
-            print(f"警告: 在测试加载器中跳过索引 {i} 的空批次 (collate_fn 返回空)。")
-            continue
-
-        if len(batch_test) == 4:
-            inputs_vis, inputs_ir, targets, hazy_name_list = batch_test
-            # 处理可能的空 batch 情况（如果 collate_fn 返回了带空 tensor 的元组）
-            if not inputs_vis.numel():
-                print(f"警告: 在测试加载器索引 {i} 遇到空数据。跳过。")
-                continue
-            # 获取文件名，处理列表情况
-            hazy_name = hazy_name_list[0] if isinstance(hazy_name_list,
-                                                        (list, tuple)) and hazy_name_list else f"Unknown_Index_{i}"
-        else:
-            print(f"测试加载器返回了预期外的数据格式: {len(batch_test)} 项。跳过批次 {i}。")
-            continue
-        # --- [修改结束] ---
-
-        inputs_vis = inputs_vis.to(opt.device, non_blocking=True)
-        inputs_ir = inputs_ir.to(opt.device, non_blocking=True)  # --- [修改] 添加红外输入到设备 ---
-        targets = targets.to(opt.device, non_blocking=True)
-
-        with torch.no_grad():
-            H, W = inputs_vis.shape[2:]  # 使用可见光尺寸作为基准
-            try:
-                # --- [修改] 填充两个输入 (假设需要16的倍数) ---
-                inputs_vis_padded = pad_img(inputs_vis, 16)
-                inputs_ir_padded = pad_img(inputs_ir, 16)
-                # --- [修改结束] ---
-            except Exception as e:
-                print(f"\n错误: 测试时填充图像 {hazy_name} 失败: {e}。跳过。")
-                continue
-
-            try:
-                # --- [修改] 正确调用双流模型 (测试时不用掩码, haze_mask=None) ---
-                pred_output = net(
-                    inputs_vis_padded,
-                    inputs_ir_padded,
-                    haze_mask=None
-                )[0]
-                # --- [修改结束] ---
-
-                pred = pred_output  # pred_output 已经是图像
-                pred = pred.clamp(0, 1)  # 限制范围
-
-            except Exception as e:
-                # 打印更详细的错误信息
-                import traceback
-                print(f"\n未知错误: 测试时模型前向传播失败 ({hazy_name}): {e}")
-                # traceback.print_exc() # 取消注释以打印详细堆栈
-                continue
-
-            # 裁剪回原始尺寸
-            if pred.shape[2] > H or pred.shape[3] > W:
-                pred = pred[:, :, :H, :W]
-            elif pred.shape[2] < H or pred.shape[3] < W:
-                # 尺寸不匹配可能是 padding 或模型内部下采样/上采样的问题
-                print(f"警告: 预测尺寸 ({pred.shape}) 小于目标尺寸 ({H}, {W})，文件名 {hazy_name}。指标可能不准确。")
-
-        # 计算指标
-        try:
-            # 确保 pred 和 targets 维度匹配
-            if pred.shape != targets.shape:
-                print(f"警告: 预测 ({pred.shape}) 和目标 ({targets.shape}) 尺寸不匹配，文件名 {hazy_name}。跳过指标计算。")
-                continue
-            ssim_tmp = ssim(pred, targets).item()
-            psnr_tmp = psnr(pred, targets)
-            # 增加对 NaN 和 Inf 值的检查
-            if not np.isnan(ssim_tmp) and not np.isinf(ssim_tmp):
-                ssims.append(ssim_tmp)
-            else:
-                print(f"警告: 无效 SSIM 值 ({ssim_tmp})，文件名 {hazy_name}。跳过。")
-            if not np.isnan(psnr_tmp) and not np.isinf(psnr_tmp):
-                psnrs.append(psnr_tmp)
-            else:
-                print(f"警告: 无效 PSNR 值 ({psnr_tmp})，文件名 {hazy_name}。跳过。")
-        except Exception as e:
-            print(f"\n错误: 计算指标失败 ({hazy_name}): {e}")
-
-    # 计算平均值前检查列表是否为空
-    mean_ssim = np.mean(ssims) if ssims else 0.0
-    mean_psnr = np.mean(psnrs) if psnrs else 0.0
-    return mean_ssim, mean_psnr
-
-
-# 定义函数 set_seed_torch：设置随机种子以保证实验可复现性
-def set_seed_torch(seed=2024):
-    """
-    设置 Python, NumPy 和 PyTorch 的随机种子以提高实验可复现性。
-    """
-    os.environ['PYTHONHASHSEED'] = str(seed)
+from data import StatefulRandomSampler
+from data.stateful_sampler import validate_single_process_world
+from data.data_loader import SynthMultiModalDataset, collate_synth
+from option.Teacher import build_parser, prepare_experiment_dirs, save_config, validate_config
+from option._formal_config import tir_normalization_config_from_args
+from training.omega_sampler import OmegaSampler
+from training.source_step import compute_source_batch_losses
+from training.step_control import perform_optimizer_step
+from training.omega_state import update_empty_omega_streak
+from training.metrics import psnr, ssim_global
+from utils.visualize_fog_routed import build_diagnostic_panel
+from training.checkpointing import (
+    build_source_checkpoint, build_formal_model_from_config, capture_rng_state,
+    restore_source_training_state, validate_checkpoint_metadata, validate_model_semantics_config,
+)
+from training.resume_config import validate_source_resume_semantics
+
+
+def _set_model_init_seed(seed):
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    # 对于需要确定性的场景，取消下面两行的注释，但这可能会降低性能
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
-    # 通常 benchmark = True 可以加速训练
-    torch.backends.cudnn.benchmark = True
+
+
+def main(argv=None):
+    args = validate_config(build_parser().parse_args(argv))
+    validate_single_process_world()
+    prepare_experiment_dirs(args)
+    save_config(args)
+    _set_model_init_seed(args.model_init_seed)
+    device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
+    resume_checkpoint = torch.load(args.resume_checkpoint, map_location="cpu") if args.resume_checkpoint else None
+    if resume_checkpoint is not None:
+        validate_checkpoint_metadata(resume_checkpoint, "source", args.density_gt_semantics)
+        validate_model_semantics_config(resume_checkpoint["config"], vars(args))
+        validate_source_resume_semantics(resume_checkpoint["config"], vars(args))
+        if resume_checkpoint["config"].get("train_size") != args.train_size:
+            raise ValueError("source checkpoint train_size/preprocessing mismatch")
+    dataset = SynthMultiModalDataset(
+        args.train_data_dir, train=True, size=args.train_size, density_gt_semantics=args.density_gt_semantics,
+        density_map_normalization=args.density_map_normalization,
+        density_fixed_min=args.density_fixed_min, density_fixed_max=args.density_fixed_max,
+        density_calibrated_min=args.density_calibrated_min, density_calibrated_max=args.density_calibrated_max,
+        tir_normalization_config=tir_normalization_config_from_args(args),
+        pair_alignment_policy=args.pair_alignment_policy,
+        augmentation_seed_base=args.model_init_seed,
+    )
+    inspection = dataset.inspect_density_sample(0)
+    print(f"[density] semantics={args.density_gt_semantics} inspection={inspection}")
+    sampler = StatefulRandomSampler(len(dataset), seed=args.model_init_seed)
+    dataset.set_sampler_epoch(sampler.epoch)
+    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
+                        num_workers=args.num_workers, collate_fn=collate_synth)
+    # The same persisted semantic configuration is used for source training,
+    # resume and evaluation; no architecture default may silently replace a
+    # user-supplied model/preprocessing setting.
+    model = build_formal_model_from_config(vars(args)).to(device)
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate)
+    omega_sampler = OmegaSampler(
+        regions_per_image=args.omega_regions_per_image,
+        min_area=args.omega_min_area,
+        max_area=args.omega_max_area,
+        seed=args.model_init_seed,
+    )
+    omega_generator = torch.Generator(device=device)
+    omega_generator.manual_seed(args.model_init_seed + 101)
+    model.train()
+    global_step, empty_omega_streak, start_epoch = 0, 0, 0
+    density_batch_logged = False
+    if resume_checkpoint is not None:
+        restored = restore_source_training_state(
+            resume_checkpoint, model, optimizer, sampler, args.density_gt_semantics,
+            manifest_fingerprint=dataset.manifest_fingerprint(), omega_generator=omega_generator,
+        )
+        global_step = restored["global_step"]
+        empty_omega_streak = restored["empty_omega_streak"]
+        start_epoch = restored["epoch"]
+        dataset.set_sampler_epoch(sampler.epoch)
+        if sampler.next_sample_position >= len(dataset) and start_epoch < args.epochs:
+            # Checkpoints are committed only at successful-step boundaries.
+            # At an epoch boundary the next iterator must start from the next
+            # saved deterministic permutation, never from an exhausted cursor.
+            sampler.advance_epoch()
+            dataset.set_sampler_epoch(sampler.epoch)
+    for _epoch in range(start_epoch, args.epochs):
+        for hazy, clear, tir, density in loader:
+            if hazy.numel() == 0:
+                continue
+            hazy, clear, tir, density = (value.to(device) for value in (hazy, clear, tir, density))
+            if not density_batch_logged:
+                print(
+                    "[density] first_batch converted "
+                    f"min={density.min().item():.6f} max={density.max().item():.6f} "
+                    f"mean={density.mean().item():.6f}"
+                )
+                density_batch_logged = True
+            source_result = compute_source_batch_losses(
+                model, (hazy, clear, tir, density), args, omega_sampler, global_step,
+                omega_generator=omega_generator,
+            )
+            losses, state = source_result["losses"], source_result["state"]
+            valid_omega_count = int(source_result["omega"]["omega_support"].shape[0])
+            optimizer.zero_grad(set_to_none=True)
+            losses["total"].backward()
+            succeeded = perform_optimizer_step(optimizer, model.parameters())
+            if not succeeded:
+                # The committed sampler cursor deliberately remains unchanged.
+                # Stop this iterator so a fresh iterator replays the exact
+                # uncommitted batch instead of committing a later batch under
+                # the earlier cursor position.
+                print(f"step={global_step} skipped: non-finite gradients; batch will be retried")
+                break
+            if succeeded:
+                sampler.commit(hazy.shape[0])
+                empty_omega_streak = update_empty_omega_streak(
+                    empty_omega_streak,
+                    effective_lambda_route=args.lambda_router * state["lambda_route"],
+                    valid_omega_count=valid_omega_count,
+                    step_succeeded=True,
+                )
+                if empty_omega_streak >= args.max_consecutive_empty_omega_steps:
+                    statuses = source_result["omega"]["status"]
+                    raise RuntimeError(
+                        "route loss remained enabled without valid Omega regions; "
+                        f"streak={empty_omega_streak}, statuses={statuses}, "
+                        f"density_min={density.min().item():.5f}, density_max={density.max().item():.5f}, "
+                        f"density_mean={density.mean().item():.5f}, density_std={density.std().item():.5f}, "
+                        f"omega_area=[{args.omega_min_area},{args.omega_max_area}], "
+                        f"effective_lambda_route={args.lambda_router * state['lambda_route']:.6f}"
+                    )
+                global_step += 1
+                if global_step % 50 == 0:
+                    print(
+                        f"step={global_step} total={losses['total'].item():.5f} "
+                        f"density={losses['density'].item():.5f} route={losses['route'].item():.5f} "
+                        f"route_mean={source_result['output']['route_soft'].mean().item():.4f} "
+                        f"psnr={psnr(source_result['output']['pred_clear'].detach(), clear).item():.3f} "
+                        f"ssim={ssim_global(source_result['output']['pred_clear'].detach(), clear).item():.4f}"
+                    )
+                if args.saved_data_dir and global_step % 500 == 0:
+                    panel = build_diagnostic_panel(
+                        hazy, tir, clear, density, source_result["output"],
+                        q=source_result["q"],
+                    )
+                    panel.save(Path(args.saved_data_dir) / f"source_step_{global_step:08d}.png")
+        if sampler.next_sample_position >= len(dataset) and _epoch + 1 < args.epochs:
+            sampler.advance_epoch()
+            dataset.set_sampler_epoch(sampler.epoch)
+        if args.saved_model_dir:
+            checkpoint = build_source_checkpoint(
+                model.state_dict(), optimizer.state_dict(), None, global_step, _epoch + 1,
+                vars(args), args.density_gt_semantics,
+                capture_rng_state(omega_generator=omega_generator),
+                sampler_states={"source": sampler.state_dict()},
+                empty_omega_streaks={"source": empty_omega_streak},
+                manifest_fingerprints={"source": dataset.manifest_fingerprint()},
+            )
+            torch.save(checkpoint, Path(args.saved_model_dir) / "source_last.pt")
 
 
 if __name__ == "__main__":
-
-    set_seed_torch(2024)
-
-    # --- [修改] 数据集路径和实例化 ---
-    # !! 请将下面的路径修改为你实际的数据集路径 !!
-    train_base_dir = opt.train_data_dir  # 训练集根目录
-    test_base_dir = opt.test_data_dir  # 测试集根目录
-
-    # 训练数据集路径：合成域五元组 hazy_vis, clear_vis, infrared, density_gt, mask_gt
-    try:
-        train_set = SynthMultiModalDataset(
-            root=train_base_dir,
-            train=True,
-            size=256,
-        )
-        print(f"成功加载训练数据集，共 {len(train_set)} 个样本。")
-    except Exception as e:
-        print(f"错误: 初始化训练数据集 SynthMultiModalDataset 失败: {e}")
-        train_set = None  # 设置为 None 以便后续检查
-        exit()  # 训练集加载失败则退出
-
-    # 测试数据集路径
-    test_hazy_vis_folder = os.path.join(test_base_dir, 'hazy')
-    test_ir_folder = os.path.join(test_base_dir, 'ir')
-    test_clear_vis_folder = os.path.join(test_base_dir, 'clear')
-    try:
-        test_set = TestDataset(
-            hazy_visible_path=test_hazy_vis_folder,
-            infrared_path=test_ir_folder,
-            clear_visible_path=test_clear_vis_folder,
-            size=256,  # 测试时使用中心裁剪或缩放
-            format='auto'  # 自动兼容 jpg/png/multi-level 数据集
-        )
-        print(f"成功加载测试数据集，共 {len(test_set)} 个样本。")
-    except Exception as e:
-        print(f"错误: 初始化测试数据集 TestDataset 失败: {e}。测试将跳过。")
-        test_set = None
-    # --- [修改结束] ---
-
-    # --- DataLoader ---
-    # 从配置中读取 batch_size 和 num_workers，提供默认值
-    batch_size = getattr(opt, 'batch_size', 8)  # 使用 opt 中的 batch_size，默认为 4
-    num_workers = getattr(opt, 'num_workers', 16)  # 使用 opt 中的 num_workers，默认为 4
-
-    loader_train = None
-    if train_set:  # 仅在 train_set 成功加载时创建 DataLoader
-        loader_train = DataLoader(
-            dataset=train_set,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            collate_fn=collate_synth,
-            pin_memory=True,  # 如果内存充足，可以加速数据传输
-            drop_last=True  # 丢弃最后一个不完整的 batch，避免 BN 层问题
-        )
-    else:
-        print("错误：训练数据集加载失败，无法创建训练 DataLoader。")
-        exit()
-
-    loader_test = None
-    if test_set:
-        loader_test = DataLoader(
-            dataset=test_set,
-            batch_size=8,  # 测试时通常 batch_size=1
-            shuffle=False,
-            num_workers=16,  # 测试时 worker 少一些通常没问题
-            collate_fn=collate_fn_skip_none
-        )
-
-    # --- [修改] 模型初始化 ---
-    teacher_net = VIFNetInconsistencyTeacher(
-        semantic_dim=opt.semantic_dim,
-        num_color_prototypes=opt.num_color_prototypes,
-        transport_temperature=opt.transport_temperature,
-        fusion_temperature=opt.fusion_temperature,
-        verify_threshold=opt.verify_threshold,
-        verify_temperature=opt.verify_temperature,
-    ).to(opt.device)  # 实例化新的模型
-    teacher_net = teacher_net.to(opt.device)
-    # --- [修改结束] ---
-
-    epoch_size = len(loader_train) if loader_train else 0
-    if epoch_size == 0:
-        print("错误：训练 DataLoader 为空或长度为 0。请检查数据集和批处理大小。")
-        exit()
-    print("每个 Epoch 的步数 (epoch_size): ", epoch_size)
-
-    if opt.device == 'cuda':
-        # 如果有多张 GPU，DataParallel 会自动使用
-        print(f"检测到 CUDA 设备，使用 DataParallel (可用 GPU 数量: {torch.cuda.device_count()})。")
-        teacher_net = torch.nn.DataParallel(teacher_net)
-        cudnn.benchmark = True  # 启用 benchmark 加速
-
-    try:
-        pytorch_total_params = sum(p.numel() for p in teacher_net.parameters() if p.requires_grad)
-        print("模型可训练参数总量: ==> {}".format(pytorch_total_params))
-    except Exception as e:
-        print(f"计算总参数量时出错: {e}")
-    print("------------------------------------------------------------------")
-
-    contrast_loss_module = None
-    if getattr(opt, "w_loss_Cr", 0.0) > 0:
-        contrast_loss_module = ContrastLoss().to(opt.device)
-
-    criterion = [
-        nn.L1Loss().to(opt.device),
-        SSIM().to(opt.device),
-        contrast_loss_module,
-    ]
-
-
-    # Adam 优化器
-    optimizer = optim.Adam(params=filter(lambda x: x.requires_grad, teacher_net.parameters()), lr=opt.start_lr,
-                           betas=(0.9, 0.999),
-                           eps=1e-08)
-    optimizer.zero_grad()  # 初始化梯度
-
-    # 开始训练
-    print("开始训练...")
-    # AAA
-    train(teacher_net, loader_train, loader_test, optimizer, criterion)
-    # --- [修改结束] ---
-    # AAA
-    print("训练完成。")
+    main()

@@ -1,66 +1,33 @@
-from pathlib import Path
+import torch
+
+from Eval_EMA import load_model
+from model import FogRoutedRGBTIRDehazer
 
 
-ROOT = Path(__file__).resolve().parents[1]
+def test_eval_ema_explicitly_selects_requested_checkpoint_state(tmp_path):
+    model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
+    teacher_state = {key: value.clone() for key, value in model.state_dict().items()}
+    student_state = {key: value.clone() for key, value in model.state_dict().items()}
+    first_key = next(iter(student_state))
+    student_state[first_key] = student_state[first_key] + 1
+    path = tmp_path / "ema.pt"
+    torch.save({
+        "format_version": 1, "training_stage": "ema", "model_class": "FogRoutedRGBTIRDehazer",
+        "density_gt_semantics": "transmission",
+            "config": {
+                "base_channels": 8, "router_hidden_channels": 8,
+                "deform_num_samples": 4, "deform_max_offset": 2.0,
+                "num_structure_renderers": 2, "memory_max_tokens": 16,
+                "memory_topk": 2, "memory_attention_temperature": 0.07,
+                "memory_reliability_epsilon": 1e-6,
+                "memory_reliable_ratio_threshold": 0.01,
+                "memory_confidence_threshold": 0.1, "memory_exclusion_extra_margin": 0,
+                "boundary_width": 1,
+            }, "teacher": teacher_state, "student": student_state,
+    }, path)
 
+    teacher, _ = load_model(path, "teacher")
+    student, _ = load_model(path, "student")
 
-def _read(path):
-    return (ROOT / path).read_text(encoding="utf-8")
-
-
-def test_eval_ema_uses_internal_mask_outputs_only():
-    source = _read("Eval_EMA.py")
-
-    for forbidden in (
-        "INPUT_FOLDER_MASK",
-        "MIN_DEHAZE_STRENGTH",
-        "transform_mask",
-        "transform_to_tensor_only",
-        "mask_image_path",
-        "alpha_final",
-        "use_mask_if_available",
-        "haze_mask_tensor",
-        "haze_mask_resized",
-        "1.0 - alpha",
-        "haze_vis_original",
-        "original_tensor",
-    ):
-        assert forbidden not in source
-
-    assert "def dehaze(model, vis_image_path, ir_image_path, folder):" in source
-    assert "return_dict=True" in source
-    assert 'out["pred_clear"]' in source
-    assert 'out["density_map"]' in source
-    assert 'out["mask_prob"]' in source
-    assert 'out["binary_mask"]' in source
-
-
-def test_eval_ema_has_no_training_import_or_external_mask_override():
-    source = _read("Eval_EMA.py")
-
-    assert "from Teacher import" not in source
-    assert "import Teacher" not in source
-    assert "haze_mask=" not in source
-    assert "debug_force_mask=" not in source
-    assert "model(..., haze_mask" not in source
-
-
-def test_eval_ema_saves_restored_pred_and_internal_overview():
-    source = _read("Eval_EMA.py")
-
-    assert "SAVE_INTERNAL_OVERVIEW" in source
-    assert "internal_mask_vis" in source
-    assert "model.eval()" in source
-    assert "torch.no_grad()" in source
-    assert "pred_to_save = pred_clear_restored.squeeze(0).clamp(0, 1)" in source
-    assert "torchvision.utils.save_image(pred_to_save, save_path)" in source
-
-
-def test_teacher_comments_mark_cmdn_legacy_and_active_gumbel_path():
-    source = _read("model/Teacher.py")
-    lowered = source.lower()
-
-    assert "self.cmdn = None" in source
-    assert "HDE" in source
-    assert "GumbelSigmoidBinarizer" in source
-    assert "legacy" in lowered or "disabled" in lowered
+    assert torch.equal(teacher.state_dict()[first_key], teacher_state[first_key])
+    assert torch.equal(student.state_dict()[first_key], student_state[first_key])
