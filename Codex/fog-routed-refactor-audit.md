@@ -300,3 +300,43 @@
   Both retry tests match no-failure reference Omega/DataLoader generator states.
 - Final command: `D:\anaconda\envs\CoA\python.exe -m pytest -q -p no:cacheprovider`
   with `PYTHONDONTWRITEBYTECODE=1` -> `145 passed, 5 warnings in 36.85s`.
+
+## 2026-07-24 -- strict DataLoader RNG restore and full EMA retry injection
+
+- Baseline HEAD: `2c5f29203d081813173e06f3bedd03787552543e`. The pre-change targeted
+  suite (`test_checkpointing`, `test_step_transaction`, `test_ema_step`, and
+  `test_ema_end_to_end`) reported `16 passed, 4 warnings`.
+- Modified files: `training/checkpointing.py`, `tests/test_checkpointing.py`,
+  `tests/test_ema_end_to_end.py`, and this audit record. Checkpoint
+  `format_version` and top-level schema are unchanged.
+- Source and EMA formal restore paths now preflight their named DataLoader RNG
+  mapping before any model, optimizer, sampler, or RNG mutation. Missing
+  mappings are rejected as, for example, `source checkpoint lacks DataLoader
+  generator states: required=['source']`; a missing EMA `real` or
+  `source_anchor` key and non-tensor stored state are also explicitly rejected.
+  Extra stored generator keys remain accepted and calls without a requested
+  mapping preserve generic helper compatibility.
+- Regression tests prove failed preflight leaves source model and EMA
+  student/teacher parameters and buffers, optimizer state, sampler cursors,
+  and each requested generator unchanged. Complete mappings restore the named
+  Source `source` and EMA `real`/`source_anchor` generator states exactly.
+- The EMA retry integration test no longer replaces
+  `EMA.run_ema_adaptation_step`. It injects one failure in
+  `training.ema_step.perform_optimizer_step` after real A/B/S forward, source
+  anchor/Omega/q/route support construction, and `backward()` have executed;
+  the retry calls the original optimizer step. Teacher update was observed
+  exactly once, only on the successful retry.
+- The two attempts have byte-identical geometry-generator before/after states,
+  student/teacher buffers at real-forward entry, and anchor Omega generator
+  before/after states, q, valid-q sums, route support, Omega support/weight,
+  owner indices, and route-supervision statistics. The successful retry
+  checkpoint exactly matches the no-failure reference for student, teacher,
+  optimizer, Omega/geometry/DataLoader RNG, sampler states, empty-Omega
+  streaks, and committed steps.
+- Verification: targeted suite with `PYTHONDONTWRITEBYTECODE=1` and
+  `-p no:cacheprovider` -> `23 passed, 4 warnings in 9.33s`; full suite with
+  the same cache controls -> `152 passed, 5 warnings in 24.16s`.
+- Remaining risks: strict named-generator validation intentionally rejects
+  legacy or damaged formal resume checkpoints missing these states; the five
+  observed warnings remain upstream torchvision Pillow deprecations plus the
+  existing `TestDataset` pytest collection warning.

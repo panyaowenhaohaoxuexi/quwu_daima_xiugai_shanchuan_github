@@ -1,6 +1,8 @@
 import random
+import copy
 
 import numpy as np
+import pytest
 import torch
 
 from training.checkpointing import (
@@ -66,23 +68,29 @@ def test_source_training_state_restore_loads_model_optimizer_sampler_and_counter
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     sampler = StatefulRandomSampler(3, seed=4)
     sampler.commit(1)
+    source_loader_generator = torch.Generator().manual_seed(31)
     checkpoint = build_source_checkpoint(
         model.state_dict(), optimizer.state_dict(), None, 7, 2,
-        {"base_channels": 8}, "transmission", capture_rng_state(),
+        {"base_channels": 8}, "transmission", capture_rng_state(
+            dataloader_generators={"source": source_loader_generator},
+        ),
         sampler_states={"source": sampler.state_dict()},
         empty_omega_streaks={"source": 5},
     )
     resumed_model = nn.Linear(1, 1)
     resumed_optimizer = torch.optim.SGD(resumed_model.parameters(), lr=0.1)
     resumed_sampler = StatefulRandomSampler(3, seed=99)
+    resumed_loader_generator = torch.Generator().manual_seed(99)
 
     restored = restore_source_training_state(
-        checkpoint, resumed_model, resumed_optimizer, resumed_sampler, "transmission"
+        checkpoint, resumed_model, resumed_optimizer, resumed_sampler, "transmission",
+        dataloader_generators={"source": resumed_loader_generator},
     )
 
     assert restored == {"global_step": 7, "epoch": 2, "empty_omega_streak": 5}
     assert resumed_sampler.next_sample_position == 1
     assert torch.equal(resumed_model.weight, model.weight)
+    assert torch.equal(resumed_loader_generator.get_state(), source_loader_generator.get_state())
 
 
 def test_source_restore_rejects_changed_dataset_manifest_before_iterator_creation():
@@ -120,23 +128,237 @@ def test_ema_training_state_restore_loads_student_teacher_and_two_samplers():
     source_sampler, real_sampler = StatefulRandomSampler(3, 1), StatefulRandomSampler(4, 2)
     source_sampler.commit(1)
     real_sampler.commit(2)
+    real_loader_generator = torch.Generator().manual_seed(41)
+    source_anchor_loader_generator = torch.Generator().manual_seed(42)
     checkpoint = build_ema_checkpoint(
         student.state_dict(), teacher.state_dict(), optimizer.state_dict(), None, 5, 6, 3,
-        {"base_channels": 8}, "transmission", capture_rng_state(),
+        {"base_channels": 8}, "transmission", capture_rng_state(
+            dataloader_generators={
+                "real": real_loader_generator,
+                "source_anchor": source_anchor_loader_generator,
+            },
+        ),
         sampler_states={"source": source_sampler.state_dict(), "real": real_sampler.state_dict()},
         empty_omega_streaks={"source": 1, "anchor": 2},
     )
     new_student, new_teacher = nn.Linear(1, 1), nn.Linear(1, 1)
     new_optimizer = torch.optim.SGD(new_student.parameters(), lr=0.1)
     new_source, new_real = StatefulRandomSampler(3, 9), StatefulRandomSampler(4, 9)
+    resumed_real_generator = torch.Generator().manual_seed(99)
+    resumed_anchor_generator = torch.Generator().manual_seed(98)
 
     restored = restore_ema_training_state(
-        checkpoint, new_student, new_teacher, new_optimizer, new_source, new_real, "transmission"
+        checkpoint, new_student, new_teacher, new_optimizer, new_source, new_real, "transmission",
+        dataloader_generators={
+            "real": resumed_real_generator,
+            "source_anchor": resumed_anchor_generator,
+        },
     )
 
     assert restored["source_global_step"] == 5 and restored["ema_global_step"] == 6
     assert new_source.next_sample_position == 1 and new_real.next_sample_position == 2
     assert torch.equal(new_teacher.weight, teacher.weight)
+    assert torch.equal(resumed_real_generator.get_state(), real_loader_generator.get_state())
+    assert torch.equal(resumed_anchor_generator.get_state(), source_anchor_loader_generator.get_state())
+
+
+def test_source_restore_rejects_missing_loader_rng_before_any_state_write():
+    from torch import nn
+    from data import StatefulRandomSampler
+    from training.checkpointing import restore_source_training_state
+
+    model = nn.BatchNorm1d(2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    source_sampler = StatefulRandomSampler(3, seed=1)
+    checkpoint = build_source_checkpoint(
+        model.state_dict(), optimizer.state_dict(), None, 1, 0,
+        {"base_channels": 8}, "transmission", capture_rng_state(),
+        sampler_states={"source": source_sampler.state_dict()},
+    )
+    checkpoint["rng_state"]["dataloader_generators"] = {}
+    resumed_model = nn.BatchNorm1d(2)
+    resumed_optimizer = torch.optim.Adam(resumed_model.parameters(), lr=0.2)
+    resumed_sampler = StatefulRandomSampler(3, seed=9)
+    resumed_generator = torch.Generator().manual_seed(10)
+    before = {
+        "model": copy.deepcopy(resumed_model.state_dict()),
+        "optimizer": copy.deepcopy(resumed_optimizer.state_dict()),
+        "sampler": resumed_sampler.state_dict(),
+        "generator": resumed_generator.get_state().clone(),
+    }
+
+    with pytest.raises(ValueError, match=r"source.*DataLoader generator.*source"):
+        restore_source_training_state(
+            checkpoint, resumed_model, resumed_optimizer, resumed_sampler, "transmission",
+            dataloader_generators={"source": resumed_generator},
+        )
+
+    _assert_nested_equal(resumed_model.state_dict(), before["model"])
+    _assert_nested_equal(resumed_optimizer.state_dict(), before["optimizer"])
+    assert resumed_sampler.state_dict() == before["sampler"]
+    assert torch.equal(resumed_generator.get_state(), before["generator"])
+
+
+@pytest.mark.parametrize(
+    ("stored_generators", "missing"),
+    [({"source_anchor": torch.Generator().manual_seed(1).get_state()}, "real"),
+     ({"real": torch.Generator().manual_seed(2).get_state()}, "source_anchor")],
+)
+def test_ema_restore_rejects_each_missing_required_loader_rng(stored_generators, missing):
+    from torch import nn
+    from data import StatefulRandomSampler
+    from training.checkpointing import restore_ema_training_state
+
+    student, teacher = nn.Linear(1, 1), nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(student.parameters(), lr=0.1)
+    checkpoint = build_ema_checkpoint(
+        student.state_dict(), teacher.state_dict(), optimizer.state_dict(), None, 0, 0, 0,
+        {"base_channels": 8}, "transmission", capture_rng_state(),
+        sampler_states={
+            "source": StatefulRandomSampler(2, 1).state_dict(),
+            "real": StatefulRandomSampler(2, 2).state_dict(),
+        },
+    )
+    checkpoint["rng_state"]["dataloader_generators"] = stored_generators
+
+    with pytest.raises(ValueError, match=missing):
+        restore_ema_training_state(
+            checkpoint, nn.Linear(1, 1), nn.Linear(1, 1),
+            torch.optim.SGD(nn.Linear(1, 1).parameters(), lr=0.1),
+            StatefulRandomSampler(2, 3), StatefulRandomSampler(2, 4), "transmission",
+            dataloader_generators={
+                "real": torch.Generator().manual_seed(3),
+                "source_anchor": torch.Generator().manual_seed(4),
+            },
+        )
+
+
+def test_ema_restore_rejects_missing_loader_rng_before_any_state_write():
+    from torch import nn
+    from data import StatefulRandomSampler
+    from training.checkpointing import restore_ema_training_state
+
+    student, teacher = nn.BatchNorm1d(2), nn.BatchNorm1d(2)
+    optimizer = torch.optim.Adam(student.parameters(), lr=0.1)
+    source_sampler, real_sampler = StatefulRandomSampler(3, 1), StatefulRandomSampler(3, 2)
+    checkpoint = build_ema_checkpoint(
+        student.state_dict(), teacher.state_dict(), optimizer.state_dict(), None, 0, 0, 0,
+        {"base_channels": 8}, "transmission", capture_rng_state(),
+        sampler_states={"source": source_sampler.state_dict(), "real": real_sampler.state_dict()},
+    )
+    checkpoint["rng_state"]["dataloader_generators"] = {}
+    resumed_student, resumed_teacher = nn.BatchNorm1d(2), nn.BatchNorm1d(2)
+    resumed_optimizer = torch.optim.Adam(resumed_student.parameters(), lr=0.2)
+    resumed_source, resumed_real = StatefulRandomSampler(3, 9), StatefulRandomSampler(3, 10)
+    resumed_real_generator = torch.Generator().manual_seed(11)
+    resumed_anchor_generator = torch.Generator().manual_seed(12)
+    before = {
+        "student": copy.deepcopy(resumed_student.state_dict()),
+        "teacher": copy.deepcopy(resumed_teacher.state_dict()),
+        "optimizer": copy.deepcopy(resumed_optimizer.state_dict()),
+        "source_sampler": resumed_source.state_dict(),
+        "real_sampler": resumed_real.state_dict(),
+        "real_generator": resumed_real_generator.get_state().clone(),
+        "anchor_generator": resumed_anchor_generator.get_state().clone(),
+    }
+
+    with pytest.raises(ValueError, match=r"ema.*DataLoader generator.*real"):
+        restore_ema_training_state(
+            checkpoint, resumed_student, resumed_teacher, resumed_optimizer,
+            resumed_source, resumed_real, "transmission",
+            dataloader_generators={
+                "real": resumed_real_generator,
+                "source_anchor": resumed_anchor_generator,
+            },
+        )
+
+    _assert_nested_equal(resumed_student.state_dict(), before["student"])
+    _assert_nested_equal(resumed_teacher.state_dict(), before["teacher"])
+    _assert_nested_equal(resumed_optimizer.state_dict(), before["optimizer"])
+    assert resumed_source.state_dict() == before["source_sampler"]
+    assert resumed_real.state_dict() == before["real_sampler"]
+    assert torch.equal(resumed_real_generator.get_state(), before["real_generator"])
+    assert torch.equal(resumed_anchor_generator.get_state(), before["anchor_generator"])
+
+
+@pytest.mark.parametrize("stage", ["source", "ema"])
+def test_restore_rejects_missing_loader_rng_mapping(stage):
+    from torch import nn
+    from data import StatefulRandomSampler
+    from training.checkpointing import restore_ema_training_state, restore_source_training_state
+
+    if stage == "source":
+        model = nn.Linear(1, 1)
+        checkpoint = build_source_checkpoint(
+            model.state_dict(), torch.optim.SGD(model.parameters(), lr=0.1).state_dict(), None, 0, 0,
+            {"base_channels": 8}, "transmission", capture_rng_state(),
+            sampler_states={"source": StatefulRandomSampler(2, 1).state_dict()},
+        )
+        del checkpoint["rng_state"]["dataloader_generators"]
+        restore = lambda: restore_source_training_state(
+            checkpoint, nn.Linear(1, 1), torch.optim.SGD(nn.Linear(1, 1).parameters(), lr=0.1),
+            StatefulRandomSampler(2, 2), "transmission",
+            dataloader_generators={"source": torch.Generator().manual_seed(3)},
+        )
+    else:
+        student, teacher = nn.Linear(1, 1), nn.Linear(1, 1)
+        checkpoint = build_ema_checkpoint(
+            student.state_dict(), teacher.state_dict(), torch.optim.SGD(student.parameters(), lr=0.1).state_dict(),
+            None, 0, 0, 0, {"base_channels": 8}, "transmission", capture_rng_state(),
+            sampler_states={
+                "source": StatefulRandomSampler(2, 1).state_dict(),
+                "real": StatefulRandomSampler(2, 2).state_dict(),
+            },
+        )
+        del checkpoint["rng_state"]["dataloader_generators"]
+        restore = lambda: restore_ema_training_state(
+            checkpoint, nn.Linear(1, 1), nn.Linear(1, 1),
+            torch.optim.SGD(nn.Linear(1, 1).parameters(), lr=0.1),
+            StatefulRandomSampler(2, 3), StatefulRandomSampler(2, 4), "transmission",
+            dataloader_generators={
+                "real": torch.Generator().manual_seed(3),
+                "source_anchor": torch.Generator().manual_seed(4),
+            },
+        )
+
+    with pytest.raises(ValueError, match=rf"{stage}.*DataLoader generator"):
+        restore()
+
+
+def test_source_restore_rejects_non_tensor_loader_rng_state():
+    from torch import nn
+    from data import StatefulRandomSampler
+    from training.checkpointing import restore_source_training_state
+
+    model = nn.Linear(1, 1)
+    checkpoint = build_source_checkpoint(
+        model.state_dict(), torch.optim.SGD(model.parameters(), lr=0.1).state_dict(), None, 0, 0,
+        {"base_channels": 8}, "transmission", capture_rng_state(),
+        sampler_states={"source": StatefulRandomSampler(2, 1).state_dict()},
+    )
+    checkpoint["rng_state"]["dataloader_generators"] = {"source": "invalid"}
+
+    with pytest.raises(ValueError, match=r"source.*DataLoader generator state.*torch tensor"):
+        restore_source_training_state(
+            checkpoint, nn.Linear(1, 1), torch.optim.SGD(nn.Linear(1, 1).parameters(), lr=0.1),
+            StatefulRandomSampler(2, 2), "transmission",
+            dataloader_generators={"source": torch.Generator().manual_seed(3)},
+        )
+
+
+def _assert_nested_equal(actual, expected):
+    if torch.is_tensor(actual):
+        assert torch.equal(actual, expected)
+    elif isinstance(actual, dict):
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            _assert_nested_equal(actual[key], expected[key])
+    elif isinstance(actual, (list, tuple)):
+        assert len(actual) == len(expected)
+        for value, expected_value in zip(actual, expected):
+            _assert_nested_equal(value, expected_value)
+    else:
+        assert actual == expected
 
 
 def test_ema_restore_rejects_changed_source_or_real_manifest():

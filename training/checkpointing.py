@@ -30,6 +30,33 @@ def capture_rng_state(omega_generator=None, geometry_generator=None, dataloader_
     }
 
 
+def _validate_required_dataloader_generator_states(rng_state, dataloader_generators, *, stage):
+    """Reject resume inputs that cannot reproduce named loader worker seeds."""
+    required = set((dataloader_generators or {}).keys())
+    if not required:
+        return
+    if not isinstance(rng_state, dict):
+        raise ValueError(f"{stage} checkpoint lacks RNG state")
+    stored = rng_state.get("dataloader_generators")
+    if not isinstance(stored, dict):
+        raise ValueError(
+            f"{stage} checkpoint lacks DataLoader generator states: "
+            f"required={sorted(required)}"
+        )
+    missing = sorted(required.difference(stored))
+    if missing:
+        raise ValueError(
+            f"{stage} checkpoint lacks required DataLoader generator states: "
+            f"{', '.join(missing)}"
+        )
+    for name in sorted(required):
+        if not torch.is_tensor(stored[name]):
+            raise ValueError(
+                f"{stage} checkpoint DataLoader generator state "
+                f"{name!r} must be a torch tensor"
+            )
+
+
 def restore_rng_state(state, omega_generator=None, geometry_generator=None, dataloader_generators=None):
     random.setstate(state["python_random"])
     np.random.set_state(state["numpy"])
@@ -154,6 +181,10 @@ def restore_source_training_state(checkpoint, model, optimizer, sampler, density
                                   dataloader_generators=None):
     """Strictly restore a source checkpoint before creating the next iterator."""
     validate_checkpoint_metadata(checkpoint, "source", density_semantics)
+    rng_state = checkpoint.get("rng_state")
+    _validate_required_dataloader_generator_states(
+        rng_state, dataloader_generators, stage="source",
+    )
     model.load_state_dict(checkpoint["model"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer"])
     if scheduler is not None and checkpoint.get("scheduler") is not None:
@@ -165,7 +196,7 @@ def restore_source_training_state(checkpoint, model, optimizer, sampler, density
     if manifest_fingerprint is not None and checkpoint.get("manifest_fingerprints", {}).get("source") != manifest_fingerprint:
         raise ValueError("source dataset manifest fingerprint mismatch")
     restore_rng_state(
-        checkpoint["rng_state"], omega_generator=omega_generator,
+        rng_state, omega_generator=omega_generator,
         dataloader_generators=dataloader_generators,
     )
     return {
@@ -181,6 +212,10 @@ def restore_ema_training_state(checkpoint, student, teacher, optimizer, source_s
                                geometry_generator=None, dataloader_generators=None):
     """Strictly restore the paired EMA state before either iterator is created."""
     validate_checkpoint_metadata(checkpoint, "ema", density_semantics)
+    rng_state = checkpoint.get("rng_state")
+    _validate_required_dataloader_generator_states(
+        rng_state, dataloader_generators, stage="ema",
+    )
     student.load_state_dict(checkpoint["student"], strict=True)
     teacher.load_state_dict(checkpoint["teacher"], strict=True)
     for parameter in teacher.parameters():
@@ -198,7 +233,7 @@ def restore_ema_training_state(checkpoint, student, teacher, optimizer, source_s
         if stored != manifest_fingerprints:
             raise ValueError("EMA dataset manifest fingerprint mismatch")
     restore_rng_state(
-        checkpoint["rng_state"], omega_generator=omega_generator,
+        rng_state, omega_generator=omega_generator,
         geometry_generator=geometry_generator, dataloader_generators=dataloader_generators,
     )
     streaks = checkpoint.get("empty_omega_streaks", {})
