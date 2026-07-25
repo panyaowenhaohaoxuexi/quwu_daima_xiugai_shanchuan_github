@@ -1,7 +1,18 @@
 import torch
+from torch import nn
 from thop import profile
-# 确保导入了你的模型类
-from model import VIFNetInconsistencyTeacher
+from model.Teacher import FogRoutedRGBTIRDehazer
+
+
+class PredClearWrapper(nn.Module):
+    """Adapt the formal dictionary output to FLOPs tools expecting a tensor."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, hazy_rgb, tir):
+        return self.model(hazy_rgb, tir, route_temperature=1.0, route_mode="hard")["pred_clear"]
 
 
 def count_model_complexity():
@@ -10,8 +21,9 @@ def count_model_complexity():
 
     # 2. 实例化模型并移动到设备
     # 注意：这里使用未经过 DataParallel 包装的原始类
-    model = VIFNetInconsistencyTeacher().to(device)
+    model = FogRoutedRGBTIRDehazer().to(device)
     model.eval()
+    profiled_model = PredClearWrapper(model).to(device).eval()
 
     # 3. 创建虚拟输入 (Dummy Inputs)
     # 根据你的训练代码 (EMA.py)，输入尺寸通常是 256x256
@@ -21,7 +33,7 @@ def count_model_complexity():
 
     # 4. 使用 thop 计算 FLOPs 和参数量
     # 注意：由于是双输入模型，需要以元组形式传入 inputs
-    flops, params = profile(model, inputs=(input_vis, input_ir), verbose=False)
+    flops, params = profile(profiled_model, inputs=(input_vis, input_ir), verbose=False)
 
     # 5. 格式化输出结果
     print("-" * 30)

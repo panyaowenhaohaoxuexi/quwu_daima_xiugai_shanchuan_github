@@ -2,7 +2,7 @@
 Offline SAM sky-mask generation.
 
 This script only generates precomputed SAM sky masks and overlay previews.
-It does not train a model, modify model weights, or affect CMDN directly.
+It does not train a model or modify model weights.
 The training stage never runs SAM online; after generation, set
 train_sky_mask_dir in option/Teacher.py and train with --use_train_sky_mask.
 To generate masks for real_test_specific_hazy_dir, edit HAZY_DIR,

@@ -1,7 +1,7 @@
 import torch
 import inspect
 
-from model.fog_routed_dehazer import FogRoutedRGBTIRDehazer, appearance_receptive_field_radius_by_scale
+from model.Teacher import FogRoutedRGBTIRDehazer, appearance_receptive_field_radius_by_scale
 
 
 def test_tiny_model_cpu_supports_split_context_and_original_output_size():

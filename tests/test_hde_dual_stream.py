@@ -222,10 +222,10 @@ def test_apply_deform_passes_mask_to_supported_interface():
     assert deform.received_mask is mask
 
 
-def test_teacher_uses_normalized_ir_for_hde_and_keeps_mask_head_at_96_channels():
+def test_formal_model_routes_paired_rgb_tir_inputs_through_shared_hde():
     root = Path(__file__).resolve().parents[1]
     source = (root / "model" / "Teacher.py").read_text(encoding="utf-8")
 
-    assert "x_ir_01 = (x_ir * self.clip_input_std + self.clip_input_mean).clamp(0.0, 1.0)" in source
-    assert "density_map, density_feat = self.hde(x_vis_01, x_ir_01, return_feat=True)" in source
-    assert "nn.Conv2d(96, 32, kernel_size=3, padding=1)" in source
+    assert "self.hde = HDE()" in source
+    assert "hde_output = self.hde(padded_rgb, padded_tir)" in source
+    assert '"tir_structure_pyramid": hde_output["tir_structure_pyramid"]' in source
