@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from data import RealMultiModalDataset, StatefulRandomSampler, SynthMultiModalDataset, collate_real, collate_synth
 from data.stateful_sampler import validate_single_process_world
 from option.EMA import build_parser, prepare_experiment_dirs, save_config, validate_config
-from option._formal_config import tir_normalization_config_from_args
+from option._formal_config import LOSS_WEIGHT_NAMES, tir_normalization_config_from_args
 from training.paired_geometry import sample_geometry
 from training.ema_core import real_consistency_loss, stability_weights
 from training.checkpointing import (
@@ -52,6 +52,20 @@ def _log_loss_components(args):
         print("WARNING: reconstruction is L1-only")
     if args.boundary_gradient_weight == 0:
         print("WARNING: boundary loss has no gradient component")
+
+
+def build_ema_checkpoint_config(model_config, args):
+    """Persist the actual EMA objective instead of inherited source defaults."""
+    config = dict(model_config)
+    ema_config_keys = (
+        "ema_decay", "ema_sigma_j", "ema_sigma_m", "ema_sigma_r",
+        "ema_stability_min_weight", "lambda_ema_j", "lambda_ema_m", "lambda_ema_r",
+        "lambda_anchor", "real_batch_size", "source_anchor_batch_size", "real_data_dir",
+        "learning_rate", "epochs", "num_workers", "source_checkpoint", "formal_training",
+        *LOSS_WEIGHT_NAMES,
+    )
+    config.update({key: getattr(args, key) for key in ema_config_keys})
+    return config
 
 
 def run_ema_views(teacher, student, hazy_rgb, tir, generator, route_temperature,
@@ -250,14 +264,7 @@ def main(argv=None):
     if source_checkpoint is not None:
         student.load_state_dict(source_checkpoint["model"], strict=True)
     teacher = initialize_teacher(student)
-    ema_checkpoint_config = dict(model_config)
-    ema_config_keys = (
-        "ema_decay", "ema_sigma_j", "ema_sigma_m", "ema_sigma_r",
-        "ema_stability_min_weight", "lambda_ema_j", "lambda_ema_m", "lambda_ema_r",
-        "lambda_anchor", "real_batch_size", "source_anchor_batch_size", "real_data_dir",
-        "learning_rate", "epochs", "num_workers", "source_checkpoint",
-    )
-    ema_checkpoint_config.update({key: getattr(args, key) for key in ema_config_keys})
+    ema_checkpoint_config = build_ema_checkpoint_config(model_config, args)
     optimizer = AdamW(student.parameters(), lr=args.learning_rate)
     geometry_generator = torch.Generator(device=device)
     geometry_generator.manual_seed(args.model_init_seed + 201)

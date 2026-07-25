@@ -47,6 +47,47 @@ def test_source_and_ema_checkpoint_schemas_do_not_mix_model_fields():
     assert "model" not in ema
 
 
+def test_source_checkpoint_config_persists_actual_formal_training_loss_weights():
+    from option.Teacher import build_parser, validate_config
+
+    args = validate_config(build_parser().parse_args(["--formal_training"]))
+    checkpoint = build_source_checkpoint({}, {}, None, 0, 0, vars(args), "transmission", {})
+
+    assert checkpoint["config"]["formal_training"] is True
+    assert checkpoint["config"]["q_gradient_weight"] == 0.5
+    assert checkpoint["config"]["q_ssim_weight"] == 0.5
+    assert checkpoint["config"]["rec_gradient_weight"] == 0.2
+    assert checkpoint["config"]["rec_ssim_weight"] == 0.2
+    assert checkpoint["config"]["boundary_gradient_weight"] == 0.5
+
+
+def test_ema_checkpoint_config_uses_current_formal_loss_weights_not_source_values():
+    from EMA import build_ema_checkpoint_config
+    from option.EMA import build_parser, validate_config
+
+    args = validate_config(build_parser().parse_args(["--formal_training"]))
+    source_model_config = {
+        "formal_training": False,
+        "q_l1_weight": 1.0,
+        "q_gradient_weight": 0.0,
+        "q_ssim_weight": 0.0,
+        "rec_l1_weight": 1.0,
+        "rec_gradient_weight": 0.0,
+        "rec_ssim_weight": 0.0,
+        "boundary_l1_weight": 1.0,
+        "boundary_gradient_weight": 0.0,
+    }
+
+    config = build_ema_checkpoint_config(source_model_config, args)
+
+    assert config["formal_training"] is True
+    assert config["q_gradient_weight"] == 0.5
+    assert config["q_ssim_weight"] == 0.5
+    assert config["rec_gradient_weight"] == 0.2
+    assert config["rec_ssim_weight"] == 0.2
+    assert config["boundary_gradient_weight"] == 0.5
+
+
 def test_checkpoint_persists_distinct_source_and_real_sampler_states():
     state = {"epoch": 0, "seed": 1, "permutation": [0, 1], "next_sample_position": 1}
     checkpoint = build_ema_checkpoint(

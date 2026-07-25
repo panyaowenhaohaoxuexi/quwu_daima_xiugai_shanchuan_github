@@ -3,6 +3,42 @@
 import argparse
 
 
+LOSS_WEIGHT_NAMES = (
+    "q_l1_weight", "q_gradient_weight", "q_ssim_weight",
+    "rec_l1_weight", "rec_gradient_weight", "rec_ssim_weight",
+    "boundary_l1_weight", "boundary_gradient_weight",
+)
+
+# Preliminary formal-training values; final values are selected by ablation.
+FORMAL_TRAINING_LOSS_WEIGHTS = {
+    "q_l1_weight": 1.0,
+    "q_gradient_weight": 0.5,
+    "q_ssim_weight": 0.5,
+    "rec_l1_weight": 1.0,
+    "rec_gradient_weight": 0.2,
+    "rec_ssim_weight": 0.2,
+    "boundary_l1_weight": 1.0,
+    "boundary_gradient_weight": 0.5,
+}
+
+
+class _RecordExplicitLossWeight(argparse.Action):
+    """Retain whether a CLI weight was intentionally supplied."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        explicit = list(getattr(namespace, "_explicit_loss_weight_names", ()))
+        if self.dest not in explicit:
+            explicit.append(self.dest)
+        setattr(namespace, "_explicit_loss_weight_names", explicit)
+
+
+def _add_loss_weight_argument(parser, name, default):
+    parser.add_argument(
+        f"--{name}", type=float, default=default, action=_RecordExplicitLossWeight,
+    )
+
+
 def tir_normalization_config_from_args(args):
     """Return the one TIR loader mapping shared by train/EMA/evaluation."""
     return {
@@ -72,20 +108,21 @@ def add_training_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--q_temperature", type=float, default=0.1)
     parser.add_argument("--q_window_size", type=int, default=7)
     parser.add_argument("--q_min_valid_support", type=int, default=4)
-    parser.add_argument("--q_l1_weight", type=float, default=1.0)
-    parser.add_argument("--q_gradient_weight", type=float, default=0.0)
-    parser.add_argument("--q_ssim_weight", type=float, default=0.0)
+    parser.add_argument("--formal_training", action="store_true")
+    _add_loss_weight_argument(parser, "q_l1_weight", 1.0)
+    _add_loss_weight_argument(parser, "q_gradient_weight", 0.0)
+    _add_loss_weight_argument(parser, "q_ssim_weight", 0.0)
     parser.add_argument("--omega_regions_per_image", type=int, default=6)
     parser.add_argument("--omega_min_area", type=int, default=16)
     parser.add_argument("--omega_max_area", type=int, default=256)
     parser.add_argument("--max_consecutive_empty_omega_steps", type=int, default=100)
     parser.add_argument("--max_consecutive_failed_steps", type=int, default=20)
     parser.add_argument("--density_smooth_l1_beta", type=float, default=0.1)
-    parser.add_argument("--rec_l1_weight", type=float, default=1.0)
-    parser.add_argument("--rec_gradient_weight", type=float, default=0.0)
-    parser.add_argument("--rec_ssim_weight", type=float, default=0.0)
-    parser.add_argument("--boundary_l1_weight", type=float, default=1.0)
-    parser.add_argument("--boundary_gradient_weight", type=float, default=0.0)
+    _add_loss_weight_argument(parser, "rec_l1_weight", 1.0)
+    _add_loss_weight_argument(parser, "rec_gradient_weight", 0.0)
+    _add_loss_weight_argument(parser, "rec_ssim_weight", 0.0)
+    _add_loss_weight_argument(parser, "boundary_l1_weight", 1.0)
+    _add_loss_weight_argument(parser, "boundary_gradient_weight", 0.0)
     parser.add_argument("--reconstruction_ssim_window", type=int, default=7)
     parser.add_argument("--reconstruction_min_valid_support", type=int, default=4)
     for name in ("global", "fuse", "comp", "boundary", "router", "density", "route", "binary"):
@@ -107,8 +144,20 @@ def validate_common(args):
         raise ValueError("q_window_size must be positive and odd")
     if args.q_min_valid_support < 1:
         raise ValueError("q_min_valid_support must be >= 1")
-    if args.q_l1_weight < 0 or args.q_gradient_weight < 0 or args.q_ssim_weight < 0:
-        raise ValueError("q loss weights must be non-negative")
+    negative_loss_weights = [name for name in LOSS_WEIGHT_NAMES if getattr(args, name) < 0]
+    if negative_loss_weights:
+        raise ValueError("loss weights must be non-negative: " + ", ".join(negative_loss_weights))
+    if args.formal_training:
+        explicit = set(getattr(args, "_explicit_loss_weight_names", ()))
+        for name, value in FORMAL_TRAINING_LOSS_WEIGHTS.items():
+            if name not in explicit:
+                setattr(args, name, value)
+        invalid_formal_weights = [name for name in LOSS_WEIGHT_NAMES if getattr(args, name) <= 0]
+        if invalid_formal_weights:
+            raise ValueError(
+                "formal_training cannot use smoke default loss weights; all formal loss weights "
+                "must be > 0: " + ", ".join(invalid_formal_weights)
+            )
     if args.reconstruction_ssim_window <= 0 or args.reconstruction_ssim_window % 2 == 0:
         raise ValueError("reconstruction_ssim_window must be positive and odd")
     if args.reconstruction_min_valid_support < 1:

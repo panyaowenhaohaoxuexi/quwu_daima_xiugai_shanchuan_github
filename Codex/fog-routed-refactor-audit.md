@@ -340,3 +340,43 @@
   legacy or damaged formal resume checkpoints missing these states; the five
   observed warnings remain upstream torchvision Pillow deprecations plus the
   existing `TestDataset` pytest collection warning.
+
+## 2026-07-25 -- formal composite losses and global-TIR fallback prior
+
+- Baseline HEAD: `e1710e3a331416a07a379e35d2c0cce90be6cf47`. The initial
+  focused suite (`test_fog_routed_dehazer`, `test_source_counterfactual`,
+  `test_formal_imports`, `test_formal_options`, and `test_checkpointing`)
+  reported `41 passed, 4 warnings`.
+- Design inspection confirmed that counterfactual utility is L1 + gradient +
+  local SSIM, final reconstruction is also L1 + local SSIM + gradient, and
+  the memory fallback prior must combine local TIR structure with global TIR
+  scene context. Existing smoke defaults were q=`1/0/0`, reconstruction=`1/0/0`,
+  and boundary=`1/0` for L1/gradient/SSIM (or L1/gradient).
+- `option/_formal_config.py` now owns `--formal_training`, its preliminary
+  (ablation-tunable) formal preset q=`1/.5/.5`, reconstruction=`1/.2/.2`,
+  boundary=`1/.5`, and shared validation. Explicit CLI loss-weight arguments
+  are tracked so an explicit zero is rejected rather than silently replaced;
+  any negative one of the eight weights is rejected in all modes.
+- Source persists the validated `vars(args)` configuration. EMA previously
+  retained source-config loss weights in its checkpoint config; its new
+  `build_ema_checkpoint_config()` overwrites `formal_training` and all eight
+  loss weights from the active EMA args before checkpoint creation.
+- `MemoryRetriever` still uses its existing validity-weighted
+  `[B, structure_channels]` global context for key/query. Its fallback prior
+  now receives local structure concatenated with that context expanded over
+  spatial dimensions. Default first prior convolution inputs changed h2
+  `16->32`, h4 `32->64`, h8 `48->96`, h16 `64->128`; the retrieval return
+  interface remains six values.
+- New regression coverage checks both entry parsers, smoke defaults, formal
+  values, explicit zero/negative validation, source/EMA checkpoint weights,
+  and a deterministic empty-memory fallback where values cannot affect the
+  appearance but remote structure changes its global-context-conditioned
+  target pixel. Focused verification after the changes: `63 passed, 4 warnings`.
+- Complete verification with `PYTHONDONTWRITEBYTECODE=1` and
+  `-p no:cacheprovider`: `152 passed, 5 warnings in 12.97s`. Warnings remain
+  the four upstream torchvision Pillow deprecations plus pytest's existing
+  non-collectable `TestDataset` warning.
+- Compatibility break: old source and EMA checkpoints contain same-named
+  fallback-prior parameters with the old input-channel shape. They cannot be
+  loaded into this revision, including through `strict=False`; no migration is
+  supplied in this change.

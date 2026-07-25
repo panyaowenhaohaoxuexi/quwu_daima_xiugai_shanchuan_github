@@ -164,7 +164,7 @@ class MemoryRetriever(nn.Module):
         self.context_key = nn.Linear(structure_channels, channels, bias=False)
         self.context_query = nn.Linear(structure_channels, channels, bias=False)
         self.prior = nn.Sequential(
-            nn.Conv2d(structure_channels, channels, 1), nn.SiLU(inplace=True), nn.Conv2d(channels, channels, 1)
+            nn.Conv2d(2 * structure_channels, channels, 1), nn.SiLU(inplace=True), nn.Conv2d(channels, channels, 1)
         )
 
     def forward(self, structure, value, reliability, validity):
@@ -216,7 +216,9 @@ class MemoryRetriever(nn.Module):
         candidate_count = candidate_count.reshape(batch, 1, height, width)
         sample_fallback = (reliable_ratio < self.ratio_threshold).view(batch, 1, 1, 1)
         fallback = (sample_fallback | (confidence < self.confidence_threshold)).to(value.dtype)
-        appearance = fallback * self.prior(structure) + (1.0 - fallback) * retrieved
+        global_context_map = global_context[:, :, None, None].expand(-1, -1, height, width)
+        prior_input = torch.cat((structure, global_context_map), dim=1)
+        appearance = fallback * self.prior(prior_input) + (1.0 - fallback) * retrieved
         return appearance, confidence, fallback, reliable_mass, reliable_ratio, candidate_count
 
 

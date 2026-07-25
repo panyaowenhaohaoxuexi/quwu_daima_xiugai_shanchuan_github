@@ -1,7 +1,50 @@
 import torch
 import inspect
 
-from model.Teacher import FogRoutedRGBTIRDehazer, appearance_receptive_field_radius_by_scale
+from model.Teacher import MemoryRetriever, FogRoutedRGBTIRDehazer, appearance_receptive_field_radius_by_scale
+
+
+def test_empty_memory_fallback_prior_uses_global_tir_structure_context():
+    memory = MemoryRetriever(
+        channels=1, structure_channels=1, max_tokens=4, topk=2,
+        attention_temperature=0.07, reliability_epsilon=1e-6,
+        ratio_threshold=0.01, confidence_threshold=0.1,
+    )
+    with torch.no_grad():
+        memory.prior[0].weight.zero_()
+        memory.prior[0].weight[0, 1, 0, 0] = 1.0
+        memory.prior[0].bias.zero_()
+        memory.prior[2].weight.fill_(1.0)
+        memory.prior[2].bias.zero_()
+
+    validity = torch.ones(1, 1, 3, 3)
+    reliability = torch.zeros_like(validity)
+    structure_a = torch.zeros_like(validity)
+    structure_a[..., 1, 1] = 1.0
+    structure_b = structure_a.clone()
+    structure_b[..., 0, 0] = 2.0
+    value_a = torch.zeros_like(validity)
+    value_b = torch.full_like(validity, 17.0)
+
+    appearance_a, _, fallback_a, _, _, candidate_count_a = memory(
+        structure_a, value_a, reliability, validity,
+    )
+    appearance_with_other_value, _, fallback_with_other_value, _, _, candidate_count_with_other_value = memory(
+        structure_a, value_b, reliability, validity,
+    )
+    appearance_b, _, fallback_b, _, _, candidate_count_b = memory(
+        structure_b, value_a, reliability, validity,
+    )
+
+    assert appearance_a.shape == value_a.shape
+    assert torch.equal(fallback_a, torch.ones_like(fallback_a))
+    assert torch.equal(fallback_with_other_value, torch.ones_like(fallback_with_other_value))
+    assert torch.equal(fallback_b, torch.ones_like(fallback_b))
+    assert torch.equal(candidate_count_a, torch.zeros_like(candidate_count_a))
+    assert torch.equal(candidate_count_with_other_value, torch.zeros_like(candidate_count_with_other_value))
+    assert torch.equal(candidate_count_b, torch.zeros_like(candidate_count_b))
+    assert torch.allclose(appearance_a, appearance_with_other_value, atol=0, rtol=0)
+    assert not torch.allclose(appearance_a[..., 1, 1], appearance_b[..., 1, 1], atol=0, rtol=0)
 
 
 def test_tiny_model_cpu_supports_split_context_and_original_output_size():

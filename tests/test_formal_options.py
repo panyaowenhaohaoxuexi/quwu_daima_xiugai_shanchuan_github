@@ -1,6 +1,27 @@
 import importlib
 import sys
 
+import pytest
+
+
+LOSS_WEIGHT_ARGUMENTS = (
+    "q_l1_weight", "q_gradient_weight", "q_ssim_weight",
+    "rec_l1_weight", "rec_gradient_weight", "rec_ssim_weight",
+    "boundary_l1_weight", "boundary_gradient_weight",
+)
+
+
+FORMAL_LOSS_WEIGHTS = {
+    "q_l1_weight": 1.0,
+    "q_gradient_weight": 0.5,
+    "q_ssim_weight": 0.5,
+    "rec_l1_weight": 1.0,
+    "rec_gradient_weight": 0.2,
+    "rec_ssim_weight": 0.2,
+    "boundary_l1_weight": 1.0,
+    "boundary_gradient_weight": 0.5,
+}
+
 
 def test_option_modules_are_pure_on_import_and_validate_formal_defaults(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
@@ -32,3 +53,47 @@ def test_tir_loader_mapping_keeps_all_persisted_preprocessing_semantics():
     assert config["percentile_scope"] == "dataset"
     assert config["dataset_percentile_low_value"] == 100.0
     assert config["channel_tolerance_code_values"] == 2
+
+
+def test_default_loss_weights_remain_l1_only_smoke_values():
+    from option.Teacher import build_parser, validate_config
+
+    args = validate_config(build_parser().parse_args([]))
+
+    assert args.formal_training is False
+    assert {name: getattr(args, name) for name in LOSS_WEIGHT_ARGUMENTS} == {
+        "q_l1_weight": 1.0,
+        "q_gradient_weight": 0.0,
+        "q_ssim_weight": 0.0,
+        "rec_l1_weight": 1.0,
+        "rec_gradient_weight": 0.0,
+        "rec_ssim_weight": 0.0,
+        "boundary_l1_weight": 1.0,
+        "boundary_gradient_weight": 0.0,
+    }
+
+
+@pytest.mark.parametrize("module_name", ("option.Teacher", "option.EMA"))
+def test_formal_training_parser_loads_positive_composite_weights(module_name):
+    module = importlib.import_module(module_name)
+
+    args = module.validate_config(module.build_parser().parse_args(["--formal_training"]))
+
+    assert args.formal_training is True
+    assert {name: getattr(args, name) for name in LOSS_WEIGHT_ARGUMENTS} == FORMAL_LOSS_WEIGHTS
+
+
+@pytest.mark.parametrize("name", LOSS_WEIGHT_ARGUMENTS)
+def test_formal_training_rejects_each_explicit_zero_weight(name):
+    from option.Teacher import build_parser, validate_config
+
+    with pytest.raises(ValueError, match="smoke"):
+        validate_config(build_parser().parse_args(["--formal_training", f"--{name}", "0"]))
+
+
+@pytest.mark.parametrize("name", LOSS_WEIGHT_ARGUMENTS)
+def test_loss_weights_must_always_be_non_negative(name):
+    from option.Teacher import build_parser, validate_config
+
+    with pytest.raises(ValueError, match="non-negative"):
+        validate_config(build_parser().parse_args([f"--{name}", "-0.1"]))
