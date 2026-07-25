@@ -380,3 +380,48 @@
   fallback-prior parameters with the old input-channel shape. They cannot be
   loaded into this revision, including through `strict=False`; no migration is
   supplied in this change.
+
+## 2026-07-25 -- source resume objective locking and persistence hygiene
+
+- Baseline inspection on branch `v4`, HEAD `d3a638e1acb5bb31d390d4dce54a0697b901130f`,
+  found no tracked worktree changes. `_SEMANTIC_KEYS` contains only
+  architecture/preprocessing values; neither `formal_training` nor the eight
+  loss weights were in source resume recovery or mismatch validation.
+- Before this change `Teacher.py` parsed and fully validated raw CLI args,
+  logged loss components, saved config, then loaded the resume checkpoint.
+  Consequently an omitted `--formal_training` could commit the L1-only parser
+  defaults before the source model/optimizer state was restored. The shared
+  validation also turns an unmarked formal run's unset weights into the formal
+  preset and rejects negative weights, so it could not safely run before the
+  checkpoint objective was resolved.
+- Added the independent nine-field training-objective set and strict
+  `apply_source_resume_config(...)`. Source resume now rejects a checkpoint
+  missing any objective key with `source checkpoint training objective
+  configuration is incomplete; missing: ...`; it never falls back to parser
+  L1-only defaults. By default all nine values come from the checkpoint.
+  `--allow_source_training_override` applies only fields explicitly supplied
+  on this invocation and prints only actual value differences. It cannot
+  disable formal training because no negative formal flag exists.
+- Parser actions now place explicit `--formal_training` and loss-weight flags
+  in one private `_explicit_training_objective_keys` collection. The resume
+  merge retains restored weight markings until the single final validation, so
+  checkpoint custom formal weights are not replaced by the formal preset.
+- Teacher now resolves checkpoint objectives before its only `validate_config`
+  call, then validates architecture/preprocessing semantics, logs resolved
+  components, writes resolved config, and only then builds data/model/optimizer.
+  Existing source semantic mismatch rejection remains unconditional.
+- `persisted_config_from_args()` removes all underscore-prefixed parser state.
+  Source/EMA config JSON, source checkpoints, and EMA checkpoint config now
+  use it; regression tests verify no explicit/private marker reaches persisted
+  config. Source persistence uses eight distinct `1.1`--`1.8` values. EMA
+  starts from distinct source sentinels `9.1`--`9.8` and verifies every saved
+  weight comes from current EMA args.
+- Test count reconciliation: this task started from a fresh current-HEAD
+  collect-only result of `152 tests`. After adding ten collected cases,
+  `PYTHONDONTWRITEBYTECODE=1 ... pytest -p no:cacheprovider --collect-only -q`
+  reported `162 tests collected in 3.52s`, and the full run reported
+  `162 passed, 5 warnings in 15.74s`. The earlier repeated `152` records are
+  historical/pre-this-task counts and must not be read as a post-change count
+  for this source-resume work. The five warnings remain the four upstream
+  torchvision Pillow deprecations and the existing non-collectable
+  `TestDataset` warning.

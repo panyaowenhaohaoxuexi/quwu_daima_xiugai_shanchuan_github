@@ -73,6 +73,18 @@ def test_default_loss_weights_remain_l1_only_smoke_values():
     }
 
 
+def test_formal_training_and_loss_weights_share_explicit_cli_tracking():
+    from option.Teacher import build_parser
+
+    args = build_parser().parse_args([
+        "--formal_training", "--q_gradient_weight", "0.7",
+    ])
+
+    assert set(args._explicit_training_objective_keys) == {
+        "formal_training", "q_gradient_weight",
+    }
+
+
 @pytest.mark.parametrize("module_name", ("option.Teacher", "option.EMA"))
 def test_formal_training_parser_loads_positive_composite_weights(module_name):
     module = importlib.import_module(module_name)

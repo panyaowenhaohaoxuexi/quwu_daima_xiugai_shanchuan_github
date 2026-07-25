@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from data import RealMultiModalDataset, StatefulRandomSampler, SynthMultiModalDataset, collate_real, collate_synth
 from data.stateful_sampler import validate_single_process_world
 from option.EMA import build_parser, prepare_experiment_dirs, save_config, validate_config
-from option._formal_config import LOSS_WEIGHT_NAMES, tir_normalization_config_from_args
+from option._formal_config import LOSS_WEIGHT_NAMES, persisted_config_from_args, tir_normalization_config_from_args
 from training.paired_geometry import sample_geometry
 from training.ema_core import real_consistency_loss, stability_weights
 from training.checkpointing import (
@@ -56,7 +56,8 @@ def _log_loss_components(args):
 
 def build_ema_checkpoint_config(model_config, args):
     """Persist the actual EMA objective instead of inherited source defaults."""
-    config = dict(model_config)
+    config = {key: value for key, value in model_config.items() if not key.startswith("_")}
+    current_config = persisted_config_from_args(args)
     ema_config_keys = (
         "ema_decay", "ema_sigma_j", "ema_sigma_m", "ema_sigma_r",
         "ema_stability_min_weight", "lambda_ema_j", "lambda_ema_m", "lambda_ema_r",
@@ -64,7 +65,7 @@ def build_ema_checkpoint_config(model_config, args):
         "learning_rate", "epochs", "num_workers", "source_checkpoint", "formal_training",
         *LOSS_WEIGHT_NAMES,
     )
-    config.update({key: getattr(args, key) for key in ema_config_keys})
+    config.update({key: current_config[key] for key in ema_config_keys})
     return config
 
 

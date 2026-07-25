@@ -1,5 +1,6 @@
 """Formal source-domain training entry point for fog-routed RGB--TIR dehazing."""
 
+import argparse
 import random
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from data import StatefulRandomSampler
 from data.stateful_sampler import validate_single_process_world
 from data.data_loader import SynthMultiModalDataset, collate_synth
 from option.Teacher import build_parser, prepare_experiment_dirs, save_config, validate_config
-from option._formal_config import tir_normalization_config_from_args
+from option._formal_config import persisted_config_from_args, tir_normalization_config_from_args
 from training.omega_sampler import OmegaSampler
 from training.source_step import compute_source_batch_losses
 from training.step_control import perform_optimizer_step
@@ -24,7 +25,7 @@ from training.checkpointing import (
     build_source_checkpoint, build_formal_model_from_config, capture_rng_state,
     restore_source_training_state, validate_checkpoint_metadata, validate_model_semantics_config,
 )
-from training.resume_config import validate_source_resume_semantics
+from training.resume_config import apply_source_resume_config, validate_source_resume_semantics
 
 
 def _set_model_init_seed(seed):
@@ -46,20 +47,35 @@ def _log_loss_components(args):
 
 
 def main(argv=None):
-    args = validate_config(build_parser().parse_args(argv))
+    raw_args = build_parser().parse_args(argv)
+    resume_checkpoint = torch.load(raw_args.resume_checkpoint, map_location="cpu") if raw_args.resume_checkpoint else None
+    source_override_diff = {}
+    if resume_checkpoint is not None:
+        validate_checkpoint_metadata(
+            resume_checkpoint, "source", resume_checkpoint.get("density_gt_semantics"),
+        )
+        resolved, source_override_diff = apply_source_resume_config(
+            vars(raw_args), resume_checkpoint["config"],
+            allow_training_override=raw_args.allow_source_training_override,
+            explicit_objective_keys=getattr(raw_args, "_explicit_training_objective_keys", ()),
+        )
+        args = validate_config(argparse.Namespace(**resolved))
+        persisted_config = persisted_config_from_args(args)
+        validate_model_semantics_config(resume_checkpoint["config"], persisted_config)
+        validate_source_resume_semantics(resume_checkpoint["config"], persisted_config)
+        if resume_checkpoint["config"].get("train_size") != args.train_size:
+            raise ValueError("source checkpoint train_size/preprocessing mismatch")
+    else:
+        args = validate_config(raw_args)
+        persisted_config = persisted_config_from_args(args)
+    if source_override_diff:
+        print(f"[source] explicit training override: {source_override_diff}")
     _log_loss_components(args)
     validate_single_process_world()
     prepare_experiment_dirs(args)
     save_config(args)
     _set_model_init_seed(args.model_init_seed)
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
-    resume_checkpoint = torch.load(args.resume_checkpoint, map_location="cpu") if args.resume_checkpoint else None
-    if resume_checkpoint is not None:
-        validate_checkpoint_metadata(resume_checkpoint, "source", args.density_gt_semantics)
-        validate_model_semantics_config(resume_checkpoint["config"], vars(args))
-        validate_source_resume_semantics(resume_checkpoint["config"], vars(args))
-        if resume_checkpoint["config"].get("train_size") != args.train_size:
-            raise ValueError("source checkpoint train_size/preprocessing mismatch")
     dataset = SynthMultiModalDataset(
         args.train_data_dir, train=True, size=args.train_size, density_gt_semantics=args.density_gt_semantics,
         density_map_normalization=args.density_map_normalization,
@@ -80,7 +96,7 @@ def main(argv=None):
     # The same persisted semantic configuration is used for source training,
     # resume and evaluation; no architecture default may silently replace a
     # user-supplied model/preprocessing setting.
-    model = build_formal_model_from_config(vars(args)).to(device)
+    model = build_formal_model_from_config(persisted_config).to(device)
     optimizer = AdamW(model.parameters(), lr=args.learning_rate)
     omega_sampler = OmegaSampler(
         regions_per_image=args.omega_regions_per_image,
@@ -203,7 +219,7 @@ def main(argv=None):
         if args.saved_model_dir:
             checkpoint = build_source_checkpoint(
                 model.state_dict(), optimizer.state_dict(), None, global_step, epoch,
-                vars(args), args.density_gt_semantics,
+                persisted_config, args.density_gt_semantics,
                 capture_rng_state(
                     omega_generator=omega_generator,
                     dataloader_generators={"source": source_loader_generator},

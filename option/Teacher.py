@@ -4,7 +4,9 @@ import argparse
 import json
 from pathlib import Path
 
-from ._formal_config import add_model_arguments, add_training_arguments, validate_common
+from ._formal_config import (
+    add_model_arguments, add_training_arguments, persisted_config_from_args, validate_common,
+)
 
 
 def build_parser():
@@ -14,6 +16,7 @@ def build_parser():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--resume_checkpoint", default="")
+    parser.add_argument("--allow_source_training_override", action="store_true")
     return parser
 
 
@@ -35,4 +38,4 @@ def save_config(args):
         return
     Path(args.exp_dir).mkdir(parents=True, exist_ok=True)
     with (Path(args.exp_dir) / "config.json").open("w", encoding="utf-8") as handle:
-        json.dump(vars(args), handle, indent=2, sort_keys=True)
+        json.dump(persisted_config_from_args(args), handle, indent=2, sort_keys=True)

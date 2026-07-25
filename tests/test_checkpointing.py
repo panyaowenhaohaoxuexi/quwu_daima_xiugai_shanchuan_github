@@ -47,45 +47,47 @@ def test_source_and_ema_checkpoint_schemas_do_not_mix_model_fields():
     assert "model" not in ema
 
 
-def test_source_checkpoint_config_persists_actual_formal_training_loss_weights():
+def test_source_checkpoint_config_persists_every_actual_loss_weight_without_private_cli_state():
     from option.Teacher import build_parser, validate_config
+    from option._formal_config import LOSS_WEIGHT_NAMES, persisted_config_from_args
 
-    args = validate_config(build_parser().parse_args(["--formal_training"]))
-    checkpoint = build_source_checkpoint({}, {}, None, 0, 0, vars(args), "transmission", {})
+    expected = {
+        "q_l1_weight": 1.1,
+        "q_gradient_weight": 1.2,
+        "q_ssim_weight": 1.3,
+        "rec_l1_weight": 1.4,
+        "rec_gradient_weight": 1.5,
+        "rec_ssim_weight": 1.6,
+        "boundary_l1_weight": 1.7,
+        "boundary_gradient_weight": 1.8,
+    }
+    argv = [argument for name, value in expected.items() for argument in (f"--{name}", str(value))]
+    args = validate_config(build_parser().parse_args(argv))
+    checkpoint = build_source_checkpoint(
+        {}, {}, None, 0, 0, persisted_config_from_args(args), "transmission", {},
+    )
 
-    assert checkpoint["config"]["formal_training"] is True
-    assert checkpoint["config"]["q_gradient_weight"] == 0.5
-    assert checkpoint["config"]["q_ssim_weight"] == 0.5
-    assert checkpoint["config"]["rec_gradient_weight"] == 0.2
-    assert checkpoint["config"]["rec_ssim_weight"] == 0.2
-    assert checkpoint["config"]["boundary_gradient_weight"] == 0.5
+    assert {name: checkpoint["config"][name] for name in LOSS_WEIGHT_NAMES} == expected
+    assert not any(key.startswith("_") for key in checkpoint["config"])
 
 
 def test_ema_checkpoint_config_uses_current_formal_loss_weights_not_source_values():
     from EMA import build_ema_checkpoint_config
     from option.EMA import build_parser, validate_config
+    from option._formal_config import LOSS_WEIGHT_NAMES
 
     args = validate_config(build_parser().parse_args(["--formal_training"]))
-    source_model_config = {
-        "formal_training": False,
-        "q_l1_weight": 1.0,
-        "q_gradient_weight": 0.0,
-        "q_ssim_weight": 0.0,
-        "rec_l1_weight": 1.0,
-        "rec_gradient_weight": 0.0,
-        "rec_ssim_weight": 0.0,
-        "boundary_l1_weight": 1.0,
-        "boundary_gradient_weight": 0.0,
-    }
+    source_model_config = {name: 9.1 + index / 10 for index, name in enumerate(LOSS_WEIGHT_NAMES)}
+    source_model_config["formal_training"] = False
+    source_model_config["_legacy_private"] = "discard"
 
     config = build_ema_checkpoint_config(source_model_config, args)
 
     assert config["formal_training"] is True
-    assert config["q_gradient_weight"] == 0.5
-    assert config["q_ssim_weight"] == 0.5
-    assert config["rec_gradient_weight"] == 0.2
-    assert config["rec_ssim_weight"] == 0.2
-    assert config["boundary_gradient_weight"] == 0.5
+    assert {name: config[name] for name in LOSS_WEIGHT_NAMES} == {
+        name: getattr(args, name) for name in LOSS_WEIGHT_NAMES
+    }
+    assert not any(key.startswith("_") for key in config)
 
 
 def test_checkpoint_persists_distinct_source_and_real_sampler_states():
