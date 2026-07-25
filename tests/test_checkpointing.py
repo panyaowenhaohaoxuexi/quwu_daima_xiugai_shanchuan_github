@@ -48,8 +48,8 @@ def test_source_and_ema_checkpoint_schemas_do_not_mix_model_fields():
 
 
 def test_source_checkpoint_config_persists_every_actual_loss_weight_without_private_cli_state():
-    from option.Teacher import build_parser, validate_config
-    from option._formal_config import LOSS_WEIGHT_NAMES, persisted_config_from_args
+    from option.Teacher import LOSS_WEIGHT_NAMES, build_parser, validate_config
+    from option._formal_config import persisted_config_from_args
 
     expected = {
         "q_l1_weight": 1.1,
@@ -74,7 +74,7 @@ def test_source_checkpoint_config_persists_every_actual_loss_weight_without_priv
 def test_ema_checkpoint_config_uses_current_formal_loss_weights_not_source_values():
     from EMA import build_ema_checkpoint_config
     from option.EMA import build_parser, validate_config
-    from option._formal_config import LOSS_WEIGHT_NAMES
+    from option.Teacher import LOSS_WEIGHT_NAMES
 
     args = validate_config(build_parser().parse_args(["--formal_training"]))
     source_model_config = {name: 9.1 + index / 10 for index, name in enumerate(LOSS_WEIGHT_NAMES)}

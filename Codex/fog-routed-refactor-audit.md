@@ -425,3 +425,48 @@
   for this source-resume work. The five warnings remain the four upstream
   torchvision Pillow deprecations and the existing non-collectable
   `TestDataset` warning.
+
+## 2026-07-25 -- canonical loss layering
+
+- Baseline HEAD: `7274408285dc0ebf86b6affe3dfb79cb75ca7558` on `v4`; only the
+  existing user untracked resources were present. The prescribed loss/flow
+  baseline reported `22 passed, 4 warnings`.
+- Pre-move deterministic reference (`torch.manual_seed(31415)`): Source total
+  `3.9984745979`, q sum `10.2569599152`, real `L_real` `1.3981907368`; Source
+  prediction/density/route gradient norms were `0.9628067613`, `0.2019856274`,
+  `21.4344787598`, and real J/M/R norms were `0.1587713212`,
+  `0.2249999940`, `4.1881737709`. Canonical regression coverage preserves
+  these values, detached q, return fields and gradient connectivity.
+- Moved canonical implementations: old `loss/fog_routed_source_loss.py` ->
+  `loss/common/masked.py`, `loss/common/structural.py`, and
+  `loss/synthetic/routing.py`; `training/source_objective.py` ->
+  `loss/synthetic/objective.py`; local counterfactual error/q code ->
+  `loss/synthetic/counterfactual.py`; `training/ema_core.py` loss math ->
+  `loss/real/consistency.py`; and EMA adaptation composition ->
+  `loss/real/objective.py`.
+- Compatibility files retained: `loss/fog_routed_source_loss.py` and
+  `training/source_objective.py` are explicit re-exports; `training/ema_core.py`
+  retains only EMA state updates and imports legacy loss names directly from
+  `loss.real.consistency`. No legacy module contains a second loss formula.
+- `KL.py`, `Dice.py`, and `mssim.py` remain untouched as old independently
+  importable loss modules. They have no in-repository consumer, but removing
+  them is intentionally outside this task. `loss/__init__.py` no longer uses
+  wildcard imports and exposes only explicit formal APIs.
+- Source loss defaults, formal preset, explicit CLI tracking and validation now
+  live in `option/Teacher.py`; `option/EMA.py` visibly imports its pure source
+  anchor registration/validation functions and keeps EMA-real weights local.
+  `_formal_config.py` now contains only generic non-loss parser/validation
+  helpers. Both CLI help outputs show the unchanged source loss arguments.
+- Static import coverage verifies that `loss/` imports no model, training,
+  option or entrypoint package. The requested formula scan found canonical
+  definitions only under `loss/` and no q/BCE/binary formula matches in
+  training, model or entrypoint modules.
+- Added a no-commit Source/EMA chain smoke: real consistency, Source anchor,
+  adaptation objective and `run_ema_adaptation_step` all backpropagate; failed
+  optimizer submission leaves teacher state unchanged and emits detached
+  `L_real`, `L_src`, `L_adapt`.
+- Verification: focused legacy/formal loss flow baseline after migration,
+  compatibility and import tests passed; complete pytest with cache/bytecode
+  writes disabled reported `168 passed, 5 warnings in 12.13s`. Warnings remain
+  four upstream torchvision Pillow deprecations and the existing non-collected
+  `TestDataset` class warning.

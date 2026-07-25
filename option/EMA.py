@@ -7,6 +7,7 @@ from pathlib import Path
 from ._formal_config import (
     add_model_arguments, add_training_arguments, persisted_config_from_args, validate_common,
 )
+from .Teacher import add_source_loss_arguments, validate_source_loss_arguments
 
 
 def build_parser():
@@ -30,11 +31,13 @@ def build_parser():
     parser.add_argument("--allow_ema_training_override", action="store_true")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    add_source_loss_arguments(parser)
     return parser
 
 
 def validate_config(args):
     validate_common(args)
+    validate_source_loss_arguments(args)
     if not 0 <= args.ema_decay < 1:
         raise ValueError("ema_decay must be in [0,1)")
     if min(args.ema_sigma_j, args.ema_sigma_m, args.ema_sigma_r) <= 0:

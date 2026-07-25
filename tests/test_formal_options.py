@@ -85,6 +85,15 @@ def test_formal_training_and_loss_weights_share_explicit_cli_tracking():
     }
 
 
+def test_source_loss_defaults_and_formal_preset_are_owned_by_option_teacher():
+    import option._formal_config as common
+    from option.Teacher import FORMAL_TRAINING_LOSS_WEIGHTS, LOSS_WEIGHT_NAMES
+
+    assert set(FORMAL_TRAINING_LOSS_WEIGHTS) == set(LOSS_WEIGHT_NAMES)
+    assert not hasattr(common, "LOSS_WEIGHT_NAMES")
+    assert not hasattr(common, "FORMAL_TRAINING_LOSS_WEIGHTS")
+
+
 @pytest.mark.parametrize("module_name", ("option.Teacher", "option.EMA"))
 def test_formal_training_parser_loads_positive_composite_weights(module_name):
     module = importlib.import_module(module_name)

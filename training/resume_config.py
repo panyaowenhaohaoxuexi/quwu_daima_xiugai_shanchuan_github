@@ -1,6 +1,6 @@
 """Checkpoint-resume configuration boundaries for formal training stages."""
 
-from option._formal_config import LOSS_WEIGHT_NAMES, TRAINING_OBJECTIVE_KEYS
+from option.Teacher import LOSS_WEIGHT_NAMES, TRAINING_OBJECTIVE_KEYS
 
 _SEMANTIC_KEYS = {
     "base_channels", "router_hidden_channels", "deform_num_samples", "deform_max_offset",

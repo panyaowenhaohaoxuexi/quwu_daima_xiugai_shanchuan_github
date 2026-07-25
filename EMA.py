@@ -13,9 +13,10 @@ from torch.utils.data import DataLoader
 from data import RealMultiModalDataset, StatefulRandomSampler, SynthMultiModalDataset, collate_real, collate_synth
 from data.stateful_sampler import validate_single_process_world
 from option.EMA import build_parser, prepare_experiment_dirs, save_config, validate_config
-from option._formal_config import LOSS_WEIGHT_NAMES, persisted_config_from_args, tir_normalization_config_from_args
+from option.Teacher import LOSS_WEIGHT_NAMES
+from option._formal_config import persisted_config_from_args, tir_normalization_config_from_args
 from training.paired_geometry import sample_geometry
-from training.ema_core import real_consistency_loss, stability_weights
+from loss.real.consistency import real_consistency_loss, stability_weights
 from training.checkpointing import (
     build_ema_checkpoint, build_formal_model_from_config, capture_rng_state,
     restore_ema_training_state, validate_checkpoint_metadata,
@@ -70,7 +71,8 @@ def build_ema_checkpoint_config(model_config, args):
 
 
 def run_ema_views(teacher, student, hazy_rgb, tir, generator, route_temperature,
-                  sigma_j, sigma_m, sigma_r, minimum_weight):
+                  sigma_j, sigma_m, sigma_r, minimum_weight,
+                  lambda_j=1.0, lambda_m=1.0, lambda_r=1.0):
     """Run independent batch-level A/B/S views and return aligned EMA losses."""
     transform_a, transform_b, transform_s = (sample_geometry(generator) for _ in range(3))
     with torch.no_grad():
@@ -88,7 +90,8 @@ def run_ema_views(teacher, student, hazy_rgb, tir, generator, route_temperature,
     r_s = transform_s.inverse(output_s["route_soft"])
     weights = stability_weights(j_a, j_b, m_a, m_b, r_a, r_b, sigma_j, sigma_m, sigma_r, minimum_weight)
     losses = real_consistency_loss(j_s, 0.5 * (j_a + j_b), m_s, 0.5 * (m_a + m_b),
-                                   r_s, 0.5 * (r_a + r_b), *weights)
+                                   r_s, 0.5 * (r_a + r_b), *weights,
+                                   lambda_j=lambda_j, lambda_m=lambda_m, lambda_r=lambda_r)
     return losses, (transform_a, transform_b, transform_s)
 
 
@@ -149,9 +152,9 @@ def run_ema_epoch(student, teacher, optimizer, real_loader, source_loader, args,
             losses, _ = run_ema_views(
                 teacher, student, real_hazy, real_tir, geometry_generator, args.route_tau_end,
                 args.ema_sigma_j, args.ema_sigma_m, args.ema_sigma_r, args.ema_stability_min_weight,
+                args.lambda_ema_j, args.lambda_ema_m, args.lambda_ema_r,
             )
-            return (args.lambda_ema_j * losses["L_J"] + args.lambda_ema_m * losses["L_M"] +
-                    args.lambda_ema_r * losses["L_R"])
+            return losses["L_real"]
 
         anchor_result = {}
 

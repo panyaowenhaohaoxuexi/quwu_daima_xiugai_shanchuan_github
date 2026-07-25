@@ -6,8 +6,10 @@ import torch
 from torch.nn import functional as F
 
 from .schedules import source_route_schedule
-from .source_counterfactual import compute_q, run_counterfactual_chunks
-from .source_objective import compute_source_objective
+from loss.synthetic.counterfactual import compute_q
+from loss.synthetic.objective import compute_source_objective
+
+from .source_counterfactual import run_counterfactual_chunks
 
 
 def compute_source_batch_losses(model, source_batch, args, omega_sampler, global_step, *,
