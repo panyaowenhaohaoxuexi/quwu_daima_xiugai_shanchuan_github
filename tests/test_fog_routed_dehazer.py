@@ -1,7 +1,7 @@
 import torch
 import inspect
 
-from model.Teacher import MemoryRetriever, FogRoutedRGBTIRDehazer, appearance_receptive_field_radius_by_scale
+from model.fog_routed_dehazer import MemoryRetriever, FogRoutedRGBTIRDehazer, appearance_receptive_field_radius_by_scale
 
 
 def test_empty_memory_fallback_prior_uses_global_tir_structure_context():

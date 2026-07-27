@@ -3,8 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from model import FogRoutedRGBTIRDehazer
-from training.omega_sampler import OmegaSampler
-from training.source_step import compute_source_batch_losses
+from training.source import OmegaSampler, compute_source_batch_losses
 
 
 def _args():
@@ -37,7 +36,7 @@ def test_source_step_produces_single_graph_loss_and_counterfactual_q():
 
 
 def test_route_supervision_counts_only_regions_with_valid_q(monkeypatch):
-    import training.source_step as source_step
+    import training.source as source_step
 
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
     batch = tuple(torch.rand(1, channels, 32, 32) for channels in (3, 3, 3, 1))
@@ -54,7 +53,7 @@ def test_route_supervision_counts_only_regions_with_valid_q(monkeypatch):
             }
 
     def fake_candidates(_model, _context, _owners, _supports, *_args):
-        output = {"pred_clear": torch.zeros(3, 3, 32, 32)}
+        output = torch.zeros(3, 3, 32, 32)
         return output, output
 
     def fake_q(*_args, **_kwargs):
@@ -63,7 +62,7 @@ def test_route_supervision_counts_only_regions_with_valid_q(monkeypatch):
         valid[2, ..., 10:12, 10:12] = 1
         return torch.full_like(valid, 0.5), valid
 
-    monkeypatch.setattr(source_step, "run_counterfactual_chunks", fake_candidates)
+    monkeypatch.setattr(source_step, "_counterfactual_predictions", fake_candidates)
     monkeypatch.setattr(source_step, "compute_q", fake_q)
     result = source_step.compute_source_batch_losses(model, batch, _args(), _Omega(), global_step=1)
 

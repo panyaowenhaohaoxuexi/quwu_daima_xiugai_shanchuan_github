@@ -1,6 +1,6 @@
 import torch
 
-from model.Teacher import FogRoutedRGBTIRDehazer
+from model.fog_routed_dehazer import FogRoutedRGBTIRDehazer
 from training.source_counterfactual import build_counterfactual_routes, detached_context, gather_context
 from training.source_counterfactual import run_counterfactual_pair, run_counterfactual_chunks, compute_q
 

@@ -9,10 +9,7 @@ from PIL import Image
 from torchvision.transforms import functional as TF
 
 from data.data_loader import load_tir_as_float_tensor
-from training.checkpointing import (
-    build_formal_model_from_config, tir_normalization_config_from_checkpoint,
-    validate_checkpoint_metadata,
-)
+from utils.checkpoint import build_model_from_config, require_stage, tir_normalization_config
 
 
 def build_parser():
@@ -24,6 +21,7 @@ def build_parser():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--format", default="png")
     parser.add_argument("--save_aux", action="store_true")
+    parser.add_argument("--ema_model", choices=("student", "teacher"), default="teacher")
     return parser
 
 
@@ -41,7 +39,7 @@ def evaluate_directory(model, config, hazy_dir, tir_dir, output_dir, device, sav
                 raise FileNotFoundError(tir_path)
             with Image.open(hazy_path) as image:
                 hazy = TF.pil_to_tensor(image.convert("RGB")).float().div_(255).unsqueeze(0)
-            tir = load_tir_as_float_tensor(tir_path, tir_normalization_config_from_checkpoint(config)).unsqueeze(0)
+            tir = load_tir_as_float_tensor(tir_path, tir_normalization_config(config)).unsqueeze(0)
             policy = config.get("pair_alignment_policy", "strict")
             if policy not in ("strict", "resize_tir_to_rgb"):
                 raise ValueError(f"unsupported checkpoint pair_alignment_policy={policy!r}")
@@ -66,11 +64,13 @@ def evaluate_directory(model, config, hazy_dir, tir_dir, output_dir, device, sav
 def main(argv=None):
     args = build_parser().parse_args(argv)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    validate_checkpoint_metadata(checkpoint, "source", checkpoint.get("density_gt_semantics"))
+    stage = checkpoint.get("training_stage")
+    if stage not in ("source", "ema"):
+        raise ValueError("checkpoint training_stage must be 'source' or 'ema'")
     config = checkpoint["config"]
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
-    model = build_formal_model_from_config(config).to(device)
-    model.load_state_dict(checkpoint["model"], strict=True)
+    model = build_model_from_config(config).to(device)
+    model.load_state_dict(checkpoint["model"] if stage == "source" else checkpoint[args.ema_model], strict=True)
     model.eval()
     evaluate_directory(model, config, args.hazy_dir, args.tir_dir, args.output_dir, device,
                        args.save_aux, args.format)

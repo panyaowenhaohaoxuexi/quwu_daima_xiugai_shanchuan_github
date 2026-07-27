@@ -9,16 +9,16 @@ def test_model_package_exports_only_formal_model_and_router():
             del sys.modules[name]
 
     package = importlib.import_module("model")
-    teacher_module = importlib.import_module("model.Teacher")
+    teacher_module = importlib.import_module("model.fog_routed_dehazer")
 
     assert package.__all__ == ["FogRoutedRGBTIRDehazer", "MonotonicFogRouter"]
-    assert "model.Teacher" in sys.modules
+    assert "model.fog_routed_dehazer" in sys.modules
     assert package.FogRoutedRGBTIRDehazer is teacher_module.FogRoutedRGBTIRDehazer
 
 
 def test_legacy_model_kd_and_loss_modules_are_removed():
     removed_modules = (
-        "model.fog_routed_dehazer",
+        "model.Teacher",
         "model.cmdn",
         "model.dsfe",
         "model.gumbel_sigmoid",
@@ -42,7 +42,7 @@ def test_legacy_model_kd_and_loss_modules_are_removed():
 
 def test_loss_package_keeps_formal_fog_routed_losses_importable():
     import loss
-    from loss.fog_routed_source_loss import (
+    from loss.common import (
         masked_gradient_error,
         masked_local_ssim_error,
         masked_smooth_l1,
