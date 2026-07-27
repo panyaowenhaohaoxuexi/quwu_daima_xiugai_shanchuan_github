@@ -241,6 +241,7 @@ def test_structure_tir_has_deterministic_query_prior_and_key_value_gradient_path
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2).eval()
     base = _detach_context(model.encode_context(torch.rand(1, 3, 32, 32), torch.rand(1, 3, 32, 32)))
     half = torch.full((1, 1, 32, 32), 0.5)
+    full = torch.ones_like(half)
 
     for target_name, module_name in (("query", "q_proj"), ("prior", "prior"), ("key", "k_proj"), ("value", "v_proj")):
         context = _detach_context(base)
@@ -249,15 +250,31 @@ def test_structure_tir_has_deterministic_query_prior_and_key_value_gradient_path
         block, prior = model.decoder_stages["h2"].blocks[0], model.memory["h2"].prior
         recorded = {}
         target_module = prior if module_name == "prior" else getattr(block, module_name)
-        handle = target_module.register_forward_hook(
-            lambda _m, _values, output: recorded.update(target=output)
-        )
+        handles = [
+            target_module.register_forward_hook(lambda _m, _values, output: recorded.update(target=output)),
+        ]
+        if target_name in ("key", "value"):
+            handles.extend((
+                prior.register_forward_hook(lambda _m, _values, output: recorded.update(prior=output)),
+                model.decoder_stages["h2"].register_forward_pre_hook(
+                    lambda _m, values: recorded.update(stage_appearance=values[1])
+                ),
+            ))
         try:
-            model.decode_with_route(context, route_mode="hard", route_override_value=half,
-                                    route_override_mask=torch.ones_like(half), memory_exclude_mask=torch.ones_like(half))
+            override = full if target_name in ("key", "value") else half
+            output = model.decode_with_route(
+                context, route_mode="hard", route_override_value=override,
+                route_override_mask=full, memory_exclude_mask=full, return_debug=True,
+            )
+            if target_name in ("key", "value"):
+                torch.testing.assert_close(recorded["stage_appearance"], recorded["prior"], atol=0, rtol=0)
+                for scale in ("h16", "h8", "h4", "h2"):
+                    assert torch.count_nonzero(output["debug"]["memory_attention_candidate_count"][scale]) == 0
+                    assert torch.count_nonzero(output["debug"]["memory_stats_by_scale"][scale]["retrieval_gate"]) == 0
             recorded["target"].square().mean().backward()
         finally:
-            handle.remove()
+            for handle in handles:
+                handle.remove()
         assert structure.grad is not None, target_name
         assert torch.isfinite(structure.grad).all(), target_name
         assert structure.grad.abs().sum() > 0, target_name

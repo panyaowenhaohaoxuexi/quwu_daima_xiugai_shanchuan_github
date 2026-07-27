@@ -17,8 +17,8 @@ from option.EMA import (build_ema_checkpoint_config, build_parser, prepare_exper
                         resolve_ema_config, save_config, tir_normalization_config_from_args, validate_config)
 from training.source import OmegaSampler, compute_source_batch_losses
 from utils.checkpoint import (build_ema_checkpoint, build_model_from_config, load_ema_checkpoint,
-                              load_strict_v2_state_dict, require_checkpoint_field, require_checkpoint_format,
-                              require_complete_model_config, require_stage)
+                              load_strict_v2_state_dict, preflight_ema_resume_checkpoint,
+                              preflight_source_initialization_checkpoint)
 
 
 def _set_seed(seed):
@@ -112,9 +112,10 @@ def main(argv=None):
         raise ValueError("EMA requires exactly one of --source_checkpoint or --resume_checkpoint")
     checkpoint = torch.load(raw_args.resume_checkpoint or raw_args.source_checkpoint, map_location="cpu")
     expected_stage = "ema" if raw_args.resume_checkpoint else "source"
-    require_checkpoint_format(checkpoint)
-    require_stage(checkpoint, expected_stage)
-    checkpoint_config = require_complete_model_config(require_checkpoint_field(checkpoint, "config", label="config"))
+    checkpoint_preflight = (preflight_ema_resume_checkpoint(checkpoint)
+                            if expected_stage == "ema"
+                            else preflight_source_initialization_checkpoint(checkpoint))
+    checkpoint_config = checkpoint_preflight["config"]
     args = validate_config(argparse.Namespace(**resolve_ema_config(
         raw_args, checkpoint_config, resume=expected_stage == "ema"
     )))
@@ -123,9 +124,9 @@ def main(argv=None):
     student = build_model_from_config(vars(args)).to(device)
     optimizer = AdamW(student.parameters(), lr=args.learning_rate)
     if expected_stage == "source":
-        load_strict_v2_state_dict(student, require_checkpoint_field(checkpoint, "model", label="Source model state"), label="Source model")
+        load_strict_v2_state_dict(student, checkpoint_preflight["states"]["model"], label="Source model")
         teacher, start_epoch = initialize_teacher(student), 0
-        source_global_step, ema_global_step = int(require_checkpoint_field(checkpoint, "global_step")), 0
+        source_global_step, ema_global_step = checkpoint_preflight["metadata"]["global_step"], 0
     else:
         teacher = initialize_teacher(student)
         restored = load_ema_checkpoint(checkpoint, student, teacher, optimizer)

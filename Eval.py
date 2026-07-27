@@ -10,8 +10,7 @@ from torchvision.transforms import functional as TF
 
 from data.data_loader import COMMON_IMAGE_EXTS, load_tir_as_float_tensor
 from utils.checkpoint import (build_model_from_config, load_strict_v2_state_dict,
-                              require_checkpoint_field, require_checkpoint_format, require_complete_model_config,
-                              require_stage, tir_normalization_config)
+                              preflight_eval_checkpoint, tir_normalization_config)
 
 
 def build_parser():
@@ -101,17 +100,11 @@ def evaluate_directory(model, config, hazy_dir, tir_dir, output_dir, device, sav
 def main(argv=None):
     args = build_parser().parse_args(argv)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    require_checkpoint_format(checkpoint)
-    stage = checkpoint.get("training_stage")
-    if stage not in ("source", "ema"):
-        raise ValueError("checkpoint training_stage must be 'source' or 'ema'")
-    config = require_complete_model_config(require_checkpoint_field(checkpoint, "config", label="config"))
+    checkpoint_preflight = preflight_eval_checkpoint(checkpoint, ema_model=args.ema_model)
+    stage, config = checkpoint_preflight["stage"], checkpoint_preflight["config"]
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     model = build_model_from_config(config).to(device)
-    state_label = "Source model" if stage == "source" else f"EMA {args.ema_model}"
-    state_key = "model" if stage == "source" else args.ema_model
-    load_strict_v2_state_dict(model, require_checkpoint_field(checkpoint, state_key, label=f"{state_label} state"),
-                              label=state_label)
+    load_strict_v2_state_dict(model, checkpoint_preflight["state_dict"], label=checkpoint_preflight["state_label"])
     model.eval()
     evaluate_directory(model, config, args.hazy_dir, args.tir_dir, args.output_dir, device,
                        args.save_aux, args.format)

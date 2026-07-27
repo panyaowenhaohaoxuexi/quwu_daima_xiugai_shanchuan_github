@@ -45,13 +45,23 @@ def _source_args():
 
 def test_cuda_256_complete_source_objective_executes_counterfactual_q_and_backward(monkeypatch):
     torch.cuda.reset_peak_memory_stats()
-    model = FogRoutedRGBTIRDehazer(**{key: _config()[key] for key in MODEL_CONFIG_KEYS}).cuda().train()
     torch.manual_seed(19)
+    torch.cuda.manual_seed_all(19)
+    model = FogRoutedRGBTIRDehazer(**{key: _config()[key] for key in MODEL_CONFIG_KEYS}).cuda().train()
     hazy, clear, tir = (torch.rand(1, 3, 256, 256, device="cuda") for _ in range(3))
     yy, xx = torch.meshgrid(torch.linspace(0, 1, 256, device="cuda"), torch.linspace(0, 1, 256, device="cuda"), indexing="ij")
     density = (0.6 * yy + 0.4 * xx).unsqueeze(0).unsqueeze(0)
     decode_calls, encoder_calls = [], {"hde": 0, "rgb": 0, "tir": 0}
     original_decode = model.decode_with_route
+
+    def all_tensors_detached(value):
+        if torch.is_tensor(value):
+            return not value.requires_grad
+        if isinstance(value, dict):
+            return all(all_tensors_detached(item) for item in value.values())
+        if isinstance(value, (tuple, list)):
+            return all(all_tensors_detached(item) for item in value)
+        return True
 
     def wrapped_decode(*args, **kwargs):
         decode_calls.append({
@@ -59,7 +69,8 @@ def test_cuda_256_complete_source_objective_executes_counterfactual_q_and_backwa
             "route_override_value": kwargs.get("route_override_value"),
             "route_override_mask": kwargs.get("route_override_mask"),
             "memory_exclude_mask": kwargs.get("memory_exclude_mask"),
-            "detached_context": not args[0]["density_map"].requires_grad,
+            "boundary_mode": kwargs.get("boundary_mode"),
+            "detached_context": all_tensors_detached(args[0]),
         })
         return original_decode(*args, **kwargs)
 
@@ -81,12 +92,18 @@ def test_cuda_256_complete_source_objective_executes_counterfactual_q_and_backwa
         for handle in handles:
             handle.remove()
 
-    main = [call for call in decode_calls if call["route_override_value"] is None]
+    main = [call for call in decode_calls if call["route_override_value"] is None and
+            call["route_override_mask"] is None and call["memory_exclude_mask"] is None]
     fusion = [call for call in decode_calls if call["route_override_value"] is not None and
-              torch.count_nonzero(call["route_override_value"]) == 0]
+              torch.count_nonzero(call["route_override_value"]) == 0 and
+              torch.count_nonzero(call["route_override_mask"]) > 0 and
+              torch.count_nonzero(call["memory_exclude_mask"]) == 0]
     completion = [call for call in decode_calls if call["route_override_value"] is not None and
-                  torch.count_nonzero(call["route_override_value"]) > 0]
+                  torch.count_nonzero(call["route_override_value"]) > 0 and
+                  torch.count_nonzero(call["route_override_mask"]) > 0 and
+                  torch.equal(call["memory_exclude_mask"], call["route_override_mask"])]
     assert len(main) >= 1 and len(fusion) >= 1 and len(completion) >= 1
+    assert all(call["route_mode"] == "hard" and call["boundary_mode"] == "soft" for call in decode_calls)
     assert all(call["detached_context"] for call in fusion + completion)
     assert encoder_calls == {"hde": 1, "rgb": 1, "tir": 1}
     assert result["omega"]["omega_support"].shape[0] > 0
@@ -103,7 +120,8 @@ def test_cuda_256_complete_source_objective_executes_counterfactual_q_and_backwa
     assert peak > 0
 
 
-def test_cuda_1024x768_eval_save_aux_preserves_original_resolution(tmp_path):
+@pytest.mark.parametrize("save_aux", (False, True))
+def test_cuda_1024x768_eval_preserves_original_resolution_with_and_without_aux(tmp_path, save_aux):
     from Eval import main
 
     config = _config()
@@ -116,10 +134,22 @@ def test_cuda_1024x768_eval_save_aux_preserves_original_resolution(tmp_path):
     Image.new("RGB", (1024, 768), (80, 80, 80)).save(hazy_dir / "sample.png")
     Image.new("L", (1024, 768), 100).save(tir_dir / "sample.png")
     torch.cuda.reset_peak_memory_stats()
-    main(["--checkpoint", str(checkpoint), "--hazy_dir", str(hazy_dir), "--tir_dir", str(tir_dir),
-          "--output_dir", str(out_dir), "--device", "cuda", "--save_aux"])
-    assert Image.open(out_dir / "sample.png").size == (1024, 768)
-    assert (out_dir / "aux" / "sample_density_map.png").is_file()
+    argv = ["--checkpoint", str(checkpoint), "--hazy_dir", str(hazy_dir), "--tir_dir", str(tir_dir),
+            "--output_dir", str(out_dir), "--device", "cuda"]
+    if save_aux:
+        argv.append("--save_aux")
+    main(argv)
+    with Image.open(out_dir / "sample.png") as prediction:
+        assert prediction.size == (1024, 768)
+        prediction.verify()
+    aux_dir = out_dir / "aux"
+    aux_files = tuple(aux_dir.glob("sample_*.png")) if aux_dir.exists() else ()
+    if save_aux:
+        assert {path.name for path in aux_files} == {
+            "sample_density_map.png", "sample_route_soft.png", "sample_route_hard.png", "sample_boundary_map.png",
+        }
+    else:
+        assert not aux_files
     peak = torch.cuda.max_memory_allocated()
-    print(f"cuda_peak_1024_eval_bytes={peak}")
+    print(f"cuda_peak_1024_eval_save_aux_{save_aux}_bytes={peak}")
     assert peak > 0

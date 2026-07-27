@@ -1,6 +1,8 @@
 """Small strict checkpoints for Source, EMA and unified evaluation."""
 
+import math
 from collections.abc import Mapping
+from numbers import Integral, Real
 
 import torch
 
@@ -28,8 +30,8 @@ def require_checkpoint_format(checkpoint):
 
 
 def load_strict_v2_state_dict(model, state_dict, *, label):
-    if not isinstance(state_dict, dict):
-        raise TypeError(f"{label} state_dict must be a dictionary")
+    if not isinstance(state_dict, Mapping):
+        raise TypeError(f"{label} state_dict must be a mapping")
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as exc:
@@ -50,6 +52,92 @@ def require_checkpoint_field(checkpoint, key, *, label=None):
     if key not in checkpoint:
         raise ValueError(f"checkpoint lacks {label or key}")
     return checkpoint[key]
+
+
+def require_state_dict_field(checkpoint, key, *, label):
+    """Validate a serialized state before any model construction occurs."""
+    state_dict = require_checkpoint_field(checkpoint, key, label=f"{label} state")
+    if not isinstance(state_dict, Mapping):
+        raise TypeError(f"{label} state_dict must be a mapping")
+    if not state_dict:
+        raise ValueError(f"{label} state_dict must not be empty")
+    return state_dict
+
+
+def require_integer_checkpoint_field(checkpoint, key, *, label=None):
+    value = require_checkpoint_field(checkpoint, key, label=label or key)
+    if isinstance(value, bool):
+        raise TypeError(f"{label or key} must be an integer, received {value!r}")
+    if isinstance(value, Real) and not isinstance(value, Integral):
+        numeric = float(value)
+        if not math.isfinite(numeric) or not numeric.is_integer():
+            raise TypeError(f"{label or key} must be an integer, received {value!r}")
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TypeError(f"{label or key} must be an integer, received {value!r}") from exc
+
+
+def require_optimizer_state_field(checkpoint, *, label):
+    optimizer_state = require_checkpoint_field(checkpoint, "optimizer", label=f"{label} optimizer state")
+    if not isinstance(optimizer_state, Mapping):
+        raise TypeError(f"{label} optimizer state must be a mapping")
+    return optimizer_state
+
+
+def _preflight_checkpoint(checkpoint, *, stage, state_fields, integer_fields, optimizer_label=None):
+    """Pure formal checkpoint validation shared by entries and strict loaders."""
+    require_checkpoint_format(checkpoint)
+    require_stage(checkpoint, stage)
+    config = require_complete_model_config(require_checkpoint_field(checkpoint, "config", label="config"))
+    states = {
+        key: require_state_dict_field(checkpoint, key, label=label)
+        for key, label in state_fields.items()
+    }
+    metadata = {
+        key: require_integer_checkpoint_field(checkpoint, key)
+        for key in integer_fields
+    }
+    optimizer_state = (
+        require_optimizer_state_field(checkpoint, label=optimizer_label)
+        if optimizer_label is not None else None
+    )
+    return {"config": config, "states": states, "metadata": metadata,
+            "optimizer_state": optimizer_state}
+
+
+def preflight_source_resume_checkpoint(checkpoint):
+    return _preflight_checkpoint(
+        checkpoint, stage="source", state_fields={"model": "Source model"},
+        integer_fields=("epoch", "global_step"), optimizer_label="Source",
+    )
+
+
+def preflight_source_initialization_checkpoint(checkpoint):
+    return _preflight_checkpoint(
+        checkpoint, stage="source", state_fields={"model": "Source model"},
+        integer_fields=("global_step",),
+    )
+
+
+def preflight_ema_resume_checkpoint(checkpoint):
+    return _preflight_checkpoint(
+        checkpoint, stage="ema", state_fields={"student": "EMA student", "teacher": "EMA teacher"},
+        integer_fields=("epoch", "source_global_step", "ema_global_step"), optimizer_label="EMA",
+    )
+
+
+def preflight_eval_checkpoint(checkpoint, *, ema_model):
+    require_checkpoint_format(checkpoint)
+    stage = checkpoint.get("training_stage")
+    if stage not in ("source", "ema"):
+        raise ValueError("checkpoint training_stage must be 'source' or 'ema'")
+    config = require_complete_model_config(require_checkpoint_field(checkpoint, "config", label="config"))
+    state_key = "model" if stage == "source" else ema_model
+    state_label = "Source model" if stage == "source" else f"EMA {ema_model}"
+    return {"stage": stage, "config": config, "state_key": state_key,
+            "state_label": state_label,
+            "state_dict": require_state_dict_field(checkpoint, state_key, label=state_label)}
 
 
 def build_model_from_config(config):
@@ -79,35 +167,37 @@ def require_stage(checkpoint, stage):
 
 
 def load_source_checkpoint(checkpoint, model, optimizer=None):
-    require_checkpoint_format(checkpoint)
-    require_stage(checkpoint, "source")
-    require_complete_model_config(require_checkpoint_field(checkpoint, "config", label="config"))
-    load_strict_v2_state_dict(model, require_checkpoint_field(checkpoint, "model", label="Source model state"), label="Source model")
+    preflight = preflight_source_resume_checkpoint(checkpoint) if optimizer is not None else _preflight_checkpoint(
+        checkpoint, stage="source", state_fields={"model": "Source model"},
+        integer_fields=("epoch", "global_step"),
+    )
+    load_strict_v2_state_dict(model, preflight["states"]["model"], label="Source model")
     if optimizer is not None:
         try:
-            optimizer.load_state_dict(require_checkpoint_field(checkpoint, "optimizer", label="Source optimizer state"))
-        except (TypeError, RuntimeError, ValueError) as exc:
+            optimizer.load_state_dict(preflight["optimizer_state"])
+        except (KeyError, TypeError, RuntimeError, ValueError) as exc:
             raise RuntimeError("Source optimizer state is incompatible") from exc
-    return {"epoch": int(require_checkpoint_field(checkpoint, "epoch")),
-            "global_step": int(require_checkpoint_field(checkpoint, "global_step"))}
+    return {"epoch": preflight["metadata"]["epoch"],
+            "global_step": preflight["metadata"]["global_step"]}
 
 
 def load_ema_checkpoint(checkpoint, student, teacher, optimizer=None):
-    require_checkpoint_format(checkpoint)
-    require_stage(checkpoint, "ema")
-    require_complete_model_config(require_checkpoint_field(checkpoint, "config", label="config"))
-    load_strict_v2_state_dict(student, require_checkpoint_field(checkpoint, "student", label="EMA student state"), label="EMA student")
-    load_strict_v2_state_dict(teacher, require_checkpoint_field(checkpoint, "teacher", label="EMA teacher state"), label="EMA teacher")
+    preflight = preflight_ema_resume_checkpoint(checkpoint) if optimizer is not None else _preflight_checkpoint(
+        checkpoint, stage="ema", state_fields={"student": "EMA student", "teacher": "EMA teacher"},
+        integer_fields=("epoch", "source_global_step", "ema_global_step"),
+    )
+    load_strict_v2_state_dict(student, preflight["states"]["student"], label="EMA student")
+    load_strict_v2_state_dict(teacher, preflight["states"]["teacher"], label="EMA teacher")
     for parameter in teacher.parameters():
         parameter.requires_grad_(False)
     if optimizer is not None:
         try:
-            optimizer.load_state_dict(require_checkpoint_field(checkpoint, "optimizer", label="EMA optimizer state"))
-        except (TypeError, RuntimeError, ValueError) as exc:
+            optimizer.load_state_dict(preflight["optimizer_state"])
+        except (KeyError, TypeError, RuntimeError, ValueError) as exc:
             raise RuntimeError("EMA optimizer state is incompatible") from exc
-    return {"epoch": int(require_checkpoint_field(checkpoint, "epoch")),
-            "source_global_step": int(require_checkpoint_field(checkpoint, "source_global_step")),
-            "ema_global_step": int(require_checkpoint_field(checkpoint, "ema_global_step"))}
+    return {"epoch": preflight["metadata"]["epoch"],
+            "source_global_step": preflight["metadata"]["source_global_step"],
+            "ema_global_step": preflight["metadata"]["ema_global_step"]}
 
 
 def tir_normalization_config(config):

@@ -4,16 +4,26 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Mapping
 
 import torch
 
-from utils.checkpoint import CHECKPOINT_FORMAT_VERSION, MODEL_CONFIG_KEYS
+from utils.checkpoint import CHECKPOINT_FORMAT_VERSION, MODEL_CONFIG_KEYS, require_complete_model_config
 
 
 def _is_nonempty_tensor_state(value):
-    return (isinstance(value, dict) and bool(value) and all(
+    return (isinstance(value, Mapping) and bool(value) and all(
         isinstance(key, str) and torch.is_tensor(tensor) for key, tensor in value.items()
     ))
+
+
+def _has_valid_model_config(config):
+    """Static schema validation only; this tool never constructs or loads a model."""
+    try:
+        require_complete_model_config(config)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def extract_state_dict(checkpoint):
@@ -64,10 +74,12 @@ def main(argv=None):
               "format_version": checkpoint.get("format_version") if isinstance(checkpoint, dict) else None,
               "has_v2_format": isinstance(checkpoint, dict) and checkpoint.get("format_version") == CHECKPOINT_FORMAT_VERSION,
               "has_valid_training_stage": stage in ("source", "ema"),
-              "has_complete_model_config": isinstance(config, dict) and all(key in config for key in MODEL_CONFIG_KEYS),
+              "has_complete_model_config": isinstance(config, Mapping) and all(key in config for key in MODEL_CONFIG_KEYS),
+              "has_valid_model_config": _has_valid_model_config(config),
               "has_expected_state_dict_fields": expected_states and state_fields_are_tensors}
     report["is_formal_v2_compatible"] = all((report["has_v2_format"], report["has_valid_training_stage"],
-                                              report["has_complete_model_config"], report["has_expected_state_dict_fields"]))
+                                              report["has_complete_model_config"], report["has_valid_model_config"],
+                                              report["has_expected_state_dict_fields"]))
     if args.reference_checkpoint:
         reference = extract_state_dict(torch.load(args.reference_checkpoint, map_location="cpu"))
         report.update(compare_state_dicts(state, reference))

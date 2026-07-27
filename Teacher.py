@@ -14,8 +14,7 @@ from option.Teacher import (build_parser, persisted_config_from_args, prepare_ex
                             save_config, tir_normalization_config_from_args, validate_config)
 from training.source import OmegaSampler, compute_source_batch_losses
 from utils.checkpoint import (build_model_from_config, build_source_checkpoint, load_source_checkpoint,
-                              require_checkpoint_field, require_checkpoint_format, require_complete_model_config,
-                              require_stage)
+                              preflight_source_resume_checkpoint)
 from utils.metrics import psnr, ssim_global
 from utils.visualize_fog_routed import build_diagnostic_panel
 
@@ -62,9 +61,8 @@ def main(argv=None):
     raw_args = build_parser().parse_args(argv)
     resume = torch.load(raw_args.resume_checkpoint, map_location="cpu") if raw_args.resume_checkpoint else None
     if resume is not None:
-        require_checkpoint_format(resume)
-        require_stage(resume, "source")
-        checkpoint_config = require_complete_model_config(require_checkpoint_field(resume, "config", label="config"))
+        resume_preflight = preflight_source_resume_checkpoint(resume)
+        checkpoint_config = resume_preflight["config"]
         resumed_config = resolve_source_resume_config(raw_args, checkpoint_config)
         resumed_config["_resume_checkpoint_semantics"] = True
         args = validate_config(argparse.Namespace(**resumed_config))
