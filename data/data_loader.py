@@ -14,7 +14,7 @@ from torchvision.transforms import functional as TF
 
 
 COMMON_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
-SYNTH_IMAGE_EXTS = (".png", ".jpg", ".jpeg")
+SYNTH_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 DEFAULT_HAZE_LEVELS = ("mist", "middle", "dense")
 
 
@@ -46,6 +46,11 @@ def _array_to_unit_float(array, *, path, normalization="dtype_range", fixed_min=
         elif np.issubdtype(array.dtype, np.uint16):
             output = array.astype(np.float32) / 65535.0
         elif np.issubdtype(array.dtype, np.signedinteger) and known_integer_bits == 16:
+            if array.min() < 0 or array.max() > 65535:
+                raise ValueError(
+                    f"invalid unsigned 16-bit range in {path}: "
+                    f"min={array.min()}, max={array.max()}"
+                )
             output = array.astype(np.float32) / 65535.0
         elif np.issubdtype(array.dtype, np.floating):
             output = array.astype(np.float32)
@@ -106,6 +111,10 @@ def load_tir_as_float_tensor(path, normalization_config: Optional[Mapping] = Non
 
     def normalize_one_channel(raw):
         raw = np.asarray(raw)
+        if not raw.size:
+            raise ValueError(f"empty image: {path}")
+        if not np.isfinite(raw).all():
+            raise ValueError(f"non-finite values in {path}")
         if normalization != "percentile":
             return _array_to_unit_float(
                 raw, path=path, normalization=normalization, fixed_min=config.get("fixed_min"),
@@ -170,13 +179,15 @@ def _list_image_files(directory, extensions):
 
 
 def _stem_index(directory, extensions):
-    priority = {extension: index for index, extension in enumerate(extensions)}
     result = {}
     for name in _list_image_files(directory, extensions):
         stem = os.path.splitext(name)[0].lower()
         result.setdefault(stem, []).append(os.path.join(directory, name))
-    for paths in result.values():
-        paths.sort(key=lambda path: (priority[os.path.splitext(path)[1].lower()], os.path.basename(path).lower()))
+    for stem, paths in result.items():
+        if len(paths) > 1:
+            raise ValueError(
+                f"duplicate stem in {directory}: stem={stem}, candidates={sorted(paths)}"
+            )
     return result
 
 
@@ -218,6 +229,7 @@ class SynthMultiModalDataset(data.Dataset):
         for level in self.haze_levels:
             density_index = _stem_index(os.path.join(root, "Transmission_Map_GT", level), SYNTH_IMAGE_EXTS)
             hazy_dir = os.path.join(root, "hazy", level)
+            _stem_index(hazy_dir, SYNTH_IMAGE_EXTS)
             for filename in _list_image_files(hazy_dir, SYNTH_IMAGE_EXTS):
                 stem = os.path.splitext(filename)[0]
                 clear_path, _ = _lookup_stem(clear_index, stem)

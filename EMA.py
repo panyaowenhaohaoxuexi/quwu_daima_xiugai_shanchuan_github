@@ -2,9 +2,11 @@
 
 import argparse
 import copy
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -16,6 +18,12 @@ from option.EMA import (build_ema_checkpoint_config, build_parser, prepare_exper
 from training.source import OmegaSampler, compute_source_batch_losses
 from utils.checkpoint import (build_ema_checkpoint, build_model_from_config, load_ema_checkpoint,
                               require_stage)
+
+
+def _set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def set_batchnorm_eval(module):
@@ -107,8 +115,7 @@ def main(argv=None):
     args = validate_config(argparse.Namespace(**resolve_ema_config(
         raw_args, checkpoint["config"], resume=expected_stage == "ema"
     )))
-    prepare_experiment_dirs(args)
-    save_config(args)
+    _set_seed(args.model_init_seed)
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     student = build_model_from_config(vars(args)).to(device)
     optimizer = AdamW(student.parameters(), lr=args.learning_rate)
@@ -122,6 +129,9 @@ def main(argv=None):
         start_epoch, source_global_step, ema_global_step = restored["epoch"], restored["source_global_step"], restored["ema_global_step"]
         for param_group in optimizer.param_groups:
             param_group["lr"] = args.learning_rate
+    geometry_generator = torch.Generator().manual_seed(args.model_init_seed + 201)
+    omega_generator = torch.Generator(device=device).manual_seed(args.model_init_seed + 101)
+    omega_sampler = OmegaSampler(args.omega_regions_per_image, args.omega_min_area, args.omega_max_area, args.model_init_seed)
     real_dataset = RealMultiModalDataset(f"{args.real_data_dir}/hazy", f"{args.real_data_dir}/tir",
                                          pair_alignment_policy=args.pair_alignment_policy,
                                          tir_normalization_config=tir_normalization_config_from_args(args))
@@ -133,9 +143,8 @@ def main(argv=None):
         augmentation_seed_base=args.model_init_seed)
     real_loader = DataLoader(real_dataset, batch_size=args.real_batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_real)
     source_loader = DataLoader(source_dataset, batch_size=args.source_anchor_batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_synth)
-    geometry_generator = torch.Generator(device=device).manual_seed(args.model_init_seed + 201)
-    omega_generator = torch.Generator(device=device).manual_seed(args.model_init_seed + 101)
-    omega_sampler = OmegaSampler(args.omega_regions_per_image, args.omega_min_area, args.omega_max_area, args.model_init_seed)
+    prepare_experiment_dirs(args)
+    save_config(args)
     empty_omega_streak = 0
     for epoch in range(start_epoch, args.epochs):
         source_dataset.set_sampler_epoch(epoch)

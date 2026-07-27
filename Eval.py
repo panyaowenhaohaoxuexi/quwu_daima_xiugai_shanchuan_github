@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from PIL import Image
 from torchvision.transforms import functional as TF
 
-from data.data_loader import load_tir_as_float_tensor
+from data.data_loader import COMMON_IMAGE_EXTS, load_tir_as_float_tensor
 from utils.checkpoint import build_model_from_config, require_stage, tir_normalization_config
 
 
@@ -25,18 +25,41 @@ def build_parser():
     return parser
 
 
+def _image_paths(directory):
+    return sorted(
+        path for path in Path(directory).iterdir()
+        if path.is_file() and path.suffix.lower() in COMMON_IMAGE_EXTS
+    )
+
+
+def _tir_stem_index(tir_dir):
+    index = {}
+    for path in _image_paths(tir_dir):
+        index.setdefault(path.stem.lower(), []).append(path)
+    return index
+
+
+def _resolve_tir_path(index, hazy_path):
+    stem = hazy_path.stem.lower()
+    candidates = index.get(stem, [])
+    if not candidates:
+        raise FileNotFoundError(f"missing TIR pair for stem={stem}: hazy_path={hazy_path}")
+    if len(candidates) > 1:
+        raise ValueError(f"ambiguous TIR pair for stem={stem}: candidates={[str(path) for path in candidates]}")
+    return candidates[0]
+
+
 def evaluate_directory(model, config, hazy_dir, tir_dir, output_dir, device, save_aux=False, image_format="png"):
-    """Shared strict original-resolution inference used by Eval and Eval_EMA."""
+    """Strict original-resolution inference for Source and EMA checkpoints."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     aux_dir = output_dir / "aux"
     if save_aux:
         aux_dir.mkdir(parents=True, exist_ok=True)
+    tir_index = _tir_stem_index(tir_dir)
     with torch.inference_mode():
-        for hazy_path in sorted(Path(hazy_dir).glob("*")):
-            tir_path = Path(tir_dir) / hazy_path.name
-            if not tir_path.is_file():
-                raise FileNotFoundError(tir_path)
+        for hazy_path in _image_paths(hazy_dir):
+            tir_path = _resolve_tir_path(tir_index, hazy_path)
             with Image.open(hazy_path) as image:
                 hazy = TF.pil_to_tensor(image.convert("RGB")).float().div_(255).unsqueeze(0)
             tir = load_tir_as_float_tensor(tir_path, tir_normalization_config(config)).unsqueeze(0)

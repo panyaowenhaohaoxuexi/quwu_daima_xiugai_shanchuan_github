@@ -150,6 +150,77 @@ def test_tir_constant_per_image_percentile_is_finite_zero(tmp_path):
     assert torch.equal(tir, torch.zeros_like(tir))
 
 
+@pytest.mark.parametrize("invalid", [np.array([], dtype=np.float32), np.array([[np.nan]], dtype=np.float32), np.array([[np.inf]], dtype=np.float32)])
+def test_tir_every_normalization_path_rejects_empty_and_nonfinite_values(monkeypatch, invalid):
+    import data.data_loader as loader
+
+    monkeypatch.setattr(loader, "_open_preserving_known_bit_depth", lambda _path: ("F", invalid, None))
+    for config in ({"normalization": "dtype_range"}, {"normalization": "fixed_range", "fixed_min": 0, "fixed_max": 1},
+                   {"normalization": "percentile", "percentile_scope": "per_image"}):
+        with pytest.raises(ValueError, match="invalid-tir"):
+            loader.load_tir_as_float_tensor("invalid-tir", config)
+
+
+def test_signed_16_container_rejects_values_outside_unsigned_range():
+    import data.data_loader as loader
+
+    with pytest.raises(ValueError, match="invalid unsigned 16-bit range in signed-16"):
+        loader._array_to_unit_float(np.array([[-1, 3]], dtype=np.int32), path="signed-16", known_integer_bits=16)
+    with pytest.raises(ValueError, match="max=70000"):
+        loader._array_to_unit_float(np.array([[70000]], dtype=np.int32), path="signed-16", known_integer_bits=16)
+
+
+def test_synth_dataset_pairs_tiff_tir_and_density_by_stem(tmp_path):
+    for directory in ("clear", "ir", "hazy/mist", "Transmission_Map_GT/mist"):
+        (tmp_path / directory).mkdir(parents=True, exist_ok=True)
+    _write_rgb(tmp_path / "clear" / "sample.png", value=20)
+    _write_rgb(tmp_path / "hazy" / "mist" / "sample.png", value=40)
+    Image.fromarray(np.full((7, 9), 1000, dtype=np.uint16), mode="I;16").save(tmp_path / "ir" / "sample.tiff")
+    Image.fromarray(np.full((7, 9), 50000, dtype=np.uint16), mode="I;16").save(
+        tmp_path / "Transmission_Map_GT" / "mist" / "sample.tif"
+    )
+
+    dataset = SynthMultiModalDataset(str(tmp_path), train=False, haze_levels=("mist",))
+    assert len(dataset) == 1
+    assert dataset[0][2].shape == (3, 7, 9)
+
+
+@pytest.mark.parametrize("directory", ["clear", "ir", "Transmission_Map_GT/mist", "hazy/mist"])
+def test_synth_dataset_rejects_duplicate_stems_within_one_directory(tmp_path, directory):
+    for parent in ("clear", "ir", "hazy/mist", "Transmission_Map_GT/mist"):
+        (tmp_path / parent).mkdir(parents=True, exist_ok=True)
+    _write_rgb(tmp_path / "clear" / "sample.png", value=20)
+    _write_rgb(tmp_path / "ir" / "sample.png", value=30)
+    _write_rgb(tmp_path / "hazy" / "mist" / "sample.png", value=40)
+    Image.fromarray(np.full((7, 9), 50000, dtype=np.uint16), mode="I;16").save(
+        tmp_path / "Transmission_Map_GT" / "mist" / "sample.png"
+    )
+    filenames = ("sample.png", "sample.tiff") if directory == "Transmission_Map_GT/mist" else ("sample.png", "sample.jpg")
+    for filename in filenames:
+        path = tmp_path / directory / filename
+        if directory == "Transmission_Map_GT/mist":
+            Image.fromarray(np.full((7, 9), 50000, dtype=np.uint16), mode="I;16").save(path)
+        else:
+            _write_rgb(path, value=50)
+
+    with pytest.raises(ValueError, match="duplicate stem.*sample"):
+        SynthMultiModalDataset(str(tmp_path), train=False, haze_levels=("mist",))
+
+
+def test_same_stem_in_different_haze_levels_remains_valid(tmp_path):
+    for directory in ("clear", "ir", "hazy/mist", "hazy/dense", "Transmission_Map_GT/mist", "Transmission_Map_GT/dense"):
+        (tmp_path / directory).mkdir(parents=True, exist_ok=True)
+    _write_rgb(tmp_path / "clear" / "sample.png", value=20)
+    _write_rgb(tmp_path / "ir" / "sample.png", value=30)
+    for level in ("mist", "dense"):
+        _write_rgb(tmp_path / "hazy" / level / "sample.png", value=40)
+        Image.fromarray(np.full((7, 9), 50000, dtype=np.uint16), mode="I;16").save(
+            tmp_path / "Transmission_Map_GT" / level / "sample.png"
+        )
+
+    assert len(SynthMultiModalDataset(str(tmp_path), train=False, haze_levels=("mist", "dense"))) == 2
+
+
 def test_synth_training_geometry_preserves_aspect_ratio_and_eval_keeps_original_size(tmp_path):
     for directory in ("clear", "ir", "hazy/mist", "Transmission_Map_GT/mist"):
         (tmp_path / directory).mkdir(parents=True, exist_ok=True)

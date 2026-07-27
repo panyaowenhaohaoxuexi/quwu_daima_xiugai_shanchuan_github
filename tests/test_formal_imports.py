@@ -1,6 +1,7 @@
 import importlib
 import importlib.util
 import sys
+from pathlib import Path
 
 
 def test_model_package_exports_only_formal_model_and_router():
@@ -100,3 +101,14 @@ def test_teacher_model_imports_and_strict_state_dict_are_self_consistent():
     expected, actual = reference(rgb, tir, route_mode="hard"), restored(rgb, tir, route_mode="hard")
     for key in expected:
         torch.testing.assert_close(expected[key], actual[key], rtol=0, atol=0)
+
+
+def test_readme_distinguishes_training_entrypoints_model_definition_and_formal_command():
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert "`Teacher.py`" in readme and "Source" in readme
+    assert "`model/Teacher.py`" in readme and "FogRoutedRGBTIRDehazer" in readme
+    assert "`EMA.py`" in readme and "`Eval.py`" in readme
+    assert "not a third training stage" in readme
+    assert "model/fog_routed_dehazer.py" in readme and "does not exist" in readme
+    assert "--formal_training" in readme
