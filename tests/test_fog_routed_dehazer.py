@@ -1,5 +1,6 @@
 import torch
 import inspect
+from torch.nn import functional as F
 
 from model.Teacher import MemoryRetriever, FogRoutedRGBTIRDehazer, appearance_receptive_field_radius_by_scale
 
@@ -140,8 +141,12 @@ def test_transformer_stage_and_projection_hooks_keep_structure_query_and_appeara
     captured = {}
     handles = [
         stage.register_forward_pre_hook(lambda _module, values: captured.update(
-            stage_structure=values[0].detach(), stage_appearance=values[1].detach())),
+            stage_structure=values[0].detach(), stage_appearance=values[1].detach(), stage_validity=values[2].detach())),
+        block.structure_norm.register_forward_pre_hook(lambda _module, values: captured.update(
+            structure_norm_raw=values[0].detach())),
         block.structure_norm.register_forward_hook(lambda _module, values, output: captured.update(q_norm=output.detach())),
+        block.appearance_norm.register_forward_pre_hook(lambda _module, values: captured.update(
+            appearance_norm_raw=values[0].detach())),
         block.appearance_norm.register_forward_hook(lambda _module, values, output: captured.update(kv_norm=output.detach())),
         block.q_proj.register_forward_pre_hook(lambda _module, values: captured.update(q_proj=values[0].detach())),
         block.k_proj.register_forward_pre_hook(lambda _module, values: captured.update(k_proj=values[0].detach())),
@@ -153,6 +158,17 @@ def test_transformer_stage_and_projection_hooks_keep_structure_query_and_appeara
     finally:
         for handle in handles:
             handle.remove()
+    stage_validity = captured["stage_validity"]
+    height, width = captured["stage_structure"].shape[-2:]
+    pad_h, pad_w = (-height) % block.window_size, (-width) % block.window_size
+
+    def window_tokens(feature):
+        padded = F.pad(feature, (0, pad_w, 0, pad_h)) * F.pad(stage_validity, (0, pad_w, 0, pad_h))
+        tokens = padded.permute(0, 2, 3, 1).reshape(padded.shape[0], -1, padded.shape[1])
+        return block._partition(tokens, padded.shape[-2], padded.shape[-1])
+
+    torch.testing.assert_close(captured["structure_norm_raw"], window_tokens(captured["stage_structure"]))
+    torch.testing.assert_close(captured["appearance_norm_raw"], window_tokens(captured["stage_appearance"]))
     torch.testing.assert_close(captured["q_proj"], captured["q_norm"])
     torch.testing.assert_close(captured["k_proj"], captured["kv_norm"])
     torch.testing.assert_close(captured["v_proj"], captured["kv_norm"])
@@ -192,33 +208,59 @@ def test_content_only_completion_change_keeps_prior_and_transformer_key_value_in
         torch.testing.assert_close(actual[key], reference[key], atol=0, rtol=0)
 
 
+def test_content_tir_has_a_deterministic_completion_to_query_projection_gradient_path():
+    from training.source import _detach_context
+
+    torch.manual_seed(53)
+    model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2).eval()
+    context = _detach_context(model.encode_context(torch.rand(1, 3, 32, 32), torch.rand(1, 3, 32, 32)))
+    content = context["tir_content_pyramid"]["h2"].detach().clone().requires_grad_(True)
+    context["tir_content_pyramid"]["h2"] = content
+    full = torch.ones(1, 1, 32, 32)
+    block = model.decoder_stages["h2"].blocks[0]
+    recorded = {}
+    handles = [
+        block.q_proj.register_forward_hook(lambda _m, _values, output: recorded.update(q_output=output)),
+    ]
+    try:
+        model.decode_with_route(context, route_mode="hard", route_override_value=full,
+                                route_override_mask=full, memory_exclude_mask=full)
+        recorded["q_output"].square().mean().backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert content.grad is not None
+    assert torch.isfinite(content.grad).all()
+    assert content.grad.abs().sum() > 0
+
+
 def test_structure_tir_has_deterministic_query_prior_and_key_value_gradient_paths():
     from training.source import _detach_context
 
     torch.manual_seed(47)
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2).eval()
-    context = _detach_context(model.encode_context(torch.rand(1, 3, 32, 32), torch.rand(1, 3, 32, 32)))
-    structure = context["tir_structure_pyramid"]["h2"].detach().clone().requires_grad_(True)
-    context["tir_structure_pyramid"]["h2"] = structure
-    full = torch.ones(1, 1, 32, 32)
-    block, prior = model.decoder_stages["h2"].blocks[0], model.memory["h2"].prior
-    recorded = {}
-    handles = [
-        block.structure_norm.register_forward_hook(lambda _m, values, output: recorded.update(q=output)),
-        prior.register_forward_hook(lambda _m, values, output: recorded.update(prior=output)),
-        block.k_proj.register_forward_pre_hook(lambda _m, values: recorded.update(k=values[0])),
-        block.v_proj.register_forward_pre_hook(lambda _m, values: recorded.update(v=values[0])),
-    ]
-    try:
-        model.decode_with_route(context, route_mode="hard", route_override_value=full,
-                                route_override_mask=full, memory_exclude_mask=full)
-        (recorded["q"].square().mean() + recorded["prior"].square().mean() +
-         recorded["k"].square().mean() + recorded["v"].square().mean()).backward()
-    finally:
-        for handle in handles:
+    base = _detach_context(model.encode_context(torch.rand(1, 3, 32, 32), torch.rand(1, 3, 32, 32)))
+    half = torch.full((1, 1, 32, 32), 0.5)
+
+    for target_name, module_name in (("query", "q_proj"), ("prior", "prior"), ("key", "k_proj"), ("value", "v_proj")):
+        context = _detach_context(base)
+        structure = context["tir_structure_pyramid"]["h2"].detach().clone().requires_grad_(True)
+        context["tir_structure_pyramid"]["h2"] = structure
+        block, prior = model.decoder_stages["h2"].blocks[0], model.memory["h2"].prior
+        recorded = {}
+        target_module = prior if module_name == "prior" else getattr(block, module_name)
+        handle = target_module.register_forward_hook(
+            lambda _m, _values, output: recorded.update(target=output)
+        )
+        try:
+            model.decode_with_route(context, route_mode="hard", route_override_value=half,
+                                    route_override_mask=torch.ones_like(half), memory_exclude_mask=torch.ones_like(half))
+            recorded["target"].square().mean().backward()
+        finally:
             handle.remove()
-    assert structure.grad is not None and torch.isfinite(structure.grad).all()
-    assert structure.grad.abs().sum() > 0
+        assert structure.grad is not None, target_name
+        assert torch.isfinite(structure.grad).all(), target_name
+        assert structure.grad.abs().sum() > 0, target_name
 
 
 def test_full_completion_with_excluded_memory_has_no_rgb_feature_gradient():

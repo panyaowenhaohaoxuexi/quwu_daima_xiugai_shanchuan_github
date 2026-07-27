@@ -30,7 +30,7 @@ The synthetic root contains `clear/`, `ir/`, `hazy/<level>/`, and `Transmission_
 
 ## Structure--appearance Transformer decoder
 
-The single decoder is a multi-scale structure--appearance cross-attention Transformer decoder. At each scale, the routed structural feature initializes or updates the decoder query state, while the assembled appearance feature serves as Key and Value. h16 starts from routed structure; h8/h4/h2 add the projected, upsampled deeper decoded state to their structural query state. TIR content is never passed directly as a Transformer Value: completion appearance is generated only by the TIR-conditioned prior, while reliable fusion appearance is retrieved from RGB memory.
+The single decoder is a multi-scale structure--appearance cross-attention Transformer decoder. At each scale, the routed structural feature initializes or updates the decoder query state, while the assembled appearance feature serves as Key and Value. h16 starts from routed structure; h8/h4/h2 add the projected, upsampled deeper decoded state to their structural query state. TIR content is never passed directly as a Transformer Value. In completion regions, appearance is assembled by continuously blending RGB appearance retrieved from reliable fusion memory with a TIR-conditioned appearance prior; the prior dominates when reliable memory is absent or retrieval confidence is low.
 
 Each stage uses pre-norm multi-head window cross-attention, learnable 2-D relative-position bias, residual connections and GELU FFN blocks. Windows are right/bottom padded with validity masks and processed in configurable batches (`--decoder_window_chunk_size`), giving bounded local attention rather than a high-resolution global `HW x HW` matrix.
 

@@ -493,9 +493,11 @@
 - Window batches are chunked by `decoder_window_chunk_size`, so high-resolution
   scales do not materialize a global spatial attention matrix. Invalid windows,
   attention, FFN residuals and stage outputs are explicitly zeroed.
-- Appearance retrieval now uses a continuous confidence/ratio/coverage gate;
-  empty memory, padding and absent candidates produce a strict zero gate.
-  Fallback remains a diagnostic mask only.
+- Appearance retrieval now uses a continuous confidence/ratio/coverage gate to
+  blend reliable RGB fusion-memory appearance with a TIR-conditioned prior;
+  the prior dominates when memory is absent or confidence is low. Empty memory,
+  padding and absent candidates produce a strict zero gate. Fallback remains a
+  diagnostic mask only.
 - Formal Source/EMA/Eval checkpoint loading requires format version 2,
   complete decoder configuration and strict state-dict loading. Legacy
   inspection remains read-only and reports only static compatibility; it does

@@ -15,6 +15,7 @@ from .hde import HDE
 from .monotonic_router import MonotonicFogRouter
 from .appearance_memory import MemoryRetriever, TIRConditionedAppearancePrior
 from .structure_appearance_transformer import StructureAppearanceTransformerStage
+from utils.model_config_validation import require_positive_integer, validate_model_config_values
 
 
 def _groups(channels):
@@ -133,29 +134,25 @@ class FogRoutedRGBTIRDehazer(nn.Module):
                  decoder_mlp_ratio=4.0, decoder_attention_dropout=0.0,
                  decoder_projection_dropout=0.0, decoder_ffn_dropout=0.0):
         super().__init__()
-        if memory_max_tokens < 1 or not (2 <= memory_topk <= memory_max_tokens):
-            raise ValueError("require 2 <= memory_topk <= memory_max_tokens")
-        if deform_num_samples < 1 or deform_max_offset < 0 or num_structure_renderers < 1:
-            raise ValueError("invalid deform or renderer configuration")
-        self.base_channels = int(base_channels)
-        if self.base_channels <= 0:
-            raise ValueError("base_channels must be > 0")
-        if int(decoder_num_heads) <= 0:
-            raise ValueError("decoder_num_heads must be > 0")
-        for name, value in (("decoder_depth", decoder_depth), ("decoder_window_size", decoder_window_size),
-                            ("decoder_window_chunk_size", decoder_window_chunk_size), ("decoder_mlp_ratio", decoder_mlp_ratio)):
-            if float(value) <= 0:
-                raise ValueError(f"{name} must be > 0, received {value}")
-        for name, value in (("decoder_attention_dropout", decoder_attention_dropout),
-                            ("decoder_projection_dropout", decoder_projection_dropout), ("decoder_ffn_dropout", decoder_ffn_dropout)):
-            if not 0.0 <= float(value) < 1.0:
-                raise ValueError(f"{name} must be in [0, 1), received {value}")
-        self.boundary_width = int(boundary_width)
+        model_config = {name: value for name, value in locals().items() if name != "self"}
+        validate_model_config_values(model_config)
+        base_channels = require_positive_integer("base_channels", base_channels)
+        router_hidden_channels = require_positive_integer("router_hidden_channels", router_hidden_channels)
+        deform_num_samples = require_positive_integer("deform_num_samples", deform_num_samples)
+        num_structure_renderers = require_positive_integer("num_structure_renderers", num_structure_renderers)
+        memory_max_tokens = require_positive_integer("memory_max_tokens", memory_max_tokens)
+        memory_topk = require_positive_integer("memory_topk", memory_topk)
+        memory_query_chunk_size = require_positive_integer("memory_query_chunk_size", memory_query_chunk_size)
+        boundary_width = require_positive_integer("boundary_width", boundary_width)
+        decoder_num_heads = require_positive_integer("decoder_num_heads", decoder_num_heads)
+        decoder_depth = require_positive_integer("decoder_depth", decoder_depth)
+        decoder_window_size = require_positive_integer("decoder_window_size", decoder_window_size)
+        decoder_window_chunk_size = require_positive_integer("decoder_window_chunk_size", decoder_window_chunk_size)
+        self.base_channels = base_channels
+        self.boundary_width = boundary_width
         self.deform_max_offset = float(deform_max_offset)
         self.memory_exclusion_extra_margin = int(memory_exclusion_extra_margin)
-        self.memory_query_chunk_size = int(memory_query_chunk_size)
-        if self.memory_exclusion_extra_margin < 0 or self.memory_query_chunk_size < 1:
-            raise ValueError("memory exclusion margin must be >= 0 and query chunk size must be >= 1")
+        self.memory_query_chunk_size = memory_query_chunk_size
         self.hde = HDE()
         self.router = MonotonicFogRouter(router_hidden_channels)
         self.rgb_encoder = PyramidEncoder(base_channels)
@@ -345,8 +342,8 @@ class FogRoutedRGBTIRDehazer(nn.Module):
             ), dim=1))
             structures[name] = self.merge[name](torch.cat(((1 - route) * fusion_candidate, route * completion_candidate, boundary_feature), dim=1))
             reliability = ((1.0 - route).detach() * valid * (1.0 - exclusion))
-            retrieved, confidence, fallback, mass, ratio, count, gate = self.memory[name](S, fusion_candidate, reliability, valid)
-            appearances[name] = ((1.0 - route) * fusion_candidate + route * retrieved) * valid
+            memory_appearance, confidence, fallback, mass, ratio, count, gate = self.memory[name](S, fusion_candidate, reliability, valid)
+            appearances[name] = ((1.0 - route) * fusion_candidate + route * memory_appearance) * valid
             structures[name] = structures[name] * valid
             debug_scales[name] = {
                 "effective_override_mask": mask, "candidate_count": count, "reliability": reliability,

@@ -1,8 +1,10 @@
 import pytest
 import torch
 from PIL import Image
+from types import SimpleNamespace
 
 from model import FogRoutedRGBTIRDehazer
+from training.source import OmegaSampler, compute_source_batch_losses
 from utils.checkpoint import CHECKPOINT_FORMAT_VERSION, MODEL_CONFIG_KEYS
 
 
@@ -27,17 +29,77 @@ def _config():
     return values
 
 
-def test_cuda_256_source_style_forward_backward_is_finite():
+def _source_args():
+    return SimpleNamespace(
+        route_tau_start=1.0, route_tau_end=0.2, route_hard_start_step=1,
+        counterfactual_start_step=0, route_loss_start_step=0, route_loss_warmup_steps=0,
+        binary_loss_start_step=0, binary_loss_warmup_steps=0, lambda_route=1.0,
+        lambda_binary=1.0, q_temperature=0.1, counterfactual_chunk_size=2,
+        density_smooth_l1_beta=0.1, lambda_global=1.0, lambda_fuse=1.0,
+        lambda_comp=1.0, lambda_boundary=1.0, lambda_router=1.0, lambda_density=1.0,
+        rec_l1_weight=1.0, rec_gradient_weight=0.0, rec_ssim_weight=0.0,
+        boundary_l1_weight=1.0, boundary_gradient_weight=0.0,
+        reconstruction_ssim_window=3, reconstruction_min_valid_support=2,
+    )
+
+
+def test_cuda_256_complete_source_objective_executes_counterfactual_q_and_backward(monkeypatch):
     torch.cuda.reset_peak_memory_stats()
     model = FogRoutedRGBTIRDehazer(**{key: _config()[key] for key in MODEL_CONFIG_KEYS}).cuda().train()
+    torch.manual_seed(19)
     hazy, clear, tir = (torch.rand(1, 3, 256, 256, device="cuda") for _ in range(3))
-    output = model(hazy, tir, route_mode="soft")
-    loss = (output["pred_clear"] - clear).abs().mean() + output["density_map"].mean() + output["route_soft"].mean()
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert any(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in model.parameters())
+    yy, xx = torch.meshgrid(torch.linspace(0, 1, 256, device="cuda"), torch.linspace(0, 1, 256, device="cuda"), indexing="ij")
+    density = (0.6 * yy + 0.4 * xx).unsqueeze(0).unsqueeze(0)
+    decode_calls, encoder_calls = [], {"hde": 0, "rgb": 0, "tir": 0}
+    original_decode = model.decode_with_route
+
+    def wrapped_decode(*args, **kwargs):
+        decode_calls.append({
+            "route_mode": kwargs.get("route_mode"),
+            "route_override_value": kwargs.get("route_override_value"),
+            "route_override_mask": kwargs.get("route_override_mask"),
+            "memory_exclude_mask": kwargs.get("memory_exclude_mask"),
+            "detached_context": not args[0]["density_map"].requires_grad,
+        })
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(model, "decode_with_route", wrapped_decode)
+    handles = [
+        model.hde.register_forward_hook(lambda *_: encoder_calls.__setitem__("hde", encoder_calls["hde"] + 1)),
+        model.rgb_encoder.register_forward_hook(lambda *_: encoder_calls.__setitem__("rgb", encoder_calls["rgb"] + 1)),
+        model.tir_encoder.register_forward_hook(lambda *_: encoder_calls.__setitem__("tir", encoder_calls["tir"] + 1)),
+    ]
+    try:
+        result = compute_source_batch_losses(
+            model, (hazy, clear, tir, density), _source_args(),
+            OmegaSampler(regions_per_image=4, min_area=16, max_area=32, seed=7, edge_threshold=10.0),
+            global_step=1, omega_generator=torch.Generator(device="cuda").manual_seed(29),
+        )
+        loss = result["losses"]["total"]
+        loss.backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    main = [call for call in decode_calls if call["route_override_value"] is None]
+    fusion = [call for call in decode_calls if call["route_override_value"] is not None and
+              torch.count_nonzero(call["route_override_value"]) == 0]
+    completion = [call for call in decode_calls if call["route_override_value"] is not None and
+                  torch.count_nonzero(call["route_override_value"]) > 0]
+    assert len(main) >= 1 and len(fusion) >= 1 and len(completion) >= 1
+    assert all(call["detached_context"] for call in fusion + completion)
+    assert encoder_calls == {"hde": 1, "rgb": 1, "tir": 1}
+    assert result["omega"]["omega_support"].shape[0] > 0
+    assert result["q"].requires_grad is False
+    assert int((result["q_valid_sum"] > 0).sum()) > 0
+    assert result["route_supervision"]["valid_q_region_count"] > 0
+    assert result["state"]["lambda_route"] > 0 and result["state"]["lambda_binary"] > 0
+    for name in ("route", "binary", "total"):
+        assert torch.isfinite(result["losses"][name]).all()
+    for module in (model.hde, model.router, model.decoder_stages["h2"]):
+        assert any(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in module.parameters())
     peak = torch.cuda.max_memory_allocated()
-    print(f"cuda_peak_256_source_bytes={peak}")
+    print(f"cuda_peak_256_complete_source_bytes={peak}")
     assert peak > 0
 
 

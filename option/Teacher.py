@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
+from utils.model_config_validation import validate_model_config_values
+
 
 LOSS_WEIGHT_NAMES = (
     "q_l1_weight", "q_gradient_weight", "q_ssim_weight",
@@ -174,21 +176,7 @@ def _validate_preprocessing(args):
 
 
 def _validate_model_and_source_flow(args):
-    if args.base_channels <= 0:
-        raise ValueError("base_channels must be > 0")
-    if args.decoder_num_heads <= 0:
-        raise ValueError("decoder_num_heads must be > 0")
-    widths = (args.base_channels, args.base_channels * 2, args.base_channels * 3, args.base_channels * 4)
-    if any(width % args.decoder_num_heads for width in widths):
-        raise ValueError("all decoder scale widths must be divisible by decoder_num_heads; "
-                         f"decoder_num_heads={args.decoder_num_heads}, widths={widths}")
-    for name in ("decoder_depth", "decoder_window_size", "decoder_window_chunk_size", "decoder_mlp_ratio"):
-        if getattr(args, name) <= 0:
-            raise ValueError(f"{name} must be > 0, received {getattr(args, name)}")
-    for name in ("decoder_attention_dropout", "decoder_projection_dropout", "decoder_ffn_dropout"):
-        value = getattr(args, name)
-        if not 0.0 <= value < 1.0:
-            raise ValueError(f"{name} must be in [0, 1), received {value}")
+    validate_model_config_values(vars(args))
     for name in ("route_tau_start", "route_tau_end", "memory_attention_temperature", "q_temperature", "density_smooth_l1_beta"):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} must be > 0")

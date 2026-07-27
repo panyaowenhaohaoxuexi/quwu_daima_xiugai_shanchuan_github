@@ -10,15 +10,21 @@ import torch
 from utils.checkpoint import CHECKPOINT_FORMAT_VERSION, MODEL_CONFIG_KEYS
 
 
+def _is_nonempty_tensor_state(value):
+    return (isinstance(value, dict) and bool(value) and all(
+        isinstance(key, str) and torch.is_tensor(tensor) for key, tensor in value.items()
+    ))
+
+
 def extract_state_dict(checkpoint):
     """Extract one explicit state mapping without guessing formal load behavior."""
     if not isinstance(checkpoint, dict):
         raise TypeError("checkpoint must be a dictionary")
     for key in ("model", "state_dict", "student", "teacher"):
         value = checkpoint.get(key)
-        if isinstance(value, dict) and all(torch.is_tensor(item) for item in value.values()):
+        if _is_nonempty_tensor_state(value):
             return value
-    if checkpoint and all(torch.is_tensor(item) for item in checkpoint.values()):
+    if _is_nonempty_tensor_state(checkpoint):
         return checkpoint
     raise ValueError("checkpoint contains no recognizable tensor state dictionary")
 
@@ -51,7 +57,7 @@ def main(argv=None):
     expected_states = ((stage == "source" and "model" in checkpoint) or
                        (stage == "ema" and "student" in checkpoint and "teacher" in checkpoint)) if isinstance(checkpoint, dict) else False
     state_fields_are_tensors = all(
-        isinstance(checkpoint.get(key), dict) and all(torch.is_tensor(value) for value in checkpoint[key].values())
+        _is_nonempty_tensor_state(checkpoint.get(key))
         for key in (("model",) if stage == "source" else ("student", "teacher") if stage == "ema" else ())
     )
     report = {"checkpoint_key_count": len(state), "keys": sorted(state),

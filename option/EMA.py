@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
+from utils.model_config_validation import validate_model_config_values
+
 
 LOSS_WEIGHT_NAMES = (
     "q_l1_weight", "q_gradient_weight", "q_ssim_weight",
@@ -130,28 +132,11 @@ def _validate_inherited_source_config(args):
             raise ValueError(f"{name} must be > 0")
     if args.route_hard_start_step < 0 or args.counterfactual_start_step > args.route_loss_start_step:
         raise ValueError("invalid route/counterfactual schedule")
-    if args.counterfactual_chunk_size < 1 or args.deform_num_samples < 1 or args.deform_max_offset < 0:
+    validate_model_config_values(vars(args))
+    if args.counterfactual_chunk_size < 1:
         raise ValueError("invalid counterfactual/deform configuration")
-    if args.train_size < 1 or args.num_structure_renderers < 1 or args.memory_max_tokens < 1 or args.memory_query_chunk_size < 1:
+    if args.train_size < 1:
         raise ValueError("invalid Source renderer, memory, or train-size configuration")
-    if args.memory_exclusion_extra_margin < 0 or not 2 <= args.memory_topk <= args.memory_max_tokens:
-        raise ValueError("invalid Source memory configuration")
-    if args.base_channels <= 0 or args.decoder_num_heads <= 0:
-        raise ValueError("base_channels and decoder_num_heads must be > 0")
-    widths = (args.base_channels, args.base_channels * 2, args.base_channels * 3, args.base_channels * 4)
-    if any(width % args.decoder_num_heads for width in widths):
-        raise ValueError("all decoder scale widths must be divisible by decoder_num_heads; "
-                         f"decoder_num_heads={args.decoder_num_heads}, widths={widths}")
-    for name in ("decoder_depth", "decoder_window_size", "decoder_window_chunk_size", "decoder_mlp_ratio"):
-        if getattr(args, name) <= 0:
-            raise ValueError(f"{name} must be > 0, received {getattr(args, name)}")
-    for name in ("decoder_attention_dropout", "decoder_projection_dropout", "decoder_ffn_dropout"):
-        value = getattr(args, name)
-        if not 0.0 <= value < 1.0:
-            raise ValueError(f"{name} must be in [0, 1), received {value}")
-    for name in ("memory_reliable_ratio_threshold", "memory_confidence_threshold"):
-        if not 0 <= getattr(args, name) <= 1:
-            raise ValueError(f"{name} must be in [0,1]")
     if args.boundary_width < 1 or args.max_consecutive_empty_omega_steps < 1:
         raise ValueError("invalid Source boundary or empty-Omega configuration")
     if not (4 <= args.omega_regions_per_image <= 8) or not (0 < args.omega_min_area <= args.omega_max_area):

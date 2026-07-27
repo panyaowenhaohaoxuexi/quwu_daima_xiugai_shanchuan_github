@@ -1,18 +1,17 @@
 """Small strict checkpoints for Source, EMA and unified evaluation."""
 
+from collections.abc import Mapping
+
 import torch
 
-CHECKPOINT_FORMAT_VERSION = 2
-
-MODEL_CONFIG_KEYS = (
-    "base_channels", "router_hidden_channels", "deform_num_samples", "deform_max_offset",
-    "num_structure_renderers", "memory_max_tokens", "memory_topk", "memory_query_chunk_size",
-    "memory_attention_temperature", "memory_reliability_epsilon", "memory_reliable_ratio_threshold",
-    "memory_confidence_threshold", "memory_exclusion_extra_margin", "boundary_width",
-    "decoder_num_heads", "decoder_depth", "decoder_window_size", "decoder_window_chunk_size",
-    "decoder_mlp_ratio", "decoder_attention_dropout", "decoder_projection_dropout", "decoder_ffn_dropout",
+from .model_config_validation import (
+    MODEL_CONFIG_KEYS,
+    require_nonnegative_integer,
+    require_positive_integer,
+    validate_model_config_values,
 )
 
+CHECKPOINT_FORMAT_VERSION = 2
 
 def require_checkpoint_dict(checkpoint):
     if not isinstance(checkpoint, dict):
@@ -37,20 +36,36 @@ def load_strict_v2_state_dict(model, state_dict, *, label):
         raise RuntimeError(f"{label} state_dict is incompatible with the v2 structure-appearance Transformer architecture") from exc
 
 
-def build_model_from_config(config):
+def require_complete_model_config(config):
+    if not isinstance(config, Mapping):
+        raise TypeError("checkpoint config must be a mapping")
     missing = [key for key in MODEL_CONFIG_KEYS if key not in config]
     if missing:
         raise ValueError("checkpoint lacks model configuration: " + ", ".join(missing))
+    validate_model_config_values(config)
+    return config
+
+
+def require_checkpoint_field(checkpoint, key, *, label=None):
+    if key not in checkpoint:
+        raise ValueError(f"checkpoint lacks {label or key}")
+    return checkpoint[key]
+
+
+def build_model_from_config(config):
+    require_complete_model_config(config)
     from model.Teacher import FogRoutedRGBTIRDehazer
     return FogRoutedRGBTIRDehazer(**{key: config[key] for key in MODEL_CONFIG_KEYS})
 
 
 def build_source_checkpoint(model, optimizer, *, epoch, global_step, config):
+    require_complete_model_config(config)
     return {"format_version": CHECKPOINT_FORMAT_VERSION, "training_stage": "source", "model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "epoch": int(epoch), "global_step": int(global_step), "config": dict(config)}
 
 
 def build_ema_checkpoint(student, teacher, optimizer, *, epoch, source_global_step, ema_global_step, config):
+    require_complete_model_config(config)
     return {"format_version": CHECKPOINT_FORMAT_VERSION, "training_stage": "ema", "student": student.state_dict(), "teacher": teacher.state_dict(),
             "optimizer": optimizer.state_dict(), "epoch": int(epoch),
             "source_global_step": int(source_global_step), "ema_global_step": int(ema_global_step),
@@ -66,29 +81,33 @@ def require_stage(checkpoint, stage):
 def load_source_checkpoint(checkpoint, model, optimizer=None):
     require_checkpoint_format(checkpoint)
     require_stage(checkpoint, "source")
-    load_strict_v2_state_dict(model, checkpoint.get("model"), label="Source model")
+    require_complete_model_config(require_checkpoint_field(checkpoint, "config", label="config"))
+    load_strict_v2_state_dict(model, require_checkpoint_field(checkpoint, "model", label="Source model state"), label="Source model")
     if optimizer is not None:
         try:
-            optimizer.load_state_dict(checkpoint["optimizer"])
-        except (KeyError, RuntimeError, ValueError) as exc:
+            optimizer.load_state_dict(require_checkpoint_field(checkpoint, "optimizer", label="Source optimizer state"))
+        except (TypeError, RuntimeError, ValueError) as exc:
             raise RuntimeError("Source optimizer state is incompatible") from exc
-    return {"epoch": int(checkpoint["epoch"]), "global_step": int(checkpoint["global_step"])}
+    return {"epoch": int(require_checkpoint_field(checkpoint, "epoch")),
+            "global_step": int(require_checkpoint_field(checkpoint, "global_step"))}
 
 
 def load_ema_checkpoint(checkpoint, student, teacher, optimizer=None):
     require_checkpoint_format(checkpoint)
     require_stage(checkpoint, "ema")
-    load_strict_v2_state_dict(student, checkpoint.get("student"), label="EMA student")
-    load_strict_v2_state_dict(teacher, checkpoint.get("teacher"), label="EMA teacher")
+    require_complete_model_config(require_checkpoint_field(checkpoint, "config", label="config"))
+    load_strict_v2_state_dict(student, require_checkpoint_field(checkpoint, "student", label="EMA student state"), label="EMA student")
+    load_strict_v2_state_dict(teacher, require_checkpoint_field(checkpoint, "teacher", label="EMA teacher state"), label="EMA teacher")
     for parameter in teacher.parameters():
         parameter.requires_grad_(False)
     if optimizer is not None:
         try:
-            optimizer.load_state_dict(checkpoint["optimizer"])
-        except (KeyError, RuntimeError, ValueError) as exc:
+            optimizer.load_state_dict(require_checkpoint_field(checkpoint, "optimizer", label="EMA optimizer state"))
+        except (TypeError, RuntimeError, ValueError) as exc:
             raise RuntimeError("EMA optimizer state is incompatible") from exc
-    return {"epoch": int(checkpoint["epoch"]), "source_global_step": int(checkpoint["source_global_step"]),
-            "ema_global_step": int(checkpoint["ema_global_step"])}
+    return {"epoch": int(require_checkpoint_field(checkpoint, "epoch")),
+            "source_global_step": int(require_checkpoint_field(checkpoint, "source_global_step")),
+            "ema_global_step": int(require_checkpoint_field(checkpoint, "ema_global_step"))}
 
 
 def tir_normalization_config(config):

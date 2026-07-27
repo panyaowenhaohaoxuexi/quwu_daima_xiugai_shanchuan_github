@@ -6,10 +6,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from utils.model_config_validation import require_finite_float, require_positive_integer
+
 
 def _validate_dropout(name, value):
-    if not 0.0 <= float(value) < 1.0:
-        raise ValueError(f"{name} must be in [0, 1), received {value}")
+    require_finite_float(name, value, minimum=0.0, maximum=1.0, upper_inclusive=False)
 
 
 class StructureAppearanceTransformerBlock(nn.Module):
@@ -22,20 +23,20 @@ class StructureAppearanceTransformerBlock(nn.Module):
     def __init__(self, channels, num_heads, window_size, window_chunk_size, mlp_ratio=4.0,
                  attention_dropout=0.0, projection_dropout=0.0, ffn_dropout=0.0):
         super().__init__()
-        if int(channels) <= 0:
-            raise ValueError(f"channels must be > 0, received {channels}")
-        if int(num_heads) <= 0:
-            raise ValueError(f"num_heads must be > 0, received {num_heads}")
-        if int(channels) % int(num_heads):
+        channels = require_positive_integer("channels", channels)
+        num_heads = require_positive_integer("num_heads", num_heads)
+        window_size = require_positive_integer("window_size", window_size)
+        window_chunk_size = require_positive_integer("window_chunk_size", window_chunk_size)
+        if channels % num_heads:
             raise ValueError(f"channels must be divisible by num_heads, received channels={channels}, num_heads={num_heads}")
-        for name, value in (("window_size", window_size), ("window_chunk_size", window_chunk_size), ("mlp_ratio", mlp_ratio)):
-            if float(value) <= 0:
-                raise ValueError(f"{name} must be > 0, received {value}")
+        mlp_ratio = require_finite_float("mlp_ratio", mlp_ratio)
+        if mlp_ratio <= 0:
+            raise ValueError(f"mlp_ratio must be > 0, received {mlp_ratio!r}")
         _validate_dropout("attention_dropout", attention_dropout)
         _validate_dropout("projection_dropout", projection_dropout)
         _validate_dropout("ffn_dropout", ffn_dropout)
-        self.channels, self.num_heads = int(channels), int(num_heads)
-        self.window_size, self.window_chunk_size = int(window_size), int(window_chunk_size)
+        self.channels, self.num_heads = channels, num_heads
+        self.window_size, self.window_chunk_size = window_size, window_chunk_size
         self.head_dim = self.channels // self.num_heads
         self.scale = self.head_dim ** -0.5
         self.structure_norm = nn.LayerNorm(self.channels)
@@ -121,11 +122,10 @@ class StructureAppearanceTransformerStage(nn.Module):
 
     def __init__(self, channels, num_heads, depth, window_size, window_chunk_size, **kwargs):
         super().__init__()
-        if int(depth) <= 0:
-            raise ValueError(f"decoder_depth must be > 0, received {depth}")
+        depth = require_positive_integer("decoder_depth", depth)
         self.blocks = nn.ModuleList([
             StructureAppearanceTransformerBlock(channels, num_heads, window_size, window_chunk_size, **kwargs)
-            for _ in range(int(depth))
+            for _ in range(depth)
         ])
 
     def forward(self, structure_tokens, appearance_tokens, validity_mask):

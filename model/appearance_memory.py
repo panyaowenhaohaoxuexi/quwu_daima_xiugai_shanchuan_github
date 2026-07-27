@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from utils.model_config_validation import require_finite_float, require_positive_integer
+
 
 class TIRConditionedAppearancePrior(nn.Module):
     """Generate appearance only from local and global TIR structure."""
@@ -28,19 +30,24 @@ class MemoryRetriever(nn.Module):
     def __init__(self, channels, structure_channels, max_tokens, topk, attention_temperature,
                  reliability_epsilon, ratio_threshold, confidence_threshold, query_chunk_size=1024):
         super().__init__()
-        checks = (("max_tokens", max_tokens, lambda value: int(value) > 0),
-                  ("topk", topk, lambda value: 2 <= int(value) <= int(max_tokens)),
-                  ("query_chunk_size", query_chunk_size, lambda value: int(value) > 0),
-                  ("attention_temperature", attention_temperature, lambda value: float(value) > 0),
-                  ("reliability_epsilon", reliability_epsilon, lambda value: float(value) > 0),
-                  ("ratio_threshold", ratio_threshold, lambda value: 0 <= float(value) <= 1),
-                  ("confidence_threshold", confidence_threshold, lambda value: 0 <= float(value) <= 1))
-        for name, value, valid in checks:
-            if not valid(value):
-                raise ValueError(f"invalid {name}={value}")
-        self.max_tokens, self.topk, self.query_chunk_size = int(max_tokens), int(topk), int(query_chunk_size)
-        self.attention_temperature, self.reliability_epsilon = float(attention_temperature), float(reliability_epsilon)
-        self.ratio_threshold, self.confidence_threshold = float(ratio_threshold), float(confidence_threshold)
+        channels = require_positive_integer("channels", channels)
+        structure_channels = require_positive_integer("structure_channels", structure_channels)
+        max_tokens = require_positive_integer("max_tokens", max_tokens)
+        topk = require_positive_integer("topk", topk)
+        query_chunk_size = require_positive_integer("query_chunk_size", query_chunk_size)
+        if not 2 <= topk <= max_tokens:
+            raise ValueError(f"topk must satisfy 2 <= topk <= max_tokens, received topk={topk!r}, max_tokens={max_tokens!r}")
+        attention_temperature = require_finite_float("attention_temperature", attention_temperature)
+        reliability_epsilon = require_finite_float("reliability_epsilon", reliability_epsilon)
+        ratio_threshold = require_finite_float("ratio_threshold", ratio_threshold, minimum=0.0, maximum=1.0)
+        confidence_threshold = require_finite_float("confidence_threshold", confidence_threshold, minimum=0.0, maximum=1.0)
+        if attention_temperature <= 0:
+            raise ValueError(f"attention_temperature must be > 0, received {attention_temperature!r}")
+        if reliability_epsilon <= 0:
+            raise ValueError(f"reliability_epsilon must be > 0, received {reliability_epsilon!r}")
+        self.max_tokens, self.topk, self.query_chunk_size = max_tokens, topk, query_chunk_size
+        self.attention_temperature, self.reliability_epsilon = attention_temperature, reliability_epsilon
+        self.ratio_threshold, self.confidence_threshold = ratio_threshold, confidence_threshold
         self.key = nn.Conv2d(structure_channels, channels, 1)
         self.query = nn.Conv2d(structure_channels, channels, 1)
         self.context_key = nn.Linear(structure_channels, channels, bias=False)

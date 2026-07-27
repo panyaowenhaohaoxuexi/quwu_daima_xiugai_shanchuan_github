@@ -17,7 +17,8 @@ from option.EMA import (build_ema_checkpoint_config, build_parser, prepare_exper
                         resolve_ema_config, save_config, tir_normalization_config_from_args, validate_config)
 from training.source import OmegaSampler, compute_source_batch_losses
 from utils.checkpoint import (build_ema_checkpoint, build_model_from_config, load_ema_checkpoint,
-                              load_strict_v2_state_dict, require_checkpoint_format, require_stage)
+                              load_strict_v2_state_dict, require_checkpoint_field, require_checkpoint_format,
+                              require_complete_model_config, require_stage)
 
 
 def _set_seed(seed):
@@ -113,17 +114,18 @@ def main(argv=None):
     expected_stage = "ema" if raw_args.resume_checkpoint else "source"
     require_checkpoint_format(checkpoint)
     require_stage(checkpoint, expected_stage)
+    checkpoint_config = require_complete_model_config(require_checkpoint_field(checkpoint, "config", label="config"))
     args = validate_config(argparse.Namespace(**resolve_ema_config(
-        raw_args, checkpoint["config"], resume=expected_stage == "ema"
+        raw_args, checkpoint_config, resume=expected_stage == "ema"
     )))
     _set_seed(args.model_init_seed)
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     student = build_model_from_config(vars(args)).to(device)
     optimizer = AdamW(student.parameters(), lr=args.learning_rate)
     if expected_stage == "source":
-        load_strict_v2_state_dict(student, checkpoint.get("model"), label="Source model")
+        load_strict_v2_state_dict(student, require_checkpoint_field(checkpoint, "model", label="Source model state"), label="Source model")
         teacher, start_epoch = initialize_teacher(student), 0
-        source_global_step, ema_global_step = int(checkpoint["global_step"]), 0
+        source_global_step, ema_global_step = int(require_checkpoint_field(checkpoint, "global_step")), 0
     else:
         teacher = initialize_teacher(student)
         restored = load_ema_checkpoint(checkpoint, student, teacher, optimizer)
@@ -176,7 +178,7 @@ def main(argv=None):
         if args.saved_model_dir:
             torch.save(build_ema_checkpoint(student, teacher, optimizer, epoch=epoch + 1,
                 source_global_step=source_global_step, ema_global_step=ema_global_step,
-                config=build_ema_checkpoint_config(checkpoint["config"], args)), Path(args.saved_model_dir) / "ema_last.pt")
+                config=build_ema_checkpoint_config(checkpoint_config, args)), Path(args.saved_model_dir) / "ema_last.pt")
     return student, teacher
 
 
