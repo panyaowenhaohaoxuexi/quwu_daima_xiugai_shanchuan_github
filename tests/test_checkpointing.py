@@ -1,3 +1,4 @@
+import argparse
 import random
 import copy
 
@@ -48,8 +49,7 @@ def test_source_and_ema_checkpoint_schemas_do_not_mix_model_fields():
 
 
 def test_source_checkpoint_config_persists_every_actual_loss_weight_without_private_cli_state():
-    from option.Teacher import LOSS_WEIGHT_NAMES, build_parser, validate_config
-    from option._formal_config import persisted_config_from_args
+    from option.Teacher import LOSS_WEIGHT_NAMES, build_parser, persisted_config_from_args, validate_config
 
     expected = {
         "q_l1_weight": 1.1,
@@ -72,18 +72,21 @@ def test_source_checkpoint_config_persists_every_actual_loss_weight_without_priv
 
 
 def test_ema_checkpoint_config_uses_current_formal_loss_weights_not_source_values():
-    from EMA import build_ema_checkpoint_config
-    from option.EMA import build_parser, validate_config
-    from option.Teacher import LOSS_WEIGHT_NAMES
+    from option.EMA import build_ema_checkpoint_config, build_parser, resolve_ema_config, validate_config
+    from option.Teacher import LOSS_WEIGHT_NAMES, build_parser as build_source_parser, persisted_config_from_args
 
-    args = validate_config(build_parser().parse_args(["--formal_training"]))
-    source_model_config = {name: 9.1 + index / 10 for index, name in enumerate(LOSS_WEIGHT_NAMES)}
-    source_model_config["formal_training"] = False
-    source_model_config["_legacy_private"] = "discard"
+    source_config = persisted_config_from_args(build_source_parser().parse_args([]))
+    source_config.update({name: 9.1 + index / 10 for index, name in enumerate(LOSS_WEIGHT_NAMES)})
+    source_config["formal_training"] = False
+    source_config["train_data_dir"] = "anchor"
+    source_config["_legacy_private"] = "discard"
+    raw = build_parser().parse_args([])
+    resolved, _ = resolve_ema_config(raw, source_config, allow_training_override=False)
+    args = validate_config(argparse.Namespace(**resolved))
 
-    config = build_ema_checkpoint_config(source_model_config, args)
+    config = build_ema_checkpoint_config(source_config, args)
 
-    assert config["formal_training"] is True
+    assert config["formal_training"] is False
     assert {name: config[name] for name in LOSS_WEIGHT_NAMES} == {
         name: getattr(args, name) for name in LOSS_WEIGHT_NAMES
     }

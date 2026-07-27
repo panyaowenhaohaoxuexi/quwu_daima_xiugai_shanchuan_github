@@ -44,6 +44,7 @@ def test_ema_entrypoint_runs_real_and_source_anchor_from_strict_source_checkpoin
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
     source_args = build_source_parser().parse_args([
         "--base_channels", "8", "--memory_max_tokens", "16", "--memory_topk", "2", "--train_size", "32",
+        "--counterfactual_chunk_size", "6",
     ])
     source_checkpoint = tmp_path / "source.pt"
     torch.save(build_source_checkpoint(
@@ -54,10 +55,9 @@ def test_ema_entrypoint_runs_real_and_source_anchor_from_strict_source_checkpoin
     from EMA import main
     checkpoint_dir = tmp_path / "ema-checkpoints"
     main([
-        "--source_checkpoint", str(source_checkpoint), "--train_data_dir", str(tmp_path),
-        "--real_data_dir", str(tmp_path / "real"), "--train_size", "32", "--epochs", "1", "--device", "cpu",
+        "--source_checkpoint", str(source_checkpoint), "--source_anchor_data_dir", str(tmp_path),
+        "--real_data_dir", str(tmp_path / "real"), "--epochs", "1", "--device", "cpu",
         "--saved_model_dir", str(checkpoint_dir), "--exp_dir", str(tmp_path / "ema-experiment"),
-        "--counterfactual_chunk_size", "6",
     ])
     checkpoint = torch.load(checkpoint_dir / "ema_last.pt", map_location="cpu")
     assert checkpoint["training_stage"] == "ema"
@@ -69,10 +69,9 @@ def test_ema_entrypoint_runs_real_and_source_anchor_from_strict_source_checkpoin
     # Both independent real/source cursors are at epoch boundaries after one
     # successful step. EMA resume must advance both and perform the next step.
     main([
-        "--resume_checkpoint", str(checkpoint_dir / "ema_last.pt"), "--train_data_dir", str(tmp_path),
-        "--real_data_dir", str(tmp_path / "real"), "--train_size", "32", "--epochs", "2", "--device", "cpu",
+        "--resume_checkpoint", str(checkpoint_dir / "ema_last.pt"), "--source_anchor_data_dir", str(tmp_path),
+        "--real_data_dir", str(tmp_path / "real"), "--epochs", "2", "--device", "cpu",
         "--saved_model_dir", str(checkpoint_dir), "--exp_dir", str(tmp_path / "ema-resume"),
-        "--counterfactual_chunk_size", "6",
     ])
     resumed = torch.load(checkpoint_dir / "ema_last.pt", map_location="cpu")
     assert resumed["ema_global_step"] == 2
@@ -97,6 +96,7 @@ def test_ema_failure_after_full_forward_backward_replays_transaction_exactly(tmp
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
     source_args = build_source_parser().parse_args([
         "--base_channels", "8", "--memory_max_tokens", "16", "--memory_topk", "2", "--train_size", "32",
+        "--counterfactual_chunk_size", "6",
     ])
     source_checkpoint = tmp_path / "source.pt"
     torch.save(build_source_checkpoint(
@@ -104,9 +104,8 @@ def test_ema_failure_after_full_forward_backward_replays_transaction_exactly(tmp
         vars(source_args), "transmission", capture_rng_state(),
     ), source_checkpoint)
     common = [
-        "--source_checkpoint", str(source_checkpoint), "--train_data_dir", str(tmp_path),
-        "--real_data_dir", str(tmp_path / "real"), "--train_size", "32", "--epochs", "1", "--device", "cpu",
-        "--counterfactual_chunk_size", "6",
+        "--source_checkpoint", str(source_checkpoint), "--source_anchor_data_dir", str(tmp_path),
+        "--real_data_dir", str(tmp_path / "real"), "--epochs", "1", "--device", "cpu",
     ]
     reference_dir = tmp_path / "reference"
     EMA.main([*common, "--saved_model_dir", str(reference_dir), "--exp_dir", str(tmp_path / "reference-exp")])

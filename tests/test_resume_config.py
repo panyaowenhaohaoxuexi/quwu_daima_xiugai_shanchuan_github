@@ -32,12 +32,12 @@ def test_ema_resume_restores_checkpoint_adaptation_values_by_default():
     current = {
         "base_channels": 16, "tir_normalization": "dtype_range", "density_gt_semantics": "transmission",
         "route_tau_end": 0.2, "train_size": 256, "ema_decay": 0.9, "lambda_anchor": 1.0, "epochs": 2,
-        "train_data_dir": "new-source", "real_data_dir": "new-real",
+        "source_anchor_data_dir": "new-source", "real_data_dir": "new-real",
     }
     saved = {
         "base_channels": 8, "tir_normalization": "fixed_range", "density_gt_semantics": "density",
         "route_tau_end": 0.4, "train_size": 32, "ema_decay": 0.99, "lambda_anchor": 0.3, "epochs": 9,
-        "train_data_dir": "old-source", "real_data_dir": "old-real",
+        "source_anchor_data_dir": "old-source", "real_data_dir": "old-real",
     }
 
     restored, diff = apply_ema_resume_config(current, saved, allow_training_override=False)
@@ -48,7 +48,7 @@ def test_ema_resume_restores_checkpoint_adaptation_values_by_default():
     assert restored["ema_decay"] == 0.99
     assert restored["lambda_anchor"] == 0.3
     assert restored["epochs"] == 2
-    assert restored["train_data_dir"] == "new-source"
+    assert restored["source_anchor_data_dir"] == "new-source"
     assert restored["real_data_dir"] == "new-real"
     assert diff == {}
 
@@ -57,12 +57,12 @@ def test_ema_resume_keeps_only_explicitly_permitted_training_overrides():
     current = {
         "base_channels": 16, "tir_normalization": "dtype_range", "density_gt_semantics": "transmission",
         "route_tau_end": 0.2, "train_size": 256, "ema_decay": 0.9, "lambda_anchor": 1.0, "epochs": 2,
-        "train_data_dir": "new-source", "real_data_dir": "new-real",
+        "source_anchor_data_dir": "new-source", "real_data_dir": "new-real",
     }
     saved = {
         "base_channels": 8, "tir_normalization": "fixed_range", "density_gt_semantics": "density",
         "route_tau_end": 0.4, "train_size": 32, "ema_decay": 0.99, "lambda_anchor": 0.3, "epochs": 9,
-        "train_data_dir": "old-source", "real_data_dir": "old-real",
+        "source_anchor_data_dir": "old-source", "real_data_dir": "old-real",
     }
 
     restored, diff = apply_ema_resume_config(current, saved, allow_training_override=True)
@@ -72,7 +72,7 @@ def test_ema_resume_keeps_only_explicitly_permitted_training_overrides():
     assert restored["train_size"] == 32
     assert restored["ema_decay"] == 0.9
     assert restored["lambda_anchor"] == 1.0
-    assert restored["train_data_dir"] == "new-source"
+    assert restored["source_anchor_data_dir"] == "new-source"
     assert restored["real_data_dir"] == "new-real"
     assert diff == {"ema_decay": (0.99, 0.9), "lambda_anchor": (0.3, 1.0)}
 
@@ -149,16 +149,21 @@ def test_source_resume_allows_explicit_formal_training_true_override_only():
     assert diff == {"formal_training": (False, True)}
 
 
-@pytest.mark.parametrize("missing", ("formal_training", "q_gradient_weight"))
-def test_source_resume_rejects_checkpoint_missing_training_objective(missing):
+@pytest.mark.parametrize(
+    ("missing", "expected"),
+    (("formal_training", False), ("q_gradient_weight", 0.0)),
+)
+def test_source_resume_uses_warned_historical_l1_defaults_for_legacy_checkpoint(missing, expected):
     checkpoint = _objective_config(formal_training=True, start=1.1)
     checkpoint.pop(missing)
 
-    with pytest.raises(ValueError, match=rf"training objective configuration.*{missing}"):
-        apply_source_resume_config(
+    with pytest.warns(RuntimeWarning, match=rf"legacy.*{missing}"):
+        resolved, _ = apply_source_resume_config(
             _objective_config(formal_training=False, start=7.1), checkpoint,
             allow_training_override=False, explicit_objective_keys=set(),
         )
+
+    assert resolved[missing] == expected
 
 
 @pytest.mark.parametrize("allow_training_override", (False, True))
@@ -177,7 +182,7 @@ def test_source_resume_override_never_bypasses_semantic_validation(allow_trainin
 
 def test_source_resume_persisted_config_keeps_checkpoint_objective_and_drops_private_fields():
     from argparse import Namespace
-    from option._formal_config import persisted_config_from_args
+    from option.Teacher import persisted_config_from_args
 
     checkpoint = _objective_config(formal_training=True, start=1.1)
     resolved, _ = apply_source_resume_config(

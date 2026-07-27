@@ -12,8 +12,10 @@ from torch.utils.data import DataLoader
 from data import StatefulRandomSampler
 from data.stateful_sampler import validate_single_process_world
 from data.data_loader import SynthMultiModalDataset, collate_synth
-from option.Teacher import build_parser, prepare_experiment_dirs, save_config, validate_config
-from option._formal_config import persisted_config_from_args, tir_normalization_config_from_args
+from option.Teacher import (
+    build_parser, persisted_config_from_args, prepare_experiment_dirs, save_config,
+    tir_normalization_config_from_args, validate_config,
+)
 from training.omega_sampler import OmegaSampler
 from training.source_step import compute_source_batch_losses
 from training.step_control import perform_optimizer_step

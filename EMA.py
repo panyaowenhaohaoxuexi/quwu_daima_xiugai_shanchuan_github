@@ -12,9 +12,11 @@ from torch.utils.data import DataLoader
 
 from data import RealMultiModalDataset, StatefulRandomSampler, SynthMultiModalDataset, collate_real, collate_synth
 from data.stateful_sampler import validate_single_process_world
-from option.EMA import build_parser, prepare_experiment_dirs, save_config, validate_config
-from option.Teacher import LOSS_WEIGHT_NAMES
-from option._formal_config import persisted_config_from_args, tir_normalization_config_from_args
+from option.EMA import (
+    build_ema_checkpoint_config, build_parser, prepare_experiment_dirs,
+    resolve_ema_config, save_config, tir_normalization_config_from_args,
+    validate_config,
+)
 from training.paired_geometry import sample_geometry
 from loss.real.consistency import real_consistency_loss, stability_weights
 from training.checkpointing import (
@@ -26,7 +28,6 @@ from training.step_transaction import rollback_step_transaction, snapshot_step_t
 from training.omega_sampler import OmegaSampler
 from training.omega_state import update_empty_omega_streak
 from training.source_step import compute_source_batch_losses
-from training.resume_config import apply_checkpoint_semantics, apply_ema_resume_config
 
 
 def set_batchnorm_eval(module):
@@ -53,21 +54,6 @@ def _log_loss_components(args):
         print("WARNING: reconstruction is L1-only")
     if args.boundary_gradient_weight == 0:
         print("WARNING: boundary loss has no gradient component")
-
-
-def build_ema_checkpoint_config(model_config, args):
-    """Persist the actual EMA objective instead of inherited source defaults."""
-    config = {key: value for key, value in model_config.items() if not key.startswith("_")}
-    current_config = persisted_config_from_args(args)
-    ema_config_keys = (
-        "ema_decay", "ema_sigma_j", "ema_sigma_m", "ema_sigma_r",
-        "ema_stability_min_weight", "lambda_ema_j", "lambda_ema_m", "lambda_ema_r",
-        "lambda_anchor", "real_batch_size", "source_anchor_batch_size", "real_data_dir",
-        "learning_rate", "epochs", "num_workers", "source_checkpoint", "formal_training",
-        *LOSS_WEIGHT_NAMES,
-    )
-    config.update({key: current_config[key] for key in ema_config_keys})
-    return config
 
 
 def run_ema_views(teacher, student, hazy_rgb, tir, generator, route_temperature,
@@ -237,31 +223,36 @@ def run_ema_epoch(student, teacher, optimizer, real_loader, source_loader, args,
 
 
 def main(argv=None):
-    args = validate_config(build_parser().parse_args(argv))
+    raw_args = build_parser().parse_args(argv)
+    resume_checkpoint = torch.load(raw_args.resume_checkpoint, map_location="cpu") if raw_args.resume_checkpoint else None
+    if resume_checkpoint is None and not raw_args.source_checkpoint:
+        raise ValueError("EMA adaptation requires --source_checkpoint or --resume_checkpoint")
+    source_checkpoint = None
+    if resume_checkpoint is not None:
+        validate_checkpoint_metadata(resume_checkpoint, "ema", resume_checkpoint.get("density_gt_semantics"))
+        model_config = resume_checkpoint["config"]
+        resolved, config_diff = resolve_ema_config(
+            raw_args, model_config,
+            allow_training_override=raw_args.allow_ema_training_override,
+            is_resume=True,
+        )
+        args = validate_config(argparse.Namespace(**resolved))
+        if config_diff:
+            print(f"[EMA] explicit training override: {config_diff}")
+    else:
+        source_checkpoint = torch.load(raw_args.source_checkpoint, map_location="cpu")
+        validate_checkpoint_metadata(source_checkpoint, "source", source_checkpoint.get("density_gt_semantics"))
+        model_config = source_checkpoint["config"]
+        resolved, _ = resolve_ema_config(
+            raw_args, model_config, allow_training_override=False,
+        )
+        args = validate_config(argparse.Namespace(**resolved))
     _log_loss_components(args)
     validate_single_process_world()
     prepare_experiment_dirs(args)
     random.seed(args.model_init_seed)
     np.random.seed(args.model_init_seed)
     torch.manual_seed(args.model_init_seed)
-    resume_checkpoint = torch.load(args.resume_checkpoint, map_location="cpu") if args.resume_checkpoint else None
-    if resume_checkpoint is None and not args.source_checkpoint:
-        raise ValueError("EMA adaptation requires --source_checkpoint or --resume_checkpoint")
-    source_checkpoint = None
-    if resume_checkpoint is not None:
-        validate_checkpoint_metadata(resume_checkpoint, "ema", resume_checkpoint.get("density_gt_semantics"))
-        model_config = resume_checkpoint["config"]
-        resolved, config_diff = apply_ema_resume_config(
-            vars(args), model_config, allow_training_override=args.allow_ema_training_override
-        )
-        args = validate_config(argparse.Namespace(**resolved))
-        if config_diff:
-            print(f"[EMA] explicit training override: {config_diff}")
-    else:
-        source_checkpoint = torch.load(args.source_checkpoint, map_location="cpu")
-        validate_checkpoint_metadata(source_checkpoint, "source", source_checkpoint.get("density_gt_semantics"))
-        model_config = source_checkpoint["config"]
-        args = validate_config(argparse.Namespace(**apply_checkpoint_semantics(vars(args), model_config)))
     save_config(args)
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     student = build_formal_model_from_config(model_config).to(device)
@@ -282,7 +273,7 @@ def main(argv=None):
         tir_normalization_config=tir_normalization_config_from_args(args),
     )
     source_dataset = SynthMultiModalDataset(
-        args.train_data_dir, train=True, size=args.train_size, density_gt_semantics=args.density_gt_semantics,
+        args.source_anchor_data_dir, train=True, size=args.train_size, density_gt_semantics=args.density_gt_semantics,
         density_map_normalization=args.density_map_normalization,
         density_fixed_min=args.density_fixed_min, density_fixed_max=args.density_fixed_max,
         density_calibrated_min=args.density_calibrated_min,

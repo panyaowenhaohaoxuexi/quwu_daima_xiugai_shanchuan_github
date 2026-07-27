@@ -1,6 +1,20 @@
 """Checkpoint-resume configuration boundaries for formal training stages."""
 
-from option.Teacher import LOSS_WEIGHT_NAMES, TRAINING_OBJECTIVE_KEYS
+import warnings
+
+
+LOSS_WEIGHT_NAMES = (
+    "q_l1_weight", "q_gradient_weight", "q_ssim_weight",
+    "rec_l1_weight", "rec_gradient_weight", "rec_ssim_weight",
+    "boundary_l1_weight", "boundary_gradient_weight",
+)
+TRAINING_OBJECTIVE_KEYS = ("formal_training", *LOSS_WEIGHT_NAMES)
+_LEGACY_SOURCE_OBJECTIVE_DEFAULTS = {
+    "formal_training": False,
+    "q_l1_weight": 1.0, "q_gradient_weight": 0.0, "q_ssim_weight": 0.0,
+    "rec_l1_weight": 1.0, "rec_gradient_weight": 0.0, "rec_ssim_weight": 0.0,
+    "boundary_l1_weight": 1.0, "boundary_gradient_weight": 0.0,
+}
 
 _SEMANTIC_KEYS = {
     "base_channels", "router_hidden_channels", "deform_num_samples", "deform_max_offset",
@@ -23,7 +37,7 @@ _SEMANTIC_KEYS = {
 # and ``epochs`` is the requested stop boundary for the current invocation.
 _EMA_RUNTIME_KEYS = {
     "device", "num_workers", "exp_dir", "saved_model_dir", "saved_data_dir",
-    "log_dir", "output_dir", "epochs", "train_data_dir", "real_data_dir",
+    "log_dir", "output_dir", "epochs", "source_anchor_data_dir", "real_data_dir",
     "source_checkpoint", "resume_checkpoint", "allow_ema_training_override",
     "log_frequency", "save_frequency", "save_visualizations",
 }
@@ -58,10 +72,19 @@ def apply_source_resume_config(current, checkpoint_config, *, allow_training_ove
     """Lock source-training objectives unless an explicit override is allowed."""
     missing = [key for key in TRAINING_OBJECTIVE_KEYS if key not in checkpoint_config]
     if missing:
-        raise ValueError(
-            "source checkpoint training objective configuration is incomplete; missing: "
-            + ", ".join(missing)
+        warnings.warn(
+            "legacy source checkpoint lacks training objective configuration; "
+            "using historical L1 defaults for: " + ", ".join(missing),
+            RuntimeWarning,
+            stacklevel=2,
         )
+        checkpoint_config = dict(checkpoint_config)
+        checkpoint_config.update({key: _LEGACY_SOURCE_OBJECTIVE_DEFAULTS[key] for key in missing})
+        # A partial formal profile cannot be validated without inventing a
+        # composite objective.  Preserve every recorded weight, but disable
+        # preset application so missing fields retain historical L1 values.
+        if any(key in LOSS_WEIGHT_NAMES for key in missing):
+            checkpoint_config["formal_training"] = False
 
     resolved = dict(current)
     explicit = set(explicit_objective_keys).intersection(TRAINING_OBJECTIVE_KEYS)

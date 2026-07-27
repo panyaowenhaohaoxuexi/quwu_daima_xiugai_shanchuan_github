@@ -352,7 +352,7 @@
   the memory fallback prior must combine local TIR structure with global TIR
   scene context. Existing smoke defaults were q=`1/0/0`, reconstruction=`1/0/0`,
   and boundary=`1/0` for L1/gradient/SSIM (or L1/gradient).
-- `option/_formal_config.py` now owns `--formal_training`, its preliminary
+- The then-shared configuration module owned `--formal_training`, its preliminary
   (ablation-tunable) formal preset q=`1/.5/.5`, reconstruction=`1/.2/.2`,
   boundary=`1/.5`, and shared validation. Explicit CLI loss-weight arguments
   are tracked so an explicit zero is rejected rather than silently replaced;
@@ -452,11 +452,9 @@
   importable loss modules. They have no in-repository consumer, but removing
   them is intentionally outside this task. `loss/__init__.py` no longer uses
   wildcard imports and exposes only explicit formal APIs.
-- Source loss defaults, formal preset, explicit CLI tracking and validation now
-  live in `option/Teacher.py`; `option/EMA.py` visibly imports its pure source
-  anchor registration/validation functions and keeps EMA-real weights local.
-  `_formal_config.py` now contains only generic non-loss parser/validation
-  helpers. Both CLI help outputs show the unchanged source loss arguments.
+- Source loss defaults, formal preset, explicit CLI tracking and validation then
+  lived in `option/Teacher.py`; EMA reused the Source-anchor registration and
+  validation functions while keeping EMA-real weights local.
 - Static import coverage verifies that `loss/` imports no model, training,
   option or entrypoint package. The requested formula scan found canonical
   definitions only under `loss/` and no q/BCE/binary formula matches in
@@ -470,3 +468,19 @@
   writes disabled reported `168 passed, 5 warnings in 12.13s`. Warnings remain
   four upstream torchvision Pillow deprecations and the existing non-collected
   `TestDataset` class warning.
+
+## 2026-07-27 -- stage-local configuration ownership
+
+- Source configuration is now self-contained in `option/Teacher.py`; real-domain
+  EMA configuration is independently implemented in `option/EMA.py`. Importing
+  either module remains side-effect free.
+- EMA inherits model, preprocessing, route, Omega, Source-anchor loss and
+  train-size semantics from the selected checkpoint before full validation;
+  its parser exposes only EMA runtime/training controls and
+  `source_anchor_data_dir`.
+- New EMA checkpoints store `source_anchor_data_dir` and omit the historical
+  source-path key. When loading an old checkpoint, its historical source path
+  is mapped to the new anchor-path field; an explicitly supplied new path wins.
+- Legacy Source checkpoints missing training-objective fields receive a warned
+  historical L1 compatibility profile, while all present checkpoint weights
+  remain unchanged.

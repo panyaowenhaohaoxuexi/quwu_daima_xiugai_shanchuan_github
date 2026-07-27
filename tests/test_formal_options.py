@@ -1,3 +1,4 @@
+import argparse
 import importlib
 import sys
 
@@ -35,12 +36,13 @@ def test_option_modules_are_pure_on_import_and_validate_formal_defaults(monkeypa
 
     assert not list(tmp_path.iterdir())
     teacher.validate_config(teacher.build_parser().parse_args([]))
-    ema.validate_config(ema.build_parser().parse_args([]))
+    source_config = teacher.persisted_config_from_args(teacher.build_parser().parse_args([]))
+    resolved, _ = ema.resolve_ema_config(ema.build_parser().parse_args([]), source_config, allow_training_override=False)
+    ema.validate_config(argparse.Namespace(**resolved))
 
 
 def test_tir_loader_mapping_keeps_all_persisted_preprocessing_semantics():
-    from option.Teacher import build_parser
-    from option._formal_config import tir_normalization_config_from_args
+    from option.Teacher import build_parser, tir_normalization_config_from_args
 
     args = build_parser().parse_args([
         "--tir_normalization", "percentile", "--tir_percentile_scope", "dataset",
@@ -86,17 +88,13 @@ def test_formal_training_and_loss_weights_share_explicit_cli_tracking():
 
 
 def test_source_loss_defaults_and_formal_preset_are_owned_by_option_teacher():
-    import option._formal_config as common
     from option.Teacher import FORMAL_TRAINING_LOSS_WEIGHTS, LOSS_WEIGHT_NAMES
 
     assert set(FORMAL_TRAINING_LOSS_WEIGHTS) == set(LOSS_WEIGHT_NAMES)
-    assert not hasattr(common, "LOSS_WEIGHT_NAMES")
-    assert not hasattr(common, "FORMAL_TRAINING_LOSS_WEIGHTS")
 
 
-@pytest.mark.parametrize("module_name", ("option.Teacher", "option.EMA"))
-def test_formal_training_parser_loads_positive_composite_weights(module_name):
-    module = importlib.import_module(module_name)
+def test_formal_training_parser_loads_positive_composite_weights():
+    module = importlib.import_module("option.Teacher")
 
     args = module.validate_config(module.build_parser().parse_args(["--formal_training"]))
 
