@@ -77,6 +77,14 @@ def add_model_arguments(parser):
     parser.add_argument("--memory_reliable_ratio_threshold", type=float, default=0.01)
     parser.add_argument("--memory_confidence_threshold", type=float, default=0.1)
     parser.add_argument("--memory_exclusion_extra_margin", type=int, default=0)
+    parser.add_argument("--decoder_num_heads", type=int, default=4)
+    parser.add_argument("--decoder_depth", type=int, default=1)
+    parser.add_argument("--decoder_window_size", type=int, default=7)
+    parser.add_argument("--decoder_window_chunk_size", type=int, default=128)
+    parser.add_argument("--decoder_mlp_ratio", type=float, default=4.0)
+    parser.add_argument("--decoder_attention_dropout", type=float, default=0.0)
+    parser.add_argument("--decoder_projection_dropout", type=float, default=0.0)
+    parser.add_argument("--decoder_ffn_dropout", type=float, default=0.0)
     parser.add_argument("--boundary_width", type=int, default=1)
     parser.add_argument("--route_tau_start", type=float, default=1.0)
     parser.add_argument("--route_tau_end", type=float, default=0.2)
@@ -166,6 +174,21 @@ def _validate_preprocessing(args):
 
 
 def _validate_model_and_source_flow(args):
+    if args.base_channels <= 0:
+        raise ValueError("base_channels must be > 0")
+    if args.decoder_num_heads <= 0:
+        raise ValueError("decoder_num_heads must be > 0")
+    widths = (args.base_channels, args.base_channels * 2, args.base_channels * 3, args.base_channels * 4)
+    if any(width % args.decoder_num_heads for width in widths):
+        raise ValueError("all decoder scale widths must be divisible by decoder_num_heads; "
+                         f"decoder_num_heads={args.decoder_num_heads}, widths={widths}")
+    for name in ("decoder_depth", "decoder_window_size", "decoder_window_chunk_size", "decoder_mlp_ratio"):
+        if getattr(args, name) <= 0:
+            raise ValueError(f"{name} must be > 0, received {getattr(args, name)}")
+    for name in ("decoder_attention_dropout", "decoder_projection_dropout", "decoder_ffn_dropout"):
+        value = getattr(args, name)
+        if not 0.0 <= value < 1.0:
+            raise ValueError(f"{name} must be in [0, 1), received {value}")
     for name in ("route_tau_start", "route_tau_end", "memory_attention_temperature", "q_temperature", "density_smooth_l1_beta"):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} must be > 0")

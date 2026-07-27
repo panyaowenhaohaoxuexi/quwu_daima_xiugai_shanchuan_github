@@ -13,6 +13,8 @@ from torch.nn import functional as F
 
 from .hde import HDE
 from .monotonic_router import MonotonicFogRouter
+from .appearance_memory import MemoryRetriever, TIRConditionedAppearancePrior
+from .structure_appearance_transformer import StructureAppearanceTransformerStage
 
 
 def _groups(channels):
@@ -120,121 +122,34 @@ class LocalDeformableAppearanceSampler(nn.Module):
         return output, offsets, weights
 
 
-class LocalCrossAttention(nn.Module):
-    """Windowed cross attention: structure Query, RGB appearance Key/Value."""
-    def __init__(self, channels, window_size=3):
-        super().__init__()
-        self.window_size = int(window_size)
-        self.query = nn.Conv2d(channels, channels, 1, bias=False)
-        self.key = nn.Conv2d(channels, channels, 1, bias=False)
-        self.value = nn.Conv2d(channels, channels, 1, bias=False)
-        self.output = nn.Conv2d(channels, channels, 1, bias=False)
-
-    def forward(self, structure, appearance, validity):
-        batch, channels, height, width = structure.shape
-        radius = self.window_size // 2
-        query = self.query(structure).unsqueeze(2)
-        key = F.unfold(self.key(appearance), self.window_size, padding=radius)
-        key = key.reshape(batch, channels, self.window_size ** 2, height, width)
-        value = F.unfold(self.value(appearance), self.window_size, padding=radius)
-        value = value.reshape(batch, channels, self.window_size ** 2, height, width)
-        valid = F.unfold(validity, self.window_size, padding=radius)
-        valid = valid.reshape(batch, self.window_size ** 2, height, width) > 0.5
-        logits = (query * key).sum(dim=1) / (channels ** 0.5)
-        attention = torch.softmax(logits.masked_fill(~valid, -1e4), dim=1)
-        attended = (attention.unsqueeze(1) * value).sum(dim=2)
-        return structure + self.output(attended) * validity
-
-
-class MemoryRetriever(nn.Module):
-    def __init__(self, channels, structure_channels, max_tokens, topk, attention_temperature,
-                 reliability_epsilon, ratio_threshold, confidence_threshold, query_chunk_size=1024):
-        super().__init__()
-        self.max_tokens = int(max_tokens)
-        self.topk = int(topk)
-        self.attention_temperature = float(attention_temperature)
-        self.reliability_epsilon = float(reliability_epsilon)
-        self.ratio_threshold = float(ratio_threshold)
-        self.confidence_threshold = float(confidence_threshold)
-        self.query_chunk_size = int(query_chunk_size)
-        if self.query_chunk_size < 1:
-            raise ValueError("query_chunk_size must be >= 1")
-        self.key = nn.Conv2d(structure_channels, channels, 1)
-        self.query = nn.Conv2d(structure_channels, channels, 1)
-        self.context_key = nn.Linear(structure_channels, channels, bias=False)
-        self.context_query = nn.Linear(structure_channels, channels, bias=False)
-        self.prior = nn.Sequential(
-            nn.Conv2d(2 * structure_channels, channels, 1), nn.SiLU(inplace=True), nn.Conv2d(channels, channels, 1)
-        )
-
-    def forward(self, structure, value, reliability, validity):
-        batch, channels, height, width = value.shape
-        valid_mass = validity.sum(dim=(1, 2, 3))
-        reliable_mass = reliability.sum(dim=(1, 2, 3))
-        reliable_ratio = reliable_mass / valid_mass.clamp_min(1.0)
-        global_context = (structure * validity).sum(dim=(2, 3)) / valid_mass[:, None].clamp_min(1.0)
-        key = self.key(structure) + self.context_key(global_context).view(batch, channels, 1, 1)
-        query = self.query(structure) + self.context_query(global_context).view(batch, channels, 1, 1)
-        key = F.normalize(key.flatten(2).transpose(1, 2), dim=-1, eps=1e-6)
-        query = F.normalize(query.flatten(2).transpose(1, 2), dim=-1, eps=1e-6)
-        value_flat = value.flatten(2).transpose(1, 2)
-        reliability_flat = reliability.flatten(1)
-        retrieved = torch.zeros_like(value_flat)
-        confidence = torch.zeros(batch, height * width, device=value.device, dtype=value.dtype)
-        candidate_count = torch.zeros(batch, height * width, device=value.device, dtype=torch.long)
-        for item in range(batch):
-            valid_indices = torch.where(reliability_flat[item] > self.reliability_epsilon)[0]
-            if valid_indices.numel() == 0:
-                continue
-            if valid_indices.numel() > self.max_tokens:
-                positions = torch.linspace(0, valid_indices.numel() - 1, self.max_tokens,
-                                           device=value.device).round().long()
-                valid_indices = valid_indices[positions]
-            item_key = key[item, valid_indices]
-            item_value = value_flat[item, valid_indices]
-            item_reliability = reliability_flat[item, valid_indices]
-            top_count = min(self.topk, valid_indices.numel())
-            reliability_bias = item_reliability.clamp_min(self.reliability_epsilon).log().unsqueeze(0)
-            for query_start in range(0, query.shape[1], self.query_chunk_size):
-                query_end = min(query_start + self.query_chunk_size, query.shape[1])
-                query_chunk = query[item, query_start:query_end]
-                scores = query_chunk @ item_key.t() / self.attention_temperature
-                scores = scores + reliability_bias
-                top_scores, top_indices = torch.topk(scores, k=top_count, dim=-1)
-                attention = torch.softmax(top_scores, dim=-1)
-                retrieved[item, query_start:query_end] = (attention.unsqueeze(-1) * item_value[top_indices]).sum(dim=1)
-                candidate_count[item, query_start:query_end].fill_(top_count)
-                if top_count == 1:
-                    confidence[item, query_start:query_end].fill_(1.0)
-                else:
-                    entropy = -(attention * attention.clamp_min(1e-8).log()).sum(dim=-1)
-                    confidence[item, query_start:query_end] = (
-                        1.0 - entropy / torch.log(torch.tensor(float(top_count), device=value.device))
-                    ).clamp(0, 1)
-        retrieved = retrieved.transpose(1, 2).reshape(batch, channels, height, width)
-        confidence = confidence.reshape(batch, 1, height, width)
-        candidate_count = candidate_count.reshape(batch, 1, height, width)
-        sample_fallback = (reliable_ratio < self.ratio_threshold).view(batch, 1, 1, 1)
-        fallback = (sample_fallback | (confidence < self.confidence_threshold)).to(value.dtype)
-        global_context_map = global_context[:, :, None, None].expand(-1, -1, height, width)
-        prior_input = torch.cat((structure, global_context_map), dim=1)
-        appearance = fallback * self.prior(prior_input) + (1.0 - fallback) * retrieved
-        return appearance, confidence, fallback, reliable_mass, reliable_ratio, candidate_count
-
-
 class FogRoutedRGBTIRDehazer(nn.Module):
     def __init__(self, base_channels=16, router_hidden_channels=8, deform_num_samples=4,
                  deform_max_offset=2.0, num_structure_renderers=2, memory_max_tokens=256,
                  memory_topk=8, memory_attention_temperature=0.07,
                  memory_reliability_epsilon=1e-6, memory_reliable_ratio_threshold=0.01,
                  memory_confidence_threshold=0.1, memory_exclusion_extra_margin=0,
-                 boundary_width=1, memory_query_chunk_size=1024):
+                 boundary_width=1, memory_query_chunk_size=1024, decoder_num_heads=4,
+                 decoder_depth=1, decoder_window_size=7, decoder_window_chunk_size=128,
+                 decoder_mlp_ratio=4.0, decoder_attention_dropout=0.0,
+                 decoder_projection_dropout=0.0, decoder_ffn_dropout=0.0):
         super().__init__()
         if memory_max_tokens < 1 or not (2 <= memory_topk <= memory_max_tokens):
             raise ValueError("require 2 <= memory_topk <= memory_max_tokens")
         if deform_num_samples < 1 or deform_max_offset < 0 or num_structure_renderers < 1:
             raise ValueError("invalid deform or renderer configuration")
         self.base_channels = int(base_channels)
+        if self.base_channels <= 0:
+            raise ValueError("base_channels must be > 0")
+        if int(decoder_num_heads) <= 0:
+            raise ValueError("decoder_num_heads must be > 0")
+        for name, value in (("decoder_depth", decoder_depth), ("decoder_window_size", decoder_window_size),
+                            ("decoder_window_chunk_size", decoder_window_chunk_size), ("decoder_mlp_ratio", decoder_mlp_ratio)):
+            if float(value) <= 0:
+                raise ValueError(f"{name} must be > 0, received {value}")
+        for name, value in (("decoder_attention_dropout", decoder_attention_dropout),
+                            ("decoder_projection_dropout", decoder_projection_dropout), ("decoder_ffn_dropout", decoder_ffn_dropout)):
+            if not 0.0 <= float(value) < 1.0:
+                raise ValueError(f"{name} must be in [0, 1), received {value}")
         self.boundary_width = int(boundary_width)
         self.deform_max_offset = float(deform_max_offset)
         self.memory_exclusion_extra_margin = int(memory_exclusion_extra_margin)
@@ -247,6 +162,12 @@ class FogRoutedRGBTIRDehazer(nn.Module):
         self.tir_encoder = PyramidEncoder(base_channels)
         self.scale_names = ("h2", "h4", "h8", "h16")
         rgb_widths = self.rgb_encoder.widths
+        expected_widths = (self.base_channels, self.base_channels * 2, self.base_channels * 3, self.base_channels * 4)
+        if tuple(rgb_widths) != expected_widths:
+            raise ValueError(f"unexpected decoder widths={tuple(rgb_widths)}, expected={expected_widths}")
+        if any(width % int(decoder_num_heads) for width in rgb_widths):
+            raise ValueError("all decoder scale widths must be divisible by decoder_num_heads; "
+                             f"decoder_num_heads={decoder_num_heads}, widths={tuple(rgb_widths)}")
         structure_widths = (32, 48, 64, 96)
         self.appearance = nn.ModuleDict()
         self.structure = nn.ModuleDict()
@@ -276,8 +197,12 @@ class FogRoutedRGBTIRDehazer(nn.Module):
                 memory_query_chunk_size,
             )
         h2_channels = rgb_widths[0]
-        self.decoder_cross = nn.ModuleDict({
-            name: LocalCrossAttention(width) for name, width in zip(self.scale_names, rgb_widths)
+        self.decoder_stages = nn.ModuleDict({
+            name: StructureAppearanceTransformerStage(
+                width, decoder_num_heads, decoder_depth, decoder_window_size, decoder_window_chunk_size,
+                mlp_ratio=decoder_mlp_ratio, attention_dropout=decoder_attention_dropout,
+                projection_dropout=decoder_projection_dropout, ffn_dropout=decoder_ffn_dropout,
+            ) for name, width in zip(self.scale_names, rgb_widths)
         })
         self.decoder_up = nn.ModuleDict({
             "h16_to_h8": nn.Conv2d(rgb_widths[3], rgb_widths[2], 1),
@@ -420,15 +345,17 @@ class FogRoutedRGBTIRDehazer(nn.Module):
             ), dim=1))
             structures[name] = self.merge[name](torch.cat(((1 - route) * fusion_candidate, route * completion_candidate, boundary_feature), dim=1))
             reliability = ((1.0 - route).detach() * valid * (1.0 - exclusion))
-            retrieved, confidence, fallback, mass, ratio, count = self.memory[name](S, fusion_candidate, reliability, valid)
-            appearances[name] = (1.0 - route) * fusion_candidate + route * retrieved
+            retrieved, confidence, fallback, mass, ratio, count, gate = self.memory[name](S, fusion_candidate, reliability, valid)
+            appearances[name] = ((1.0 - route) * fusion_candidate + route * retrieved) * valid
+            structures[name] = structures[name] * valid
             debug_scales[name] = {
                 "effective_override_mask": mask, "candidate_count": count, "reliability": reliability,
                 "offsets": offsets, "sample_weights": sample_weights, "renderer_weights": renderer_weights,
                 "confidence": confidence, "fallback": fallback, "reliable_mass": mass, "reliable_ratio": ratio,
+                "retrieval_gate": gate,
             }
             if name == "h2":
-                reporting = (confidence, fallback, mass, ratio, boundary)
+                reporting = (confidence, fallback, mass, ratio, gate, boundary)
         decoded = None
         previous_name = None
         for name in reversed(self.scale_names):
@@ -438,11 +365,11 @@ class FogRoutedRGBTIRDehazer(nn.Module):
                 decoded = F.interpolate(projection(decoded), size=structural_query.shape[-2:],
                                         mode="bilinear", align_corners=False)
                 structural_query = structural_query + decoded
-            decoded = self.decoder_cross[name](structural_query, appearances[name], validity_scales[name])
+            decoded = self.decoder_stages[name](structural_query, appearances[name], validity_scales[name])
             previous_name = name
         decoded = F.silu(decoded)
         pred_clear = torch.sigmoid(self.rgb_output_head(F.interpolate(decoded, size=active.shape[-2:], mode="bilinear", align_corners=False)))
-        confidence, fallback, mass, ratio, boundary = reporting
+        confidence, fallback, mass, ratio, gate, boundary = reporting
         output = {
             "pred_clear": self._crop(pred_clear, original_size),
             "density_map": self._crop(context["density_map"], original_size),
@@ -454,6 +381,7 @@ class FogRoutedRGBTIRDehazer(nn.Module):
             "memory_reliable_mass": mass,
             "memory_reliable_ratio": ratio,
             "memory_fallback_mask": self._crop(F.interpolate(fallback, size=active.shape[-2:], mode="nearest"), original_size),
+            "memory_retrieval_gate": self._crop(F.interpolate(gate, size=active.shape[-2:], mode="bilinear", align_corners=False), original_size),
         }
         if return_debug:
             output["debug"] = {
@@ -468,6 +396,7 @@ class FogRoutedRGBTIRDehazer(nn.Module):
                 "memory_stats_by_scale": {
                     name: {
                         "confidence": value["confidence"], "fallback_mask": value["fallback"],
+                        "retrieval_gate": value["retrieval_gate"],
                         "reliable_mass": value["reliable_mass"], "reliable_ratio": value["reliable_ratio"],
                     }
                     for name, value in debug_scales.items()

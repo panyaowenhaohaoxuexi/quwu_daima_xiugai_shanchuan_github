@@ -9,7 +9,8 @@ from PIL import Image
 from torchvision.transforms import functional as TF
 
 from data.data_loader import COMMON_IMAGE_EXTS, load_tir_as_float_tensor
-from utils.checkpoint import build_model_from_config, require_stage, tir_normalization_config
+from utils.checkpoint import (build_model_from_config, load_strict_v2_state_dict,
+                              require_checkpoint_format, require_stage, tir_normalization_config)
 
 
 def build_parser():
@@ -99,13 +100,15 @@ def evaluate_directory(model, config, hazy_dir, tir_dir, output_dir, device, sav
 def main(argv=None):
     args = build_parser().parse_args(argv)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    require_checkpoint_format(checkpoint)
     stage = checkpoint.get("training_stage")
     if stage not in ("source", "ema"):
         raise ValueError("checkpoint training_stage must be 'source' or 'ema'")
     config = checkpoint["config"]
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     model = build_model_from_config(config).to(device)
-    model.load_state_dict(checkpoint["model"] if stage == "source" else checkpoint[args.ema_model], strict=True)
+    load_strict_v2_state_dict(model, checkpoint["model"] if stage == "source" else checkpoint[args.ema_model],
+                              label="Source model" if stage == "source" else f"EMA {args.ema_model}")
     model.eval()
     evaluate_directory(model, config, args.hazy_dir, args.tir_dir, args.output_dir, device,
                        args.save_aux, args.format)

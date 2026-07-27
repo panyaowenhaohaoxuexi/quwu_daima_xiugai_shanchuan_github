@@ -6,9 +6,17 @@ from Eval import main
 from model import FogRoutedRGBTIRDehazer
 
 
+DECODER_CONFIG = {
+    "decoder_num_heads": 4, "decoder_depth": 1, "decoder_window_size": 7,
+    "decoder_window_chunk_size": 128, "decoder_mlp_ratio": 4.0,
+    "decoder_attention_dropout": 0.0, "decoder_projection_dropout": 0.0,
+    "decoder_ffn_dropout": 0.0,
+}
+
+
 def test_eval_saves_prediction_and_aux_at_original_size(tmp_path):
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
-    config = {
+    config = {**DECODER_CONFIG,
         "base_channels": 8, "router_hidden_channels": 8, "deform_num_samples": 4,
         "deform_max_offset": 2.0, "num_structure_renderers": 2, "memory_max_tokens": 16,
         "memory_topk": 2, "memory_query_chunk_size": 1024, "memory_attention_temperature": 0.07,
@@ -20,7 +28,7 @@ def test_eval_saves_prediction_and_aux_at_original_size(tmp_path):
         "tir_channel_tolerance_code_values": 1, "tir_channel_tolerance_float": 1e-5,
     }
     checkpoint = tmp_path / "source.pt"
-    torch.save({"format_version": 1, "training_stage": "source", "model_class": "FogRoutedRGBTIRDehazer",
+    torch.save({"format_version": 2, "training_stage": "source", "model_class": "FogRoutedRGBTIRDehazer",
                 "density_gt_semantics": "transmission", "config": config, "model": model.state_dict()}, checkpoint)
     hazy_dir, tir_dir, out_dir = tmp_path / "hazy", tmp_path / "tir", tmp_path / "out"
     hazy_dir.mkdir(); tir_dir.mkdir()
@@ -36,7 +44,7 @@ def test_eval_saves_prediction_and_aux_at_original_size(tmp_path):
 
 def test_eval_rejects_mismatched_tir_under_strict_checkpoint_alignment(tmp_path):
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
-    config = {
+    config = {**DECODER_CONFIG,
         "base_channels": 8, "router_hidden_channels": 8, "deform_num_samples": 4,
         "deform_max_offset": 2.0, "num_structure_renderers": 2, "memory_max_tokens": 16,
         "memory_topk": 2, "memory_query_chunk_size": 1024, "memory_attention_temperature": 0.07,
@@ -48,7 +56,7 @@ def test_eval_rejects_mismatched_tir_under_strict_checkpoint_alignment(tmp_path)
         "tir_channel_tolerance_code_values": 1, "tir_channel_tolerance_float": 1e-5,
     }
     checkpoint = tmp_path / "source.pt"
-    torch.save({"format_version": 1, "training_stage": "source", "model_class": "FogRoutedRGBTIRDehazer",
+    torch.save({"format_version": 2, "training_stage": "source", "model_class": "FogRoutedRGBTIRDehazer",
                 "density_gt_semantics": "transmission", "config": config, "model": model.state_dict()}, checkpoint)
     hazy_dir, tir_dir, out_dir = tmp_path / "hazy", tmp_path / "tir", tmp_path / "out"
     hazy_dir.mkdir(); tir_dir.mkdir()
@@ -63,7 +71,7 @@ def test_eval_rejects_mismatched_tir_under_strict_checkpoint_alignment(tmp_path)
 
 def test_eval_honors_requested_output_format(tmp_path):
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
-    config = {
+    config = {**DECODER_CONFIG,
         "base_channels": 8, "router_hidden_channels": 8, "deform_num_samples": 4,
         "deform_max_offset": 2.0, "num_structure_renderers": 2, "memory_max_tokens": 16,
         "memory_topk": 2, "memory_query_chunk_size": 1024, "memory_attention_temperature": 0.07,
@@ -75,7 +83,7 @@ def test_eval_honors_requested_output_format(tmp_path):
         "tir_channel_tolerance_code_values": 1, "tir_channel_tolerance_float": 1e-5,
     }
     checkpoint = tmp_path / "source.pt"
-    torch.save({"format_version": 1, "training_stage": "source", "model_class": "FogRoutedRGBTIRDehazer",
+    torch.save({"format_version": 2, "training_stage": "source", "model_class": "FogRoutedRGBTIRDehazer",
                 "density_gt_semantics": "transmission", "config": config, "model": model.state_dict()}, checkpoint)
     hazy_dir, tir_dir, out_dir = tmp_path / "hazy", tmp_path / "tir", tmp_path / "out"
     hazy_dir.mkdir(); tir_dir.mkdir()
@@ -90,7 +98,7 @@ def test_eval_honors_requested_output_format(tmp_path):
 def test_eval_auto_detects_ema_and_selects_student_or_teacher_weights(tmp_path):
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
     teacher = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
-    config = {
+    config = {**DECODER_CONFIG,
         "base_channels": 8, "router_hidden_channels": 8, "deform_num_samples": 4,
         "deform_max_offset": 2.0, "num_structure_renderers": 2, "memory_max_tokens": 16,
         "memory_topk": 2, "memory_query_chunk_size": 1024, "memory_attention_temperature": 0.07,
@@ -102,7 +110,7 @@ def test_eval_auto_detects_ema_and_selects_student_or_teacher_weights(tmp_path):
         "tir_channel_tolerance_code_values": 1, "tir_channel_tolerance_float": 1e-5,
     }
     checkpoint = tmp_path / "ema.pt"
-    torch.save({"training_stage": "ema", "config": config, "student": model.state_dict(),
+    torch.save({"format_version": 2, "training_stage": "ema", "config": config, "student": model.state_dict(),
                 "teacher": teacher.state_dict()}, checkpoint)
     hazy_dir, tir_dir = tmp_path / "hazy", tmp_path / "tir"
     hazy_dir.mkdir(); tir_dir.mkdir()
@@ -118,7 +126,7 @@ def test_eval_auto_detects_ema_and_selects_student_or_teacher_weights(tmp_path):
 
 def test_eval_pairs_case_insensitive_stems_across_extensions_and_ignores_non_images(tmp_path):
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
-    config = {
+    config = {**DECODER_CONFIG,
         "base_channels": 8, "router_hidden_channels": 8, "deform_num_samples": 4,
         "deform_max_offset": 2.0, "num_structure_renderers": 2, "memory_max_tokens": 16,
         "memory_topk": 2, "memory_query_chunk_size": 1024, "memory_attention_temperature": 0.07,
@@ -130,7 +138,7 @@ def test_eval_pairs_case_insensitive_stems_across_extensions_and_ignores_non_ima
         "tir_channel_tolerance_code_values": 1, "tir_channel_tolerance_float": 1e-5,
     }
     checkpoint = tmp_path / "source.pt"
-    torch.save({"training_stage": "source", "config": config, "model": model.state_dict()}, checkpoint)
+    torch.save({"format_version": 2, "training_stage": "source", "config": config, "model": model.state_dict()}, checkpoint)
     hazy_dir, tir_dir, out_dir = tmp_path / "hazy", tmp_path / "tir", tmp_path / "out"
     hazy_dir.mkdir(); tir_dir.mkdir()
     Image.new("RGB", (32, 32), (80, 80, 80)).save(hazy_dir / "X.jpg")
@@ -144,7 +152,7 @@ def test_eval_pairs_case_insensitive_stems_across_extensions_and_ignores_non_ima
 
 def test_eval_rejects_case_insensitive_duplicate_hazy_stems(tmp_path):
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
-    config = {
+    config = {**DECODER_CONFIG,
         "base_channels": 8, "router_hidden_channels": 8, "deform_num_samples": 4,
         "deform_max_offset": 2.0, "num_structure_renderers": 2, "memory_max_tokens": 16,
         "memory_topk": 2, "memory_query_chunk_size": 1024, "memory_attention_temperature": 0.07,
@@ -156,7 +164,7 @@ def test_eval_rejects_case_insensitive_duplicate_hazy_stems(tmp_path):
         "tir_channel_tolerance_code_values": 1, "tir_channel_tolerance_float": 1e-5,
     }
     checkpoint = tmp_path / "source.pt"
-    torch.save({"training_stage": "source", "config": config, "model": model.state_dict()}, checkpoint)
+    torch.save({"format_version": 2, "training_stage": "source", "config": config, "model": model.state_dict()}, checkpoint)
     hazy_dir, tir_dir, out_dir = tmp_path / "hazy", tmp_path / "tir", tmp_path / "out"
     hazy_dir.mkdir(); tir_dir.mkdir()
     first_hazy, second_hazy = hazy_dir / "x.jpg", hazy_dir / "X.png"
@@ -173,7 +181,7 @@ def test_eval_rejects_case_insensitive_duplicate_hazy_stems(tmp_path):
 
 def test_eval_reports_missing_and_ambiguous_tir_stem_pairs(tmp_path):
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
-    config = {
+    config = {**DECODER_CONFIG,
         "base_channels": 8, "router_hidden_channels": 8, "deform_num_samples": 4,
         "deform_max_offset": 2.0, "num_structure_renderers": 2, "memory_max_tokens": 16,
         "memory_topk": 2, "memory_query_chunk_size": 1024, "memory_attention_temperature": 0.07,
@@ -185,7 +193,7 @@ def test_eval_reports_missing_and_ambiguous_tir_stem_pairs(tmp_path):
         "tir_channel_tolerance_code_values": 1, "tir_channel_tolerance_float": 1e-5,
     }
     checkpoint = tmp_path / "source.pt"
-    torch.save({"training_stage": "source", "config": config, "model": model.state_dict()}, checkpoint)
+    torch.save({"format_version": 2, "training_stage": "source", "config": config, "model": model.state_dict()}, checkpoint)
     hazy_dir, tir_dir, out_dir = tmp_path / "hazy", tmp_path / "tir", tmp_path / "out"
     hazy_dir.mkdir(); tir_dir.mkdir()
     Image.new("RGB", (32, 32), (80, 80, 80)).save(hazy_dir / "x.jpg")

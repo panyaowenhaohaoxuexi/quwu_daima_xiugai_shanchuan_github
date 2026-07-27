@@ -7,6 +7,8 @@ import json
 
 import torch
 
+from utils.checkpoint import CHECKPOINT_FORMAT_VERSION, MODEL_CONFIG_KEYS
+
 
 def extract_state_dict(checkpoint):
     """Extract one explicit state mapping without guessing formal load behavior."""
@@ -44,7 +46,22 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     state = extract_state_dict(checkpoint)
-    report = {"checkpoint_key_count": len(state), "keys": sorted(state)}
+    stage = checkpoint.get("training_stage") if isinstance(checkpoint, dict) else None
+    config = checkpoint.get("config") if isinstance(checkpoint, dict) else None
+    expected_states = ((stage == "source" and "model" in checkpoint) or
+                       (stage == "ema" and "student" in checkpoint and "teacher" in checkpoint)) if isinstance(checkpoint, dict) else False
+    state_fields_are_tensors = all(
+        isinstance(checkpoint.get(key), dict) and all(torch.is_tensor(value) for value in checkpoint[key].values())
+        for key in (("model",) if stage == "source" else ("student", "teacher") if stage == "ema" else ())
+    )
+    report = {"checkpoint_key_count": len(state), "keys": sorted(state),
+              "format_version": checkpoint.get("format_version") if isinstance(checkpoint, dict) else None,
+              "has_v2_format": isinstance(checkpoint, dict) and checkpoint.get("format_version") == CHECKPOINT_FORMAT_VERSION,
+              "has_valid_training_stage": stage in ("source", "ema"),
+              "has_complete_model_config": isinstance(config, dict) and all(key in config for key in MODEL_CONFIG_KEYS),
+              "has_expected_state_dict_fields": expected_states and state_fields_are_tensors}
+    report["is_formal_v2_compatible"] = all((report["has_v2_format"], report["has_valid_training_stage"],
+                                              report["has_complete_model_config"], report["has_expected_state_dict_fields"]))
     if args.reference_checkpoint:
         reference = extract_state_dict(torch.load(args.reference_checkpoint, map_location="cpu"))
         report.update(compare_state_dicts(state, reference))

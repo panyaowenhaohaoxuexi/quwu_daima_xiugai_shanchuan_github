@@ -39,7 +39,7 @@ def test_ema_entrypoint_runs_real_and_source_anchor_from_source_checkpoint(tmp_p
     assert checkpoint["training_stage"] == "ema"
     assert checkpoint["ema_global_step"] == 1
     assert set(checkpoint) == {
-        "training_stage", "student", "teacher", "optimizer", "epoch",
+        "format_version", "training_stage", "student", "teacher", "optimizer", "epoch",
         "source_global_step", "ema_global_step", "config",
     }
 

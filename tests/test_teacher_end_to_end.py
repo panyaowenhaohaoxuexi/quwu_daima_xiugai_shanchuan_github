@@ -29,7 +29,7 @@ def test_source_training_entrypoint_runs_tiny_batch_and_writes_epoch_checkpoint(
     checkpoint = torch.load(checkpoint_dir / "source_last.pt", map_location="cpu")
     assert checkpoint["training_stage"] == "source"
     assert checkpoint["global_step"] == 1
-    assert set(checkpoint) == {"training_stage", "model", "optimizer", "epoch", "global_step", "config"}
+    assert set(checkpoint) == {"format_version", "training_stage", "model", "optimizer", "epoch", "global_step", "config"}
 
     # A checkpoint saved exactly at the one-sample epoch boundary must advance
     # to a fresh deterministic sampler permutation rather than yield no batch.

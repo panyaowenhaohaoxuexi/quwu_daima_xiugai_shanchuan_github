@@ -17,7 +17,7 @@ from option.EMA import (build_ema_checkpoint_config, build_parser, prepare_exper
                         resolve_ema_config, save_config, tir_normalization_config_from_args, validate_config)
 from training.source import OmegaSampler, compute_source_batch_losses
 from utils.checkpoint import (build_ema_checkpoint, build_model_from_config, load_ema_checkpoint,
-                              require_stage)
+                              load_strict_v2_state_dict, require_checkpoint_format, require_stage)
 
 
 def _set_seed(seed):
@@ -111,6 +111,7 @@ def main(argv=None):
         raise ValueError("EMA requires exactly one of --source_checkpoint or --resume_checkpoint")
     checkpoint = torch.load(raw_args.resume_checkpoint or raw_args.source_checkpoint, map_location="cpu")
     expected_stage = "ema" if raw_args.resume_checkpoint else "source"
+    require_checkpoint_format(checkpoint)
     require_stage(checkpoint, expected_stage)
     args = validate_config(argparse.Namespace(**resolve_ema_config(
         raw_args, checkpoint["config"], resume=expected_stage == "ema"
@@ -120,7 +121,7 @@ def main(argv=None):
     student = build_model_from_config(vars(args)).to(device)
     optimizer = AdamW(student.parameters(), lr=args.learning_rate)
     if expected_stage == "source":
-        student.load_state_dict(checkpoint["model"], strict=True)
+        load_strict_v2_state_dict(student, checkpoint.get("model"), label="Source model")
         teacher, start_epoch = initialize_teacher(student), 0
         source_global_step, ema_global_step = int(checkpoint["global_step"]), 0
     else:

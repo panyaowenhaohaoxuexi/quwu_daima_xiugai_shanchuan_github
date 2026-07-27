@@ -479,3 +479,24 @@
   is mapped to the new anchor-path field; an explicitly supplied new path wins.
 - Source resume requires every persisted training-objective field and rejects
   an incomplete checkpoint configuration with a clear error.
+
+## 2026-07-27 -- structure--appearance Transformer decoder and checkpoint v2
+
+- Replaced the local one-shot decoder attention with a single h16-to-h2
+  multi-scale structure--appearance cross-attention Transformer decoder. Each
+  stage uses pre-norm multi-head window attention, learnable 2-D relative bias,
+  residual FFN blocks and validity-safe right/bottom padding.
+- At each scale, the routed structural feature initializes or updates the
+  decoder query state; assembled appearance is the only Key/Value input. TIR
+  content never directly enters Transformer Key/Value. The TIR-conditioned
+  prior receives only TIR structure and global TIR structure context.
+- Window batches are chunked by `decoder_window_chunk_size`, so high-resolution
+  scales do not materialize a global spatial attention matrix. Invalid windows,
+  attention, FFN residuals and stage outputs are explicitly zeroed.
+- Appearance retrieval now uses a continuous confidence/ratio/coverage gate;
+  empty memory, padding and absent candidates produce a strict zero gate.
+  Fallback remains a diagnostic mask only.
+- Formal Source/EMA/Eval checkpoint loading requires format version 2,
+  complete decoder configuration and strict state-dict loading. Legacy
+  inspection remains read-only and reports only static compatibility; it does
+  not guarantee a successful strict load.

@@ -11,11 +11,11 @@ def test_empty_memory_fallback_prior_uses_global_tir_structure_context():
         ratio_threshold=0.01, confidence_threshold=0.1,
     )
     with torch.no_grad():
-        memory.prior[0].weight.zero_()
-        memory.prior[0].weight[0, 1, 0, 0] = 1.0
-        memory.prior[0].bias.zero_()
-        memory.prior[2].weight.fill_(1.0)
-        memory.prior[2].bias.zero_()
+        memory.prior.layers[0].weight.zero_()
+        memory.prior.layers[0].weight[0, 1, 0, 0] = 1.0
+        memory.prior.layers[0].bias.zero_()
+        memory.prior.layers[2].weight.fill_(1.0)
+        memory.prior.layers[2].bias.zero_()
 
     validity = torch.ones(1, 1, 3, 3)
     reliability = torch.zeros_like(validity)
@@ -26,13 +26,13 @@ def test_empty_memory_fallback_prior_uses_global_tir_structure_context():
     value_a = torch.zeros_like(validity)
     value_b = torch.full_like(validity, 17.0)
 
-    appearance_a, _, fallback_a, _, _, candidate_count_a = memory(
+    appearance_a, _, fallback_a, _, _, candidate_count_a, _ = memory(
         structure_a, value_a, reliability, validity,
     )
-    appearance_with_other_value, _, fallback_with_other_value, _, _, candidate_count_with_other_value = memory(
+    appearance_with_other_value, _, fallback_with_other_value, _, _, candidate_count_with_other_value, _ = memory(
         structure_a, value_b, reliability, validity,
     )
-    appearance_b, _, fallback_b, _, _, candidate_count_b = memory(
+    appearance_b, _, fallback_b, _, _, candidate_count_b, _ = memory(
         structure_b, value_a, reliability, validity,
     )
 
@@ -61,7 +61,7 @@ def test_tiny_model_cpu_supports_split_context_and_original_output_size():
     for output in (soft, hard, full):
         for key in (
             "pred_clear", "density_map", "route_logits", "route_soft", "route_hard",
-            "boundary_map", "memory_confidence", "memory_fallback_mask",
+            "boundary_map", "memory_confidence", "memory_fallback_mask", "memory_retrieval_gate",
         ):
             assert output[key].shape[-2:] == expected_spatial
         assert output["memory_reliable_mass"].shape == (1,)
@@ -124,6 +124,101 @@ def test_unique_decoder_consumes_every_routed_structure_scale():
 
     for scale in ("h2", "h4", "h8", "h16"):
         assert any(parameter.grad is not None for parameter in model.merge[scale].parameters())
+        assert any(parameter.grad is not None and torch.isfinite(parameter.grad).all() and parameter.grad.abs().sum() > 0
+                   for parameter in model.decoder_stages[scale].parameters())
+
+
+def test_transformer_stage_and_projection_hooks_keep_structure_query_and_appearance_key_value_separate():
+    from training.source import _detach_context
+
+    torch.manual_seed(41)
+    model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2).eval()
+    context = _detach_context(model.encode_context(torch.rand(1, 3, 32, 32), torch.rand(1, 3, 32, 32)))
+    full = torch.ones(1, 1, 32, 32)
+    stage = model.decoder_stages["h2"]
+    block = stage.blocks[0]
+    captured = {}
+    handles = [
+        stage.register_forward_pre_hook(lambda _module, values: captured.update(
+            stage_structure=values[0].detach(), stage_appearance=values[1].detach())),
+        block.structure_norm.register_forward_hook(lambda _module, values, output: captured.update(q_norm=output.detach())),
+        block.appearance_norm.register_forward_hook(lambda _module, values, output: captured.update(kv_norm=output.detach())),
+        block.q_proj.register_forward_pre_hook(lambda _module, values: captured.update(q_proj=values[0].detach())),
+        block.k_proj.register_forward_pre_hook(lambda _module, values: captured.update(k_proj=values[0].detach())),
+        block.v_proj.register_forward_pre_hook(lambda _module, values: captured.update(v_proj=values[0].detach())),
+    ]
+    try:
+        output = model.decode_with_route(context, route_mode="hard", route_override_value=full,
+                                         route_override_mask=full, memory_exclude_mask=full, return_debug=True)
+    finally:
+        for handle in handles:
+            handle.remove()
+    torch.testing.assert_close(captured["q_proj"], captured["q_norm"])
+    torch.testing.assert_close(captured["k_proj"], captured["kv_norm"])
+    torch.testing.assert_close(captured["v_proj"], captured["kv_norm"])
+    torch.testing.assert_close(captured["stage_appearance"], output["debug"]["appearance_tokens"]["h2"])
+    assert captured["stage_structure"].shape == output["debug"]["structure_tokens"]["h2"].shape
+
+
+def test_content_only_completion_change_keeps_prior_and_transformer_key_value_inputs_identical():
+    from training.source import _detach_context
+
+    torch.manual_seed(43)
+    model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2).eval()
+    base = _detach_context(model.encode_context(torch.rand(1, 3, 32, 32), torch.rand(1, 3, 32, 32)))
+    full = torch.ones(1, 1, 32, 32)
+
+    def run(context):
+        recorded = {}
+        block = model.decoder_stages["h2"].blocks[0]
+        handles = [
+            model.memory["h2"].prior.register_forward_pre_hook(lambda _m, values: recorded.update(prior_input=values[0].detach())),
+            model.memory["h2"].prior.register_forward_hook(lambda _m, values, output: recorded.update(prior_output=output.detach())),
+            block.k_proj.register_forward_pre_hook(lambda _m, values: recorded.update(k=values[0].detach())),
+            block.v_proj.register_forward_pre_hook(lambda _m, values: recorded.update(v=values[0].detach())),
+        ]
+        try:
+            model.decode_with_route(context, route_mode="hard", route_override_value=full,
+                                    route_override_mask=full, memory_exclude_mask=full)
+        finally:
+            for handle in handles:
+                handle.remove()
+        return recorded
+
+    changed = _detach_context(base)
+    changed["tir_content_pyramid"]["h2"] = changed["tir_content_pyramid"]["h2"] + 0.25
+    reference, actual = run(base), run(changed)
+    for key in ("prior_input", "prior_output", "k", "v"):
+        torch.testing.assert_close(actual[key], reference[key], atol=0, rtol=0)
+
+
+def test_structure_tir_has_deterministic_query_prior_and_key_value_gradient_paths():
+    from training.source import _detach_context
+
+    torch.manual_seed(47)
+    model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2).eval()
+    context = _detach_context(model.encode_context(torch.rand(1, 3, 32, 32), torch.rand(1, 3, 32, 32)))
+    structure = context["tir_structure_pyramid"]["h2"].detach().clone().requires_grad_(True)
+    context["tir_structure_pyramid"]["h2"] = structure
+    full = torch.ones(1, 1, 32, 32)
+    block, prior = model.decoder_stages["h2"].blocks[0], model.memory["h2"].prior
+    recorded = {}
+    handles = [
+        block.structure_norm.register_forward_hook(lambda _m, values, output: recorded.update(q=output)),
+        prior.register_forward_hook(lambda _m, values, output: recorded.update(prior=output)),
+        block.k_proj.register_forward_pre_hook(lambda _m, values: recorded.update(k=values[0])),
+        block.v_proj.register_forward_pre_hook(lambda _m, values: recorded.update(v=values[0])),
+    ]
+    try:
+        model.decode_with_route(context, route_mode="hard", route_override_value=full,
+                                route_override_mask=full, memory_exclude_mask=full)
+        (recorded["q"].square().mean() + recorded["prior"].square().mean() +
+         recorded["k"].square().mean() + recorded["v"].square().mean()).backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert structure.grad is not None and torch.isfinite(structure.grad).all()
+    assert structure.grad.abs().sum() > 0
 
 
 def test_full_completion_with_excluded_memory_has_no_rgb_feature_gradient():
@@ -188,7 +283,7 @@ def test_memory_query_chunks_match_unchunked_and_bound_score_rows(monkeypatch):
     expected = reference(hazy, tir, route_mode="soft")
 
     assert actual_max_rows <= 7
-    for key in ("pred_clear", "memory_confidence", "memory_fallback_mask", "memory_reliable_mass", "memory_reliable_ratio"):
+    for key in ("pred_clear", "memory_confidence", "memory_fallback_mask", "memory_retrieval_gate", "memory_reliable_mass", "memory_reliable_ratio"):
         assert torch.allclose(actual[key], expected[key], atol=1e-6)
 
 

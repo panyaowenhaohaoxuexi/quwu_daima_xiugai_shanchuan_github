@@ -17,6 +17,8 @@ INHERITED_SOURCE_KEYS = (
     "memory_query_chunk_size", "memory_attention_temperature", "memory_reliability_epsilon",
     "memory_reliable_ratio_threshold", "memory_confidence_threshold",
     "memory_exclusion_extra_margin", "boundary_width", "route_tau_start", "route_tau_end",
+    "decoder_num_heads", "decoder_depth", "decoder_window_size", "decoder_window_chunk_size",
+    "decoder_mlp_ratio", "decoder_attention_dropout", "decoder_projection_dropout", "decoder_ffn_dropout",
     "route_hard_start_step", "train_size", "density_gt_semantics", "density_map_normalization",
     "density_fixed_min", "density_fixed_max", "density_calibrated_min",
     "density_calibrated_max", "tir_normalization", "tir_fixed_min", "tir_fixed_max",
@@ -134,6 +136,19 @@ def _validate_inherited_source_config(args):
         raise ValueError("invalid Source renderer, memory, or train-size configuration")
     if args.memory_exclusion_extra_margin < 0 or not 2 <= args.memory_topk <= args.memory_max_tokens:
         raise ValueError("invalid Source memory configuration")
+    if args.base_channels <= 0 or args.decoder_num_heads <= 0:
+        raise ValueError("base_channels and decoder_num_heads must be > 0")
+    widths = (args.base_channels, args.base_channels * 2, args.base_channels * 3, args.base_channels * 4)
+    if any(width % args.decoder_num_heads for width in widths):
+        raise ValueError("all decoder scale widths must be divisible by decoder_num_heads; "
+                         f"decoder_num_heads={args.decoder_num_heads}, widths={widths}")
+    for name in ("decoder_depth", "decoder_window_size", "decoder_window_chunk_size", "decoder_mlp_ratio"):
+        if getattr(args, name) <= 0:
+            raise ValueError(f"{name} must be > 0, received {getattr(args, name)}")
+    for name in ("decoder_attention_dropout", "decoder_projection_dropout", "decoder_ffn_dropout"):
+        value = getattr(args, name)
+        if not 0.0 <= value < 1.0:
+            raise ValueError(f"{name} must be in [0, 1), received {value}")
     for name in ("memory_reliable_ratio_threshold", "memory_confidence_threshold"):
         if not 0 <= getattr(args, name) <= 1:
             raise ValueError(f"{name} must be in [0,1]")
