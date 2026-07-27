@@ -1,6 +1,6 @@
 import torch
 
-from training.source_objective import compute_source_objective
+from loss.source import compute_source_objective
 
 
 def test_source_objective_uses_q_only_inside_omega_and_binary_penalty():

@@ -1,6 +1,6 @@
 import torch
 
-from training.omega_sampler import OmegaSampler
+from training.source import OmegaSampler
 
 
 def test_omega_sampler_returns_detached_nonoverlapping_support_and_weights():

@@ -15,7 +15,7 @@ def build_model_from_config(config):
     missing = [key for key in MODEL_CONFIG_KEYS if key not in config]
     if missing:
         raise ValueError("checkpoint lacks model configuration: " + ", ".join(missing))
-    from model.fog_routed_dehazer import FogRoutedRGBTIRDehazer
+    from model.Teacher import FogRoutedRGBTIRDehazer
     return FogRoutedRGBTIRDehazer(**{key: config[key] for key in MODEL_CONFIG_KEYS})
 
 

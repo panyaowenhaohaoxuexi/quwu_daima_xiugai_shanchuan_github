@@ -1,10 +1,7 @@
 import torch
 from torch import nn
 
-from training.ema_core import (
-    ema_update, real_consistency_loss, stability_weights,
-    synchronize_frozen_buffers, update_explicit_ema_state_buffers,
-)
+from EMA import real_consistency_loss, stability_weights, update_teacher_after_success
 
 
 def test_stability_weights_are_separate_detached_and_decrease_with_teacher_difference():
@@ -25,7 +22,7 @@ def test_ema_update_changes_parameters_only_after_a_successful_step():
         student.weight.fill_(3.0)
         teacher.weight.fill_(1.0)
 
-    ema_update(teacher, student, decay=0.5)
+    update_teacher_after_success(teacher, student, decay=0.5)
 
     assert teacher.weight.item() == 2.0
     assert not teacher.weight.requires_grad
@@ -48,8 +45,7 @@ def test_ema_buffer_updates_copy_bn_and_constants_but_ema_only_explicit_state():
         student.ema_state.fill_(5.0)
         teacher.ema_state.fill_(1.0)
 
-    synchronize_frozen_buffers(teacher, student)
-    update_explicit_ema_state_buffers(teacher, student, decay=0.5)
+    update_teacher_after_success(teacher, student, decay=0.5)
 
     assert teacher.bn.running_mean.item() == 4.0
     assert teacher.cdc_kernel.item() == 7.0

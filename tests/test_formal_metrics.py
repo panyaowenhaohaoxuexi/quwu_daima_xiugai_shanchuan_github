@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from training.metrics import psnr, ssim_global
+from utils.metrics import psnr, ssim_global
 
 
 def test_formal_metrics_are_finite_and_perfect_prediction_has_high_psnr_ssim():

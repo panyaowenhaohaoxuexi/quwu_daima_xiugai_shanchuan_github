@@ -104,7 +104,6 @@ def test_ema_checkpoint_config_is_whitelisted_and_excludes_startup_paths():
     assert persisted["base_channels"] == checkpoint_config["base_channels"]
     for forbidden in (
         "train_data_dir", "batch_size", "source_checkpoint", "resume_checkpoint",
-        "allow_source_training_override", "allow_ema_training_override",
     ):
         assert forbidden not in persisted
     assert not any(key.startswith("_") for key in persisted)

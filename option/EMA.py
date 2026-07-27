@@ -37,8 +37,14 @@ EMA_PARSER_KEYS = (
     "real_batch_size", "source_anchor_batch_size", "num_workers", "epochs", "learning_rate",
     "ema_decay", "ema_sigma_j", "ema_sigma_m", "ema_sigma_r", "ema_stability_min_weight",
     "lambda_ema_j", "lambda_ema_m", "lambda_ema_r", "lambda_anchor",
-    "max_consecutive_failed_steps", "exp_dir", "saved_model_dir", "saved_data_dir",
+    "exp_dir", "saved_model_dir", "saved_data_dir",
 )
+EMA_RUNTIME_KEYS = (
+    "device", "real_data_dir", "source_anchor_data_dir", "source_checkpoint", "resume_checkpoint",
+    "real_batch_size", "source_anchor_batch_size", "num_workers", "epochs", "learning_rate",
+    "exp_dir", "saved_model_dir", "saved_data_dir",
+)
+EMA_SEMANTIC_KEYS = tuple(key for key in EMA_PARSER_KEYS if key not in EMA_RUNTIME_KEYS)
 EMA_CHECKPOINT_CONFIG_KEYS = tuple(
     key for key in EMA_PARSER_KEYS if key not in {"source_checkpoint", "resume_checkpoint"}
 )
@@ -84,7 +90,6 @@ def build_parser():
     parser.add_argument("--lambda_ema_m", type=float, default=1.0)
     parser.add_argument("--lambda_ema_r", type=float, default=1.0)
     parser.add_argument("--lambda_anchor", type=float, default=1.0)
-    parser.add_argument("--max_consecutive_failed_steps", type=int, default=20)
     parser.add_argument("--exp_dir", default="experiment")
     parser.add_argument("--saved_model_dir", default="")
     parser.add_argument("--saved_data_dir", default="")
@@ -100,11 +105,18 @@ def _inherited_source_config(checkpoint_config):
     return {key: checkpoint_config[key] for key in INHERITED_SOURCE_KEYS}
 
 
-def resolve_ema_config(raw_args, checkpoint_config):
-    """Merge immutable Source checkpoint semantics with current EMA CLI values."""
+def resolve_ema_config(raw_args, checkpoint_config, *, resume=False):
+    """Merge checkpoint semantics with only the current run's runtime settings."""
     raw_config = vars(raw_args) if isinstance(raw_args, argparse.Namespace) else dict(raw_args)
     inherited = _inherited_source_config(checkpoint_config)
-    return {**inherited, **{key: raw_config[key] for key in EMA_PARSER_KEYS}}
+    if resume:
+        missing = [key for key in EMA_SEMANTIC_KEYS if key not in checkpoint_config]
+        if missing:
+            raise ValueError("EMA checkpoint lacks required adaptation configuration: " + ", ".join(missing))
+        semantics = {key: checkpoint_config[key] for key in EMA_SEMANTIC_KEYS}
+    else:
+        semantics = {key: raw_config[key] for key in EMA_SEMANTIC_KEYS}
+    return {**inherited, **semantics, **{key: raw_config[key] for key in EMA_RUNTIME_KEYS}}
 
 
 def _validate_inherited_source_config(args):
@@ -173,8 +185,8 @@ def validate_config(args):
         raise ValueError("ema_stability_min_weight must be in [0,1]")
     if args.real_batch_size < 1 or args.source_anchor_batch_size < 1 or args.num_workers < 0:
         raise ValueError("EMA batch sizes must be positive and num_workers must be non-negative")
-    if args.epochs < 1 or args.learning_rate <= 0 or args.max_consecutive_failed_steps < 1:
-        raise ValueError("EMA epochs, learning_rate, and failure limit must be positive")
+    if args.epochs < 1 or args.learning_rate <= 0:
+        raise ValueError("EMA epochs and learning_rate must be positive")
     return args
 
 

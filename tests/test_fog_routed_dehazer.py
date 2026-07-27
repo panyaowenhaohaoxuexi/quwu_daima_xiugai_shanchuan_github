@@ -1,7 +1,7 @@
 import torch
 import inspect
 
-from model.fog_routed_dehazer import MemoryRetriever, FogRoutedRGBTIRDehazer, appearance_receptive_field_radius_by_scale
+from model.Teacher import MemoryRetriever, FogRoutedRGBTIRDehazer, appearance_receptive_field_radius_by_scale
 
 
 def test_empty_memory_fallback_prior_uses_global_tir_structure_context():
@@ -127,10 +127,10 @@ def test_unique_decoder_consumes_every_routed_structure_scale():
 
 
 def test_full_completion_with_excluded_memory_has_no_rgb_feature_gradient():
-    from training.source_counterfactual import detached_context
+    from training.source import _detach_context
 
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
-    context = detached_context(model.encode_context(torch.rand(1, 3, 32, 32), torch.rand(1, 3, 32, 32)))
+    context = _detach_context(model.encode_context(torch.rand(1, 3, 32, 32), torch.rand(1, 3, 32, 32)))
     context["rgb_pyramid"] = {
         name: feature.detach().clone().requires_grad_(True)
         for name, feature in context["rgb_pyramid"].items()

@@ -104,11 +104,13 @@ def main(argv=None):
     checkpoint = torch.load(raw_args.resume_checkpoint or raw_args.source_checkpoint, map_location="cpu")
     expected_stage = "ema" if raw_args.resume_checkpoint else "source"
     require_stage(checkpoint, expected_stage)
-    args = validate_config(argparse.Namespace(**resolve_ema_config(raw_args, checkpoint["config"])))
+    args = validate_config(argparse.Namespace(**resolve_ema_config(
+        raw_args, checkpoint["config"], resume=expected_stage == "ema"
+    )))
     prepare_experiment_dirs(args)
     save_config(args)
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
-    student = build_model_from_config(checkpoint["config"]).to(device)
+    student = build_model_from_config(vars(args)).to(device)
     optimizer = AdamW(student.parameters(), lr=args.learning_rate)
     if expected_stage == "source":
         student.load_state_dict(checkpoint["model"], strict=True)
@@ -118,6 +120,8 @@ def main(argv=None):
         teacher = initialize_teacher(student)
         restored = load_ema_checkpoint(checkpoint, student, teacher, optimizer)
         start_epoch, source_global_step, ema_global_step = restored["epoch"], restored["source_global_step"], restored["ema_global_step"]
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = args.learning_rate
     real_dataset = RealMultiModalDataset(f"{args.real_data_dir}/hazy", f"{args.real_data_dir}/tir",
                                          pair_alignment_policy=args.pair_alignment_policy,
                                          tir_normalization_config=tir_normalization_config_from_args(args))
@@ -152,7 +156,10 @@ def main(argv=None):
             _require_finite(adapt, student, epoch=epoch, step=ema_global_step)
             optimizer.step()
             update_teacher_after_success(teacher, student, args.ema_decay)
-            empty_omega_streak = empty_omega_streak + 1 if source["state"]["lambda_route"] and not source["route_supervision"]["valid_q_region_count"] else 0
+            route_supervision_enabled = args.lambda_router * source["state"]["lambda_route"] > 0
+            empty_omega_streak = empty_omega_streak + 1 if (
+                route_supervision_enabled and not source["route_supervision"]["valid_q_region_count"]
+            ) else 0
             if empty_omega_streak >= args.max_consecutive_empty_omega_steps:
                 raise RuntimeError(f"ema empty Omega limit: epoch={epoch} step={ema_global_step}")
             source_global_step += 1; ema_global_step += 1

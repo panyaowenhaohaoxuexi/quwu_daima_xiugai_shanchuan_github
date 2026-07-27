@@ -118,11 +118,9 @@ def add_source_training_arguments(parser):
     parser.add_argument("--omega_min_area", type=int, default=16)
     parser.add_argument("--omega_max_area", type=int, default=256)
     parser.add_argument("--max_consecutive_empty_omega_steps", type=int, default=100)
-    parser.add_argument("--max_consecutive_failed_steps", type=int, default=20)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--resume_checkpoint", default="")
-    parser.add_argument("--allow_source_training_override", action="store_true")
 
 
 def add_source_loss_arguments(parser):
@@ -186,7 +184,7 @@ def _validate_model_and_source_flow(args):
     for name in ("memory_reliable_ratio_threshold", "memory_confidence_threshold"):
         if not 0 <= getattr(args, name) <= 1:
             raise ValueError(f"{name} must be in [0,1]")
-    if args.boundary_width < 1 or args.max_consecutive_empty_omega_steps < 1 or args.max_consecutive_failed_steps < 1:
+    if args.boundary_width < 1 or args.max_consecutive_empty_omega_steps < 1:
         raise ValueError("boundary_width and consecutive-step limits must be >= 1")
     if not (4 <= args.omega_regions_per_image <= 8) or not (0 < args.omega_min_area <= args.omega_max_area):
         raise ValueError("invalid Omega configuration")
@@ -202,9 +200,10 @@ def validate_source_loss_arguments(args):
         raise ValueError("loss weights must be non-negative: " + ", ".join(negative))
     if args.formal_training:
         explicit = set(getattr(args, "_explicit_training_objective_keys", ()))
-        for name, value in FORMAL_TRAINING_LOSS_WEIGHTS.items():
-            if name not in explicit:
-                setattr(args, name, value)
+        if not getattr(args, "_resume_checkpoint_semantics", False):
+            for name, value in FORMAL_TRAINING_LOSS_WEIGHTS.items():
+                if name not in explicit:
+                    setattr(args, name, value)
         invalid = [name for name in LOSS_WEIGHT_NAMES if getattr(args, name) <= 0]
         if invalid:
             raise ValueError("formal_training cannot use smoke default loss weights; all formal loss weights must be > 0: " + ", ".join(invalid))

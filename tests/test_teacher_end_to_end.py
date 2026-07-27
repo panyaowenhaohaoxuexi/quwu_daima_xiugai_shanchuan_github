@@ -39,7 +39,9 @@ def test_source_training_entrypoint_runs_tiny_batch_and_writes_epoch_checkpoint(
         "--counterfactual_start_step", "100", "--route_loss_start_step", "100",
         "--saved_model_dir", str(checkpoint_dir), "--exp_dir", str(tmp_path / "experiment-resume"),
         "--resume_checkpoint", str(checkpoint_dir / "source_last.pt"),
+        "--learning_rate", "0.002",
     ])
     resumed = torch.load(checkpoint_dir / "source_last.pt", map_location="cpu")
     assert resumed["global_step"] == 2
-
+    assert resumed["config"]["learning_rate"] == 0.002
+    assert resumed["optimizer"]["param_groups"][0]["lr"] == 0.002

@@ -18,6 +18,25 @@ from utils.metrics import psnr, ssim_global
 from utils.visualize_fog_routed import build_diagnostic_panel
 
 
+SOURCE_RUNTIME_KEYS = (
+    "train_data_dir", "resume_checkpoint", "device", "epochs", "learning_rate",
+    "batch_size", "num_workers", "exp_dir", "saved_model_dir", "saved_data_dir",
+)
+
+
+def resolve_source_resume_config(raw_args, checkpoint_config):
+    """Keep Source semantics from the checkpoint while accepting current runtime settings."""
+    raw_config = vars(raw_args)
+    semantic_keys = tuple(key for key in raw_config if not key.startswith("_") and key not in SOURCE_RUNTIME_KEYS)
+    missing = [key for key in semantic_keys if key not in checkpoint_config]
+    if missing:
+        raise ValueError("Source checkpoint lacks required training configuration: " + ", ".join(missing))
+    return {
+        **{key: checkpoint_config[key] for key in semantic_keys},
+        **{key: raw_config[key] for key in SOURCE_RUNTIME_KEYS},
+    }
+
+
 def _set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -39,10 +58,14 @@ def _require_finite_gradients(model, *, epoch, step, loss):
 
 def main(argv=None):
     raw_args = build_parser().parse_args(argv)
-    args = validate_config(raw_args)
-    resume = torch.load(args.resume_checkpoint, map_location="cpu") if args.resume_checkpoint else None
+    resume = torch.load(raw_args.resume_checkpoint, map_location="cpu") if raw_args.resume_checkpoint else None
     if resume is not None:
         require_stage(resume, "source")
+        resumed_config = resolve_source_resume_config(raw_args, resume["config"])
+        resumed_config["_resume_checkpoint_semantics"] = True
+        args = validate_config(argparse.Namespace(**resumed_config))
+    else:
+        args = validate_config(raw_args)
     prepare_experiment_dirs(args)
     save_config(args)
     _set_seed(args.model_init_seed)
@@ -63,6 +86,8 @@ def main(argv=None):
     if resume is not None:
         restored = load_source_checkpoint(resume, model, optimizer)
         start_epoch, global_step = restored["epoch"], restored["global_step"]
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = args.learning_rate
     omega_sampler = OmegaSampler(args.omega_regions_per_image, args.omega_min_area,
                                  args.omega_max_area, seed=args.model_init_seed)
     omega_generator = torch.Generator(device=device).manual_seed(args.model_init_seed + 101)
@@ -73,9 +98,9 @@ def main(argv=None):
         for hazy, clear, tir, density in loader:
             if hazy.numel() == 0:
                 continue
-            batch = tuple(value.to(device) for value in (hazy, clear, tir, density))
+            hazy, clear, tir, density = (value.to(device) for value in (hazy, clear, tir, density))
             optimizer.zero_grad(set_to_none=True)
-            result = compute_source_batch_losses(model, batch, args, omega_sampler, global_step,
+            result = compute_source_batch_losses(model, (hazy, clear, tir, density), args, omega_sampler, global_step,
                                                  omega_generator=omega_generator)
             loss = result["losses"]["total"]
             _require_finite_loss(loss, epoch=epoch, step=global_step)

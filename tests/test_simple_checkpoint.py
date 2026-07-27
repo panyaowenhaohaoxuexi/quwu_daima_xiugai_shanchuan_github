@@ -3,7 +3,7 @@ import torch
 
 def test_simple_source_checkpoint_has_only_epoch_resume_state():
     from utils.checkpoint import build_source_checkpoint, load_source_checkpoint
-    from model.fog_routed_dehazer import FogRoutedRGBTIRDehazer
+    from model.Teacher import FogRoutedRGBTIRDehazer
 
     model = FogRoutedRGBTIRDehazer(base_channels=8)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)

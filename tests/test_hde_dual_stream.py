@@ -224,7 +224,7 @@ def test_apply_deform_passes_mask_to_supported_interface():
 
 def test_formal_model_routes_paired_rgb_tir_inputs_through_shared_hde():
     root = Path(__file__).resolve().parents[1]
-    source = (root / "model" / "fog_routed_dehazer.py").read_text(encoding="utf-8")
+    source = (root / "model" / "Teacher.py").read_text(encoding="utf-8")
 
     assert "self.hde = HDE()" in source
     assert "hde_output = self.hde(padded_rgb, padded_tir)" in source

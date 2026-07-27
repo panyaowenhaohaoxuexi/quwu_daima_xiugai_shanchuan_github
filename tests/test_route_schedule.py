@@ -1,6 +1,6 @@
 import pytest
 
-from training.schedules import source_route_schedule
+from training.source import source_route_schedule
 
 
 def test_source_route_schedule_enforces_counterfactual_and_route_loss_contract():

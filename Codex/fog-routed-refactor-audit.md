@@ -394,14 +394,10 @@
   validation also turns an unmarked formal run's unset weights into the formal
   preset and rejects negative weights, so it could not safely run before the
   checkpoint objective was resolved.
-- Added the independent nine-field training-objective set and strict
-  `apply_source_resume_config(...)`. Source resume now rejects a checkpoint
-  missing any objective key with `source checkpoint training objective
-  configuration is incomplete; missing: ...`; it never falls back to parser
-  L1-only defaults. By default all nine values come from the checkpoint.
-  `--allow_source_training_override` applies only fields explicitly supplied
-  on this invocation and prints only actual value differences. It cannot
-  disable formal training because no negative formal flag exists.
+- Source resume now takes all objective semantics from the checkpoint and
+  never falls back to parser L1-only defaults. The current run supplies only
+  runtime paths and execution settings; it cannot change checkpoint training
+  semantics.
 - Parser actions now place explicit `--formal_training` and loss-weight flags
   in one private `_explicit_training_objective_keys` collection. The resume
   merge retains restored weight markings until the single final validation, so
