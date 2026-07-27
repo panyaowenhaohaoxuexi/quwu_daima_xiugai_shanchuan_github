@@ -1,12 +1,7 @@
-"""Pure configuration for real-domain EMA adaptation.
-
-Source-model and source-anchor semantics are inherited from a checkpoint rather
-than accepted as independent EMA command-line architecture options.
-"""
+"""Pure configuration for real-domain EMA adaptation."""
 
 import argparse
 import json
-import warnings
 from pathlib import Path
 
 
@@ -15,20 +10,8 @@ LOSS_WEIGHT_NAMES = (
     "rec_l1_weight", "rec_gradient_weight", "rec_ssim_weight",
     "boundary_l1_weight", "boundary_gradient_weight",
 )
-SOURCE_TRAINING_OBJECTIVE_KEYS = ("formal_training", *LOSS_WEIGHT_NAMES)
-_LEGACY_SOURCE_OBJECTIVE_DEFAULTS = {
-    "formal_training": False,
-    "q_l1_weight": 1.0, "q_gradient_weight": 0.0, "q_ssim_weight": 0.0,
-    "rec_l1_weight": 1.0, "rec_gradient_weight": 0.0, "rec_ssim_weight": 0.0,
-    "boundary_l1_weight": 1.0, "boundary_gradient_weight": 0.0,
-}
-_FORMAL_TRAINING_LOSS_WEIGHTS = {
-    "q_l1_weight": 1.0, "q_gradient_weight": 0.5, "q_ssim_weight": 0.5,
-    "rec_l1_weight": 1.0, "rec_gradient_weight": 0.2, "rec_ssim_weight": 0.2,
-    "boundary_l1_weight": 1.0, "boundary_gradient_weight": 0.5,
-}
 
-_INHERITED_SOURCE_KEYS = (
+INHERITED_SOURCE_KEYS = (
     "model_init_seed", "base_channels", "router_hidden_channels", "num_structure_renderers",
     "deform_num_samples", "deform_max_offset", "memory_max_tokens", "memory_topk",
     "memory_query_chunk_size", "memory_attention_temperature", "memory_reliability_epsilon",
@@ -45,19 +28,19 @@ _INHERITED_SOURCE_KEYS = (
     "binary_loss_warmup_steps", "omega_regions_per_image", "omega_min_area",
     "omega_max_area", "max_consecutive_empty_omega_steps", "q_temperature",
     "q_window_size", "q_min_valid_support", "density_smooth_l1_beta",
-    "reconstruction_ssim_window", "reconstruction_min_valid_support",
+    "reconstruction_ssim_window", "reconstruction_min_valid_support", "formal_training",
     "lambda_global", "lambda_fuse", "lambda_comp", "lambda_boundary", "lambda_router",
-    "lambda_density", "lambda_route", "lambda_binary", *SOURCE_TRAINING_OBJECTIVE_KEYS,
+    "lambda_density", "lambda_route", "lambda_binary", *LOSS_WEIGHT_NAMES,
 )
-_EMA_RUNTIME_KEYS = (
-    "device", "real_data_dir", "source_anchor_data_dir", "real_batch_size",
-    "source_anchor_batch_size", "num_workers", "source_checkpoint", "resume_checkpoint",
-    "allow_ema_training_override", "exp_dir", "saved_model_dir", "saved_data_dir",
+EMA_PARSER_KEYS = (
+    "device", "real_data_dir", "source_anchor_data_dir", "source_checkpoint", "resume_checkpoint",
+    "real_batch_size", "source_anchor_batch_size", "num_workers", "epochs", "learning_rate",
+    "ema_decay", "ema_sigma_j", "ema_sigma_m", "ema_sigma_r", "ema_stability_min_weight",
+    "lambda_ema_j", "lambda_ema_m", "lambda_ema_r", "lambda_anchor",
+    "max_consecutive_failed_steps", "exp_dir", "saved_model_dir", "saved_data_dir",
 )
-_EMA_TRAINING_KEYS = (
-    "epochs", "learning_rate", "ema_decay", "ema_sigma_j", "ema_sigma_m", "ema_sigma_r",
-    "ema_stability_min_weight", "lambda_ema_j", "lambda_ema_m", "lambda_ema_r",
-    "lambda_anchor", "max_consecutive_failed_steps",
+EMA_CHECKPOINT_CONFIG_KEYS = tuple(
+    key for key in EMA_PARSER_KEYS if key not in {"source_checkpoint", "resume_checkpoint"}
 )
 
 
@@ -90,6 +73,8 @@ def build_parser():
     parser.add_argument("--real_batch_size", type=int, default=1)
     parser.add_argument("--source_anchor_batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--ema_sigma_j", type=float, default=0.1)
     parser.add_argument("--ema_sigma_m", type=float, default=0.1)
@@ -100,72 +85,32 @@ def build_parser():
     parser.add_argument("--lambda_ema_r", type=float, default=1.0)
     parser.add_argument("--lambda_anchor", type=float, default=1.0)
     parser.add_argument("--max_consecutive_failed_steps", type=int, default=20)
-    parser.add_argument("--allow_ema_training_override", action="store_true")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--exp_dir", default="experiment")
     parser.add_argument("--saved_model_dir", default="")
     parser.add_argument("--saved_data_dir", default="")
     return parser
 
 
-def _normalise_checkpoint_config(checkpoint_config):
+def _inherited_source_config(checkpoint_config):
     if not isinstance(checkpoint_config, dict):
         raise TypeError("checkpoint config must be a dictionary")
-    config = {key: value for key, value in checkpoint_config.items() if not key.startswith("_")}
-    if "source_anchor_data_dir" in config:
-        source_anchor_data_dir = config.pop("source_anchor_data_dir")
-        config.pop("train_data_dir", None)
-    else:
-        source_anchor_data_dir = config.pop("train_data_dir", "")
-    config["source_anchor_data_dir"] = source_anchor_data_dir
-    missing = [key for key in SOURCE_TRAINING_OBJECTIVE_KEYS if key not in config]
+    missing = [key for key in INHERITED_SOURCE_KEYS if key not in checkpoint_config]
     if missing:
-        warnings.warn(
-            "legacy checkpoint lacks source training objective fields; "
-            "using historical L1 defaults for: " + ", ".join(missing),
-            RuntimeWarning,
-            stacklevel=3,
-        )
-        for key in missing:
-            config[key] = _LEGACY_SOURCE_OBJECTIVE_DEFAULTS[key]
-        if any(key in LOSS_WEIGHT_NAMES for key in missing):
-            config["formal_training"] = False
-    # Saved values must never be treated as omitted CLI weights and rewritten
-    # by the formal preset during validation.
-    config["_explicit_training_objective_keys"] = list(LOSS_WEIGHT_NAMES)
-    return config
+        raise ValueError("checkpoint lacks required Source configuration: " + ", ".join(missing))
+    return {key: checkpoint_config[key] for key in INHERITED_SOURCE_KEYS}
 
 
-def resolve_ema_config(current, checkpoint_config, *, allow_training_override, is_resume=False):
-    """Merge EMA runtime controls with immutable source checkpoint semantics."""
-    current_config = vars(current) if isinstance(current, argparse.Namespace) else dict(current)
-    resolved = _normalise_checkpoint_config(checkpoint_config)
-    source_anchor_from_checkpoint = resolved["source_anchor_data_dir"]
-
-    for key in _EMA_RUNTIME_KEYS:
-        if key == "source_anchor_data_dir":
-            resolved[key] = current_config[key] or source_anchor_from_checkpoint
-        else:
-            resolved[key] = current_config[key]
-
-    differences = {}
-    for key in _EMA_TRAINING_KEYS:
-        stored = resolved.get(key)
-        requested = current_config[key]
-        if not is_resume or allow_training_override or stored is None:
-            resolved[key] = requested
-            if is_resume and stored is not None and stored != requested:
-                differences[key] = (stored, requested)
-        else:
-            resolved[key] = stored
-    return resolved, differences
+def resolve_ema_config(raw_args, checkpoint_config):
+    """Merge immutable Source checkpoint semantics with current EMA CLI values."""
+    raw_config = vars(raw_args) if isinstance(raw_args, argparse.Namespace) else dict(raw_args)
+    inherited = _inherited_source_config(checkpoint_config)
+    return {**inherited, **{key: raw_config[key] for key in EMA_PARSER_KEYS}}
 
 
 def _validate_inherited_source_config(args):
-    missing = [key for key in _INHERITED_SOURCE_KEYS if not hasattr(args, key)]
+    missing = [key for key in INHERITED_SOURCE_KEYS if not hasattr(args, key)]
     if missing:
-        raise ValueError("checkpoint lacks required source configuration: " + ", ".join(missing))
+        raise ValueError("EMA config lacks required Source configuration: " + ", ".join(missing))
     for name in ("route_tau_start", "route_tau_end", "memory_attention_temperature", "q_temperature", "density_smooth_l1_beta"):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} must be > 0")
@@ -174,14 +119,14 @@ def _validate_inherited_source_config(args):
     if args.counterfactual_chunk_size < 1 or args.deform_num_samples < 1 or args.deform_max_offset < 0:
         raise ValueError("invalid counterfactual/deform configuration")
     if args.train_size < 1 or args.num_structure_renderers < 1 or args.memory_max_tokens < 1 or args.memory_query_chunk_size < 1:
-        raise ValueError("invalid source renderer, memory, or train-size configuration")
+        raise ValueError("invalid Source renderer, memory, or train-size configuration")
     if args.memory_exclusion_extra_margin < 0 or not 2 <= args.memory_topk <= args.memory_max_tokens:
-        raise ValueError("invalid source memory configuration")
+        raise ValueError("invalid Source memory configuration")
     for name in ("memory_reliable_ratio_threshold", "memory_confidence_threshold"):
         if not 0 <= getattr(args, name) <= 1:
             raise ValueError(f"{name} must be in [0,1]")
     if args.boundary_width < 1 or args.max_consecutive_empty_omega_steps < 1:
-        raise ValueError("invalid source boundary or empty-Omega configuration")
+        raise ValueError("invalid Source boundary or empty-Omega configuration")
     if not (4 <= args.omega_regions_per_image <= 8) or not (0 < args.omega_min_area <= args.omega_max_area):
         raise ValueError("invalid Omega configuration")
     if args.q_window_size <= 0 or args.q_window_size % 2 == 0 or args.q_min_valid_support < 1:
@@ -194,13 +139,9 @@ def _validate_inherited_source_config(args):
     if negative:
         raise ValueError("loss weights must be non-negative: " + ", ".join(negative))
     if args.formal_training:
-        explicit = set(getattr(args, "_explicit_training_objective_keys", ()))
-        for name, value in _FORMAL_TRAINING_LOSS_WEIGHTS.items():
-            if name not in explicit:
-                setattr(args, name, value)
         invalid = [name for name in LOSS_WEIGHT_NAMES if getattr(args, name) <= 0]
         if invalid:
-            raise ValueError("formal_training requires positive source loss weights: " + ", ".join(invalid))
+            raise ValueError("formal_training requires positive Source loss weights: " + ", ".join(invalid))
     if any(getattr(args, name) < 0 for name in vars(args) if name.startswith("lambda_")):
         raise ValueError("lambda coefficients must be non-negative")
     if args.tir_normalization == "fixed_range" and not (args.tir_fixed_max > args.tir_fixed_min):
@@ -220,6 +161,10 @@ def _validate_inherited_source_config(args):
 
 def validate_config(args):
     _validate_inherited_source_config(args)
+    if not args.real_data_dir:
+        raise ValueError("real_data_dir must be provided for EMA adaptation")
+    if not args.source_anchor_data_dir:
+        raise ValueError("source_anchor_data_dir must be provided for EMA adaptation")
     if not 0 <= args.ema_decay < 1:
         raise ValueError("ema_decay must be in [0,1)")
     if min(args.ema_sigma_j, args.ema_sigma_m, args.ema_sigma_r) <= 0:
@@ -234,15 +179,13 @@ def validate_config(args):
 
 
 def build_ema_checkpoint_config(model_config, args):
-    """Persist inherited source semantics plus the actual EMA-stage settings."""
-    config = _normalise_checkpoint_config(model_config)
-    config.pop("train_data_dir", None)
-    config.pop("_explicit_training_objective_keys", None)
+    """Persist only EMA-required Source semantics and active EMA settings."""
+    inherited = _inherited_source_config(model_config)
     current = persisted_config_from_args(args)
-    for key in (*_EMA_RUNTIME_KEYS, *_EMA_TRAINING_KEYS):
-        config[key] = current[key]
-    config.pop("resume_checkpoint", None)
-    return config
+    return {
+        **inherited,
+        **{key: current[key] for key in EMA_CHECKPOINT_CONFIG_KEYS},
+    }
 
 
 def prepare_experiment_dirs(args):

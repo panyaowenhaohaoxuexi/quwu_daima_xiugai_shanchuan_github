@@ -37,7 +37,12 @@ def test_option_modules_are_pure_on_import_and_validate_formal_defaults(monkeypa
     assert not list(tmp_path.iterdir())
     teacher.validate_config(teacher.build_parser().parse_args([]))
     source_config = teacher.persisted_config_from_args(teacher.build_parser().parse_args([]))
-    resolved, _ = ema.resolve_ema_config(ema.build_parser().parse_args([]), source_config, allow_training_override=False)
+    resolved = ema.resolve_ema_config(
+        ema.build_parser().parse_args([
+            "--real_data_dir", "real-root", "--source_anchor_data_dir", "anchor-root",
+        ]),
+        source_config,
+    )
     ema.validate_config(argparse.Namespace(**resolved))
 
 

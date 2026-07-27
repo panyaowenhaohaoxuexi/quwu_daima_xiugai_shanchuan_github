@@ -70,11 +70,12 @@ def test_ema_entrypoint_runs_real_and_source_anchor_from_strict_source_checkpoin
     # successful step. EMA resume must advance both and perform the next step.
     main([
         "--resume_checkpoint", str(checkpoint_dir / "ema_last.pt"), "--source_anchor_data_dir", str(tmp_path),
-        "--real_data_dir", str(tmp_path / "real"), "--epochs", "2", "--device", "cpu",
+        "--real_data_dir", str(tmp_path / "real"), "--epochs", "2", "--learning_rate", "0.0003", "--device", "cpu",
         "--saved_model_dir", str(checkpoint_dir), "--exp_dir", str(tmp_path / "ema-resume"),
     ])
     resumed = torch.load(checkpoint_dir / "ema_last.pt", map_location="cpu")
     assert resumed["ema_global_step"] == 2
+    assert resumed["optimizer"]["param_groups"][0]["lr"] == 0.0003
 
 
 def test_ema_failure_after_full_forward_backward_replays_transaction_exactly(tmp_path, monkeypatch):

@@ -231,21 +231,13 @@ def main(argv=None):
     if resume_checkpoint is not None:
         validate_checkpoint_metadata(resume_checkpoint, "ema", resume_checkpoint.get("density_gt_semantics"))
         model_config = resume_checkpoint["config"]
-        resolved, config_diff = resolve_ema_config(
-            raw_args, model_config,
-            allow_training_override=raw_args.allow_ema_training_override,
-            is_resume=True,
-        )
+        resolved = resolve_ema_config(raw_args, model_config)
         args = validate_config(argparse.Namespace(**resolved))
-        if config_diff:
-            print(f"[EMA] explicit training override: {config_diff}")
     else:
         source_checkpoint = torch.load(raw_args.source_checkpoint, map_location="cpu")
         validate_checkpoint_metadata(source_checkpoint, "source", source_checkpoint.get("density_gt_semantics"))
         model_config = source_checkpoint["config"]
-        resolved, _ = resolve_ema_config(
-            raw_args, model_config, allow_training_override=False,
-        )
+        resolved = resolve_ema_config(raw_args, model_config)
         args = validate_config(argparse.Namespace(**resolved))
     _log_loss_components(args)
     validate_single_process_world()
@@ -320,6 +312,8 @@ def main(argv=None):
         source_dataset.set_sampler_epoch(source_sampler.epoch)
         source_empty_omega_streak = restored["source_empty_omega_streak"]
         anchor_empty_omega_streak = restored["anchor_empty_omega_streak"]
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = args.learning_rate
         # A checkpoint is written at a successful-step boundary.  A checkpoint
         # taken at the end of an epoch therefore carries exhausted cursors;
         # move each independent stream to its next deterministic permutation

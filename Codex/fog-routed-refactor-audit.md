@@ -481,6 +481,5 @@
 - New EMA checkpoints store `source_anchor_data_dir` and omit the historical
   source-path key. When loading an old checkpoint, its historical source path
   is mapped to the new anchor-path field; an explicitly supplied new path wins.
-- Legacy Source checkpoints missing training-objective fields receive a warned
-  historical L1 compatibility profile, while all present checkpoint weights
-  remain unchanged.
+- Source resume requires every persisted training-objective field and rejects
+  an incomplete checkpoint configuration with a clear error.

@@ -71,7 +71,7 @@ def test_source_checkpoint_config_persists_every_actual_loss_weight_without_priv
     assert not any(key.startswith("_") for key in checkpoint["config"])
 
 
-def test_ema_checkpoint_config_uses_current_formal_loss_weights_not_source_values():
+def test_ema_checkpoint_config_whitelists_source_anchor_semantics_and_ema_values():
     from option.EMA import build_ema_checkpoint_config, build_parser, resolve_ema_config, validate_config
     from option.Teacher import LOSS_WEIGHT_NAMES, build_parser as build_source_parser, persisted_config_from_args
 
@@ -80,8 +80,11 @@ def test_ema_checkpoint_config_uses_current_formal_loss_weights_not_source_value
     source_config["formal_training"] = False
     source_config["train_data_dir"] = "anchor"
     source_config["_legacy_private"] = "discard"
-    raw = build_parser().parse_args([])
-    resolved, _ = resolve_ema_config(raw, source_config, allow_training_override=False)
+    raw = build_parser().parse_args([
+        "--real_data_dir", "real-root", "--source_anchor_data_dir", "anchor-root",
+        "--source_checkpoint", "source.pt", "--resume_checkpoint", "resume.pt",
+    ])
+    resolved = resolve_ema_config(raw, source_config)
     args = validate_config(argparse.Namespace(**resolved))
 
     config = build_ema_checkpoint_config(source_config, args)
@@ -90,6 +93,9 @@ def test_ema_checkpoint_config_uses_current_formal_loss_weights_not_source_value
     assert {name: config[name] for name in LOSS_WEIGHT_NAMES} == {
         name: getattr(args, name) for name in LOSS_WEIGHT_NAMES
     }
+    assert config["source_anchor_data_dir"] == "anchor-root"
+    for key in ("train_data_dir", "batch_size", "source_checkpoint", "resume_checkpoint"):
+        assert key not in config
     assert not any(key.startswith("_") for key in config)
 
 
