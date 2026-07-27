@@ -161,6 +161,45 @@ def test_tir_every_normalization_path_rejects_empty_and_nonfinite_values(monkeyp
             loader.load_tir_as_float_tensor("invalid-tir", config)
 
 
+@pytest.mark.parametrize(
+    "invalid, message",
+    [
+        (np.empty((0, 0), dtype=np.float32), "empty image"),
+        (np.empty((0, 0, 3), dtype=np.float32), "empty image"),
+        (np.empty((0, 0, 4), dtype=np.float32), "empty image"),
+    ],
+)
+def test_tir_full_array_validation_rejects_empty_before_shape_handling(monkeypatch, invalid, message):
+    import data.data_loader as loader
+
+    path = "empty-multichannel-tir"
+    monkeypatch.setattr(loader, "_open_preserving_known_bit_depth", lambda _path: ("F", invalid, None))
+
+    with pytest.raises(ValueError, match=f"{message}: {path}"):
+        loader.load_tir_as_float_tensor(path)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        np.full((2, 2, 3), np.nan, dtype=np.float32),
+        np.full((2, 2, 4), np.inf, dtype=np.float32),
+    ],
+)
+def test_tir_full_array_validation_rejects_nonfinite_before_channel_differences(monkeypatch, invalid):
+    import data.data_loader as loader
+
+    path = "nonfinite-multichannel-tir"
+    monkeypatch.setattr(loader, "_open_preserving_known_bit_depth", lambda _path: ("F", invalid, None))
+
+    def channel_difference_must_not_run(*_args, **_kwargs):
+        raise AssertionError("channel difference ran before full-array validation")
+
+    monkeypatch.setattr(loader.np, "abs", channel_difference_must_not_run)
+    with pytest.raises(ValueError, match=f"non-finite values in {path}"):
+        loader.load_tir_as_float_tensor(path)
+
+
 def test_signed_16_container_rejects_values_outside_unsigned_range():
     import data.data_loader as loader
 

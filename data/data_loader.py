@@ -108,6 +108,11 @@ def load_tir_as_float_tensor(path, normalization_config: Optional[Mapping] = Non
     config = dict(normalization_config or {})
     normalization = config.get("normalization", "dtype_range")
     mode, array, known_bits = _open_preserving_known_bit_depth(path)
+    array = np.asarray(array)
+    if not array.size:
+        raise ValueError(f"empty image: {path}")
+    if not np.isfinite(array).all():
+        raise ValueError(f"non-finite values in {path}")
 
     def normalize_one_channel(raw):
         raw = np.asarray(raw)

@@ -32,6 +32,18 @@ def _image_paths(directory):
     )
 
 
+def _unique_stem_paths(directory, *, label):
+    index = {}
+    for path in _image_paths(directory):
+        index.setdefault(path.stem.lower(), []).append(path)
+    for stem, candidates in index.items():
+        if len(candidates) > 1:
+            raise ValueError(
+                f"ambiguous {label} stem={stem}: candidates=[{', '.join(str(path) for path in candidates)}]"
+            )
+    return [candidates[0] for _, candidates in sorted(index.items())]
+
+
 def _tir_stem_index(tir_dir):
     index = {}
     for path in _image_paths(tir_dir):
@@ -58,7 +70,7 @@ def evaluate_directory(model, config, hazy_dir, tir_dir, output_dir, device, sav
         aux_dir.mkdir(parents=True, exist_ok=True)
     tir_index = _tir_stem_index(tir_dir)
     with torch.inference_mode():
-        for hazy_path in _image_paths(hazy_dir):
+        for hazy_path in _unique_stem_paths(hazy_dir, label="hazy"):
             tir_path = _resolve_tir_path(tir_index, hazy_path)
             with Image.open(hazy_path) as image:
                 hazy = TF.pil_to_tensor(image.convert("RGB")).float().div_(255).unsqueeze(0)
