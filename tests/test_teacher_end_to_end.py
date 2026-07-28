@@ -3,11 +3,28 @@ import json
 import numpy as np
 import pytest
 import torch
+from torch import nn
 from PIL import Image
 
 
 def _write_rgb(path, value):
     Image.new("RGB", (32, 32), (value, value, value)).save(path)
+
+
+@pytest.fixture(autouse=True)
+def _stub_vgg19_contrast_for_cpu_source_smoke(monkeypatch):
+    import Teacher
+
+    class _OneSSIM(nn.Module):
+        def forward(self, prediction, _clear):
+            return prediction.new_ones(())
+
+    class _ZeroContrast(nn.Module):
+        def forward(self, prediction, _clear, _hazy):
+            return prediction.mean() * 0
+
+    monkeypatch.setattr(Teacher, "build_source_reconstruction_criteria",
+                        lambda device: (_OneSSIM().to(device), _ZeroContrast().to(device)))
 
 
 def test_source_training_entrypoint_runs_tiny_batch_and_writes_epoch_checkpoint(tmp_path):

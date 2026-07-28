@@ -9,14 +9,14 @@ from utils.model_config_validation import validate_model_config_values
 
 LOSS_WEIGHT_NAMES = (
     "q_l1_weight", "q_gradient_weight", "q_ssim_weight",
-    "rec_l1_weight", "rec_gradient_weight", "rec_ssim_weight",
-    "boundary_l1_weight", "boundary_gradient_weight",
+    "global_l1_weight", "global_ssim_weight", "global_contrast_weight",
+    "region_l1_weight", "region_gradient_weight", "region_ssim_weight",
 )
 TRAINING_OBJECTIVE_KEYS = ("formal_training", *LOSS_WEIGHT_NAMES)
 FORMAL_TRAINING_LOSS_WEIGHTS = {
     "q_l1_weight": 1.0, "q_gradient_weight": 0.5, "q_ssim_weight": 0.5,
-    "rec_l1_weight": 1.0, "rec_gradient_weight": 0.2, "rec_ssim_weight": 0.2,
-    "boundary_l1_weight": 1.0, "boundary_gradient_weight": 0.5,
+    "global_l1_weight": 0.8, "global_ssim_weight": 0.2, "global_contrast_weight": 0.05,
+    "region_l1_weight": 1.0, "region_gradient_weight": 0.2, "region_ssim_weight": 0.2,
 }
 
 
@@ -152,11 +152,12 @@ def add_source_loss_arguments(parser):
     _add_loss_weight_argument(parser, "q_gradient_weight", 0.0)
     _add_loss_weight_argument(parser, "q_ssim_weight", 0.0)
     parser.add_argument("--density_smooth_l1_beta", type=float, default=0.1)
-    _add_loss_weight_argument(parser, "rec_l1_weight", 1.0)
-    _add_loss_weight_argument(parser, "rec_gradient_weight", 0.0)
-    _add_loss_weight_argument(parser, "rec_ssim_weight", 0.0)
-    _add_loss_weight_argument(parser, "boundary_l1_weight", 1.0)
-    _add_loss_weight_argument(parser, "boundary_gradient_weight", 0.0)
+    _add_loss_weight_argument(parser, "global_l1_weight", 0.8)
+    _add_loss_weight_argument(parser, "global_ssim_weight", 0.2)
+    _add_loss_weight_argument(parser, "global_contrast_weight", 0.05)
+    _add_loss_weight_argument(parser, "region_l1_weight", 1.0)
+    _add_loss_weight_argument(parser, "region_gradient_weight", 0.2)
+    _add_loss_weight_argument(parser, "region_ssim_weight", 0.2)
     parser.add_argument("--reconstruction_ssim_window", type=int, default=7)
     parser.add_argument("--reconstruction_min_valid_support", type=int, default=4)
     for name in ("global", "fuse", "comp", "boundary", "router", "density", "route", "binary"):

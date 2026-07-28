@@ -14,6 +14,7 @@ def _write_rgb(path, value):
 @pytest.fixture(autouse=True)
 def _mock_coa_clip_for_cpu_ema_smoke(monkeypatch):
     import EMA
+    import Teacher
 
     class _ZeroClipLoss(nn.Module):
         def forward(self, prediction, _text_features):
@@ -25,6 +26,18 @@ def _mock_coa_clip_for_cpu_ema_smoke(monkeypatch):
         lambda device: (_ZeroClipLoss().to(device), torch.zeros(1, 1, device=device)),
     )
     monkeypatch.setattr(EMA, "require_coa_clip_cuda", lambda _device: None)
+
+    class _OneSSIM(nn.Module):
+        def forward(self, prediction, _clear):
+            return prediction.new_ones(())
+
+    class _ZeroContrast(nn.Module):
+        def forward(self, prediction, _clear, _hazy):
+            return prediction.mean() * 0
+
+    criteria = lambda device: (_OneSSIM().to(device), _ZeroContrast().to(device))
+    monkeypatch.setattr(Teacher, "build_source_reconstruction_criteria", criteria)
+    monkeypatch.setattr(EMA, "build_source_reconstruction_criteria", criteria)
 
 
 def test_ema_entrypoint_runs_real_and_source_anchor_from_source_checkpoint(tmp_path):

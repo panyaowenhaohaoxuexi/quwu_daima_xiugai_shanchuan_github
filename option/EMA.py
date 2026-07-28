@@ -9,8 +9,8 @@ from utils.model_config_validation import validate_model_config_values
 
 LOSS_WEIGHT_NAMES = (
     "q_l1_weight", "q_gradient_weight", "q_ssim_weight",
-    "rec_l1_weight", "rec_gradient_weight", "rec_ssim_weight",
-    "boundary_l1_weight", "boundary_gradient_weight",
+    "global_l1_weight", "global_ssim_weight", "global_contrast_weight",
+    "region_l1_weight", "region_gradient_weight", "region_ssim_weight",
 )
 
 LOCAL_SOURCE_TRAIN_DIR = r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\1_FLIR\train"

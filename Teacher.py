@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from data.data_loader import SynthMultiModalDataset, collate_synth
 from option.Teacher import (build_parser, persisted_config_from_args, prepare_experiment_dirs,
                             save_config, tir_normalization_config_from_args, validate_config)
-from training.source import OmegaSampler, compute_source_batch_losses
+from training.source import OmegaSampler, build_source_reconstruction_criteria, compute_source_batch_losses
 from training.schedule import build_coa_adam, cycle_batches, set_cosine_learning_rate
 from training.observability import TrainingLogger
 from training.validation import evaluate_paired_validation, save_best_if_improved
@@ -96,6 +96,7 @@ def main(argv=None):
                                    num_workers=args.num_workers, collate_fn=collate_synth)
     model = build_model_from_config(config).to(device)
     optimizer = build_coa_adam(model.parameters(), learning_rate=args.start_lr)
+    reconstruction_criteria = build_source_reconstruction_criteria(device)
     start_epoch, global_step, best_psnr = 0, 0, float("-inf")
     if resume is not None:
         restored = load_source_checkpoint(resume, model, optimizer)
@@ -143,7 +144,8 @@ def main(argv=None):
             hazy, clear, tir, density = (value.to(device) for value in (hazy, clear, tir, density))
             optimizer.zero_grad(set_to_none=True)
             result = compute_source_batch_losses(model, (hazy, clear, tir, density), args, omega_sampler, global_step,
-                                                 omega_generator=omega_generator)
+                                                 omega_generator=omega_generator,
+                                                 reconstruction_criteria=reconstruction_criteria)
             loss = result["losses"]["total"]
             _require_finite_loss(loss, epoch=epoch, step=global_step)
             loss.backward()

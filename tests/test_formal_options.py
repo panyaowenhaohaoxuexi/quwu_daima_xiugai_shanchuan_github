@@ -7,8 +7,8 @@ import pytest
 
 LOSS_WEIGHT_ARGUMENTS = (
     "q_l1_weight", "q_gradient_weight", "q_ssim_weight",
-    "rec_l1_weight", "rec_gradient_weight", "rec_ssim_weight",
-    "boundary_l1_weight", "boundary_gradient_weight",
+    "global_l1_weight", "global_ssim_weight", "global_contrast_weight",
+    "region_l1_weight", "region_gradient_weight", "region_ssim_weight",
 )
 
 
@@ -16,11 +16,12 @@ FORMAL_LOSS_WEIGHTS = {
     "q_l1_weight": 1.0,
     "q_gradient_weight": 0.5,
     "q_ssim_weight": 0.5,
-    "rec_l1_weight": 1.0,
-    "rec_gradient_weight": 0.2,
-    "rec_ssim_weight": 0.2,
-    "boundary_l1_weight": 1.0,
-    "boundary_gradient_weight": 0.5,
+    "global_l1_weight": 0.8,
+    "global_ssim_weight": 0.2,
+    "global_contrast_weight": 0.05,
+    "region_l1_weight": 1.0,
+    "region_gradient_weight": 0.2,
+    "region_ssim_weight": 0.2,
 }
 
 
@@ -62,21 +63,21 @@ def test_tir_loader_mapping_keeps_all_persisted_preprocessing_semantics():
     assert config["channel_tolerance_code_values"] == 2
 
 
-def test_default_loss_weights_remain_l1_only_smoke_values():
+def test_default_loss_weights_match_coa_global_and_shared_region_configuration():
     from option.Teacher import build_parser, validate_config
 
     args = validate_config(build_parser().parse_args([]))
 
-    assert args.formal_training is False
     assert {name: getattr(args, name) for name in LOSS_WEIGHT_ARGUMENTS} == {
         "q_l1_weight": 1.0,
         "q_gradient_weight": 0.0,
         "q_ssim_weight": 0.0,
-        "rec_l1_weight": 1.0,
-        "rec_gradient_weight": 0.0,
-        "rec_ssim_weight": 0.0,
-        "boundary_l1_weight": 1.0,
-        "boundary_gradient_weight": 0.0,
+        "global_l1_weight": 0.8,
+        "global_ssim_weight": 0.2,
+        "global_contrast_weight": 0.05,
+        "region_l1_weight": 1.0,
+        "region_gradient_weight": 0.2,
+        "region_ssim_weight": 0.2,
     }
 
 

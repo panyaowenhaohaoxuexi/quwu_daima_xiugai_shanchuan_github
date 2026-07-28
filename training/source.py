@@ -5,7 +5,13 @@ from collections import deque
 import torch
 from torch.nn import functional as F
 
+from loss.coa_reconstruction import CoAContrastLoss, CoASSIM
 from loss.source import compute_q, compute_source_objective
+
+
+def build_source_reconstruction_criteria(device):
+    """Create CoA's global SSIM and VGG-19 contrast losses once per process."""
+    return CoASSIM().to(device), CoAContrastLoss().to(device)
 
 
 class OmegaSampler:
@@ -223,7 +229,7 @@ def _counterfactual_predictions(model, context, owners, supports, chunk_size, ro
 
 
 def compute_source_batch_losses(model, source_batch, args, omega_sampler, global_step, *,
-                                force_anchor_mode=False, omega_generator=None):
+                                force_anchor_mode=False, omega_generator=None, reconstruction_criteria=None):
     """Compute the complete Source batch result without mutating optimizer state."""
     hazy, clear, tir, density = source_batch
     state = ({"route_temperature": float(args.route_tau_end), "route_mode": "hard",
@@ -263,15 +269,22 @@ def compute_source_batch_losses(model, source_batch, args, omega_sampler, global
     route_supervision = {"sampled_omega_count": int(supports.shape[0]),
                           "valid_q_region_count": int(candidate_valid.sum().item()),
                           "valid_route_pixel_count": int((route_support > 0).sum().item())}
+    global_ssim_criterion, global_contrast_criterion = (reconstruction_criteria or (None, None))
     losses = compute_source_objective(
         output["pred_clear"], clear, output["density_map"], density, output["route_soft"], output["boundary_map"],
         q, route_support, omega_weight, density_beta=args.density_smooth_l1_beta,
         lambda_global=args.lambda_global, lambda_fuse=args.lambda_fuse, lambda_comp=args.lambda_comp,
         lambda_boundary=args.lambda_boundary, lambda_router=args.lambda_router, lambda_density=args.lambda_density,
         lambda_route=state["lambda_route"], lambda_binary=state["lambda_binary"],
-        rec_l1_weight=args.rec_l1_weight, rec_gradient_weight=args.rec_gradient_weight,
-        rec_ssim_weight=args.rec_ssim_weight, boundary_l1_weight=args.boundary_l1_weight,
-        boundary_gradient_weight=args.boundary_gradient_weight, ssim_window=args.reconstruction_ssim_window,
+        hazy_rgb=hazy, global_ssim_criterion=global_ssim_criterion,
+        global_contrast_criterion=global_contrast_criterion,
+        global_l1_weight=getattr(args, "global_l1_weight", 0.8),
+        global_ssim_weight=getattr(args, "global_ssim_weight", 0.2),
+        global_contrast_weight=getattr(args, "global_contrast_weight", 0.0),
+        region_l1_weight=getattr(args, "region_l1_weight", 1.0),
+        region_gradient_weight=getattr(args, "region_gradient_weight", 0.2),
+        region_ssim_weight=getattr(args, "region_ssim_weight", 0.2),
+        ssim_window=args.reconstruction_ssim_window,
         min_valid_support=args.reconstruction_min_valid_support,
     )
     return {"context": context, "output": output, "losses": losses, "q": q,

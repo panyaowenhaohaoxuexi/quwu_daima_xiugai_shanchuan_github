@@ -17,7 +17,7 @@ from loss.ema import real_consistency_loss, stability_weights
 from option.EMA import (build_ema_checkpoint_config, build_parser, prepare_experiment_dirs,
                         real_modal_dirs_from_args, resolve_ema_config, save_config,
                         tir_normalization_config_from_args, validate_config)
-from training.source import OmegaSampler, compute_source_batch_losses
+from training.source import OmegaSampler, build_source_reconstruction_criteria, compute_source_batch_losses
 from training.schedule import build_coa_adam, cycle_batches, set_cosine_learning_rate
 from training.observability import TrainingLogger
 from training.validation import evaluate_paired_validation, save_best_if_improved
@@ -227,6 +227,7 @@ def main(argv=None):
                                    num_workers=args.num_workers, collate_fn=collate_synth)
     prepare_experiment_dirs(args)
     save_config(args)
+    reconstruction_criteria = build_source_reconstruction_criteria(device)
     empty_omega_streak = 0
     total_steps = args.epochs * args.iters_per_epoch
     real_iterator, source_iterator = cycle_batches(real_loader), cycle_batches(source_loader)
@@ -271,8 +272,9 @@ def main(argv=None):
             real = _real_loss(teacher, student, real_hazy.to(device), real_tir.to(device), geometry_generator, args,
                               clip_criterion=clip_criterion, text_features=text_features)
             source = compute_source_batch_losses(student, tuple(value.to(device) for value in source_batch), args,
-                                                 omega_sampler, source_global_step, force_anchor_mode=True,
-                                                 omega_generator=omega_generator)
+                                                  omega_sampler, source_global_step, force_anchor_mode=True,
+                                                  omega_generator=omega_generator,
+                                                  reconstruction_criteria=reconstruction_criteria)
             adapt = adaptation_loss(real, source, args)
             _require_finite(adapt, student, epoch=epoch, step=ema_global_step)
             optimizer.step()

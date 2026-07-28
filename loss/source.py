@@ -105,25 +105,38 @@ def compute_source_objective(pred_clear, clear_rgb, density_map, density_gt, rou
                              q, omega_support, omega_weight=None, density_beta=0.1, lambda_global=1.0,
                              lambda_fuse=1.0, lambda_comp=1.0, lambda_boundary=1.0, lambda_density=1.0,
                              lambda_route=1.0, lambda_binary=1.0, lambda_router=1.0,
-                             rec_l1_weight=1.0, rec_gradient_weight=0.0, rec_ssim_weight=0.0,
-                             boundary_l1_weight=1.0, boundary_gradient_weight=0.0, ssim_window=7,
-                             min_valid_support=4):
+                             *, hazy_rgb=None, global_ssim_criterion=None, global_contrast_criterion=None,
+                             global_l1_weight=0.8, global_ssim_weight=0.2, global_contrast_weight=0.05,
+                             region_l1_weight=1.0, region_gradient_weight=0.2, region_ssim_weight=0.2,
+                             ssim_window=7, min_valid_support=4):
+    if global_contrast_weight > 0 and (hazy_rgb is None or global_contrast_criterion is None):
+        raise ValueError("CoA global contrast loss requires hazy_rgb and global_contrast_criterion")
     validity = density_gt.new_ones(density_gt.shape)
     route, boundary = route_soft.detach(), boundary_map.detach()
-    kwargs = {"l1_weight": rec_l1_weight, "gradient_weight": rec_gradient_weight,
-              "ssim_weight": rec_ssim_weight, "ssim_window": ssim_window,
+    kwargs = {"l1_weight": region_l1_weight, "gradient_weight": region_gradient_weight,
+              "ssim_weight": region_ssim_weight, "ssim_window": ssim_window,
               "min_valid_support": min_valid_support}
-    global_loss = reconstruction_error(pred_clear, clear_rgb, validity, **kwargs)
+    global_l1 = masked_mean((pred_clear - clear_rgb).abs(), validity)
+    if global_ssim_criterion is None:
+        from .coa_reconstruction import CoASSIM
+        global_ssim_criterion = CoASSIM()
+    global_ssim = 1.0 - global_ssim_criterion(pred_clear, clear_rgb)
+    global_contrast = (global_contrast_criterion(pred_clear, clear_rgb, hazy_rgb)
+                       if global_contrast_weight > 0 else pred_clear.new_zeros(()))
+    global_loss = (global_l1_weight * global_l1 + global_ssim_weight * global_ssim +
+                   global_contrast_weight * global_contrast)
     fuse_loss = reconstruction_error(pred_clear, clear_rgb, (1 - route) * validity, **kwargs)
     comp_loss = reconstruction_error(pred_clear, clear_rgb, route * validity, **kwargs)
     boundary_support = boundary * validity
-    boundary_value = (boundary_l1_weight * masked_mean((pred_clear - clear_rgb).abs(), boundary_support) +
-                      boundary_gradient_weight * masked_gradient_error(pred_clear, clear_rgb, boundary_support))
+    boundary_value = reconstruction_error(pred_clear, clear_rgb, boundary_support, **kwargs)
     density_value = masked_smooth_l1(density_map, density_gt, validity, density_beta)
     route_value = masked_bce(route_soft, q.detach(), omega_support.detach(), omega_weight)
     binary_value = masked_mean(4.0 * route_soft * (1.0 - route_soft), validity)
     router_total = lambda_density * density_value + lambda_route * route_value + lambda_binary * binary_value
     total = (lambda_global * global_loss + lambda_fuse * fuse_loss + lambda_comp * comp_loss +
              lambda_boundary * boundary_value + lambda_router * router_total)
-    return {"total": total, "global": global_loss, "fuse": fuse_loss, "comp": comp_loss,
-            "boundary": boundary_value, "density": density_value, "route": route_value, "binary": binary_value}
+    return {"total": total, "global": global_loss, "global_l1": global_l1, "global_ssim": global_ssim,
+            "global_contrast": global_contrast, "fuse": fuse_loss, "comp": comp_loss,
+            "boundary": boundary_value, "density": density_value, "route": route_value, "binary": binary_value,
+            "region_l1_weight": region_l1_weight, "region_ssim_weight": region_ssim_weight,
+            "region_gradient_weight": region_gradient_weight}

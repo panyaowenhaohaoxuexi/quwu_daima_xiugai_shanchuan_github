@@ -33,7 +33,7 @@ def test_source_resume_does_not_reset_formal_checkpoint_loss_weights():
     from option.Teacher import build_parser, persisted_config_from_args, validate_config
 
     checkpoint_config = persisted_config_from_args(validate_config(build_parser().parse_args([
-        "--formal_training", "--q_l1_weight", "1.7", "--rec_ssim_weight", "0.9",
+        "--formal_training", "--q_l1_weight", "1.7", "--region_ssim_weight", "0.9",
     ])))
     raw = build_parser().parse_args(["--resume_checkpoint", "source.pt"])
     merged = resolve_source_resume_config(raw, checkpoint_config)
@@ -41,7 +41,7 @@ def test_source_resume_does_not_reset_formal_checkpoint_loss_weights():
     resumed = validate_config(argparse.Namespace(**merged))
 
     assert resumed.q_l1_weight == 1.7
-    assert resumed.rec_ssim_weight == 0.9
+    assert resumed.region_ssim_weight == 0.9
 
 
 def test_ema_resume_keeps_checkpoint_ema_semantics_and_current_runtime_values():
