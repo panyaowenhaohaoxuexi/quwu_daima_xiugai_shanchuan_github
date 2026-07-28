@@ -13,6 +13,13 @@ LOSS_WEIGHT_NAMES = (
     "boundary_l1_weight", "boundary_gradient_weight",
 )
 
+LOCAL_SOURCE_TRAIN_DIR = r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\1_FLIR\train"
+LOCAL_VALIDATION_DATA_DIR = r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\1_FLIR\test"
+LOCAL_SOURCE_CHECKPOINT = r"E:\Github_code_upload\Multimodal_Dehaze_code\Teacher_Train\source_last.pt"
+LOCAL_REAL_ROOT_DIR = r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\2_M3FD"
+LOCAL_REAL_TIR_DIR = r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\2_M3FD\ir"
+LOCAL_EMA_OUTPUT_DIR = r"E:\Github_code_upload\Multimodal_Dehaze_code\Student_Train"
+
 INHERITED_SOURCE_KEYS = (
     "model_init_seed", "base_channels", "router_hidden_channels", "num_structure_renderers",
     "deform_num_samples", "deform_max_offset", "memory_max_tokens", "memory_topk",
@@ -37,15 +44,15 @@ INHERITED_SOURCE_KEYS = (
     "lambda_density", "lambda_route", "lambda_binary", *LOSS_WEIGHT_NAMES,
 )
 EMA_PARSER_KEYS = (
-    "device", "real_data_dir", "source_anchor_data_dir", "source_checkpoint", "resume_checkpoint",
-    "real_batch_size", "source_anchor_batch_size", "num_workers", "epochs", "learning_rate",
+    "device", "real_data_dir", "real_tir_dir", "source_anchor_data_dir", "validation_data_dir", "source_checkpoint", "resume_checkpoint",
+    "real_batch_size", "source_anchor_batch_size", "validation_batch_size", "num_workers", "epochs", "iters_per_epoch", "start_lr", "end_lr", "no_lr_sche",
     "ema_decay", "ema_sigma_j", "ema_sigma_m", "ema_sigma_r", "ema_stability_min_weight",
     "lambda_ema_j", "lambda_ema_m", "lambda_ema_r", "lambda_anchor", "w_loss_Clip",
     "exp_dir", "saved_model_dir", "saved_data_dir",
 )
 EMA_RUNTIME_KEYS = (
-    "device", "real_data_dir", "source_anchor_data_dir", "source_checkpoint", "resume_checkpoint",
-    "real_batch_size", "source_anchor_batch_size", "num_workers", "epochs", "learning_rate",
+    "device", "real_data_dir", "real_tir_dir", "source_anchor_data_dir", "validation_data_dir", "source_checkpoint", "resume_checkpoint",
+    "real_batch_size", "source_anchor_batch_size", "validation_batch_size", "num_workers", "epochs", "iters_per_epoch", "start_lr", "end_lr", "no_lr_sche",
     "exp_dir", "saved_model_dir", "saved_data_dir",
 )
 EMA_SEMANTIC_KEYS = tuple(key for key in EMA_PARSER_KEYS if key not in EMA_RUNTIME_KEYS)
@@ -73,19 +80,30 @@ def tir_normalization_config_from_args(args):
     }
 
 
+def real_modal_dirs_from_args(args):
+    """Return the real RGB-hazy and TIR roots configured for EMA."""
+    return str(Path(args.real_data_dir) / "hazy"), args.real_tir_dir
+
+
 def build_parser():
     parser = argparse.ArgumentParser("fog-routed-ema")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--real_data_dir", default="")
-    parser.add_argument("--source_anchor_data_dir", default="")
-    parser.add_argument("--source_checkpoint", default="")
+    parser.add_argument("--real_data_dir", default=LOCAL_REAL_ROOT_DIR)
+    parser.add_argument("--real_tir_dir", default=LOCAL_REAL_TIR_DIR)
+    parser.add_argument("--source_anchor_data_dir", default=LOCAL_SOURCE_TRAIN_DIR)
+    parser.add_argument("--validation_data_dir", default=LOCAL_VALIDATION_DATA_DIR)
+    parser.add_argument("--source_checkpoint", default=LOCAL_SOURCE_CHECKPOINT)
     parser.add_argument("--resume_checkpoint", default="")
     parser.add_argument("--real_batch_size", type=int, default=1)
     parser.add_argument("--source_anchor_batch_size", type=int, default=1)
+    parser.add_argument("--validation_batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--iters_per_epoch", type=int, default=1000)
+    parser.add_argument("--start_lr", "--learning_rate", dest="start_lr", type=float, default=1e-7)
+    parser.add_argument("--end_lr", type=float, default=1e-8)
+    parser.add_argument("--no_lr_sche", action="store_true", help="disable CoA cosine learning-rate schedule")
+    parser.add_argument("--ema_decay", type=float, default=0.95)
     parser.add_argument("--ema_sigma_j", type=float, default=0.1)
     parser.add_argument("--ema_sigma_m", type=float, default=0.1)
     parser.add_argument("--ema_sigma_r", type=float, default=0.1)
@@ -95,8 +113,8 @@ def build_parser():
     parser.add_argument("--lambda_ema_r", type=float, default=1.0)
     parser.add_argument("--lambda_anchor", type=float, default=1.0)
     parser.add_argument("--w_loss_Clip", default=0.5, type=float, help="weight of CoA CLIP loss")
-    parser.add_argument("--exp_dir", default="experiment")
-    parser.add_argument("--saved_model_dir", default="")
+    parser.add_argument("--exp_dir", default=LOCAL_EMA_OUTPUT_DIR)
+    parser.add_argument("--saved_model_dir", default=LOCAL_EMA_OUTPUT_DIR)
     parser.add_argument("--saved_data_dir", default="")
     return parser
 
@@ -176,18 +194,22 @@ def validate_config(args):
     _validate_inherited_source_config(args)
     if not args.real_data_dir:
         raise ValueError("real_data_dir must be provided for EMA adaptation")
+    if not args.real_tir_dir:
+        raise ValueError("real_tir_dir must be provided for EMA adaptation")
     if not args.source_anchor_data_dir:
         raise ValueError("source_anchor_data_dir must be provided for EMA adaptation")
+    if not args.validation_data_dir:
+        raise ValueError("validation_data_dir must be provided for EMA adaptation")
     if not 0 <= args.ema_decay < 1:
         raise ValueError("ema_decay must be in [0,1)")
     if min(args.ema_sigma_j, args.ema_sigma_m, args.ema_sigma_r) <= 0:
         raise ValueError("EMA sigmas must be > 0")
     if not 0 <= args.ema_stability_min_weight <= 1:
         raise ValueError("ema_stability_min_weight must be in [0,1]")
-    if args.real_batch_size < 1 or args.source_anchor_batch_size < 1 or args.num_workers < 0:
+    if args.real_batch_size < 1 or args.source_anchor_batch_size < 1 or args.validation_batch_size < 1 or args.num_workers < 0:
         raise ValueError("EMA batch sizes must be positive and num_workers must be non-negative")
-    if args.epochs < 1 or args.learning_rate <= 0:
-        raise ValueError("EMA epochs and learning_rate must be positive")
+    if args.epochs < 1 or args.iters_per_epoch < 1 or args.start_lr <= 0 or args.end_lr <= 0:
+        raise ValueError("EMA epochs, iters_per_epoch, start_lr, and end_lr must be positive")
     if args.w_loss_Clip < 0:
         raise ValueError("w_loss_Clip must be non-negative")
     return args

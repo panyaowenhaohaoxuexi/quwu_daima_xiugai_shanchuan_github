@@ -16,7 +16,26 @@ def test_teacher_owns_source_defaults_without_import_side_effects():
     args = validate_config(build_parser().parse_args([]))
 
     assert (args.batch_size, args.num_workers) == (1, 0)
-    assert args.train_data_dir == ""
+    assert args.train_data_dir == r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\1_FLIR\train"
+
+
+def test_local_machine_data_and_output_defaults_target_the_configured_datasets():
+    from option.EMA import build_parser as build_ema_parser, real_modal_dirs_from_args
+    from option.Teacher import build_parser as build_teacher_parser
+
+    teacher = build_teacher_parser().parse_args([])
+    ema = build_ema_parser().parse_args([])
+
+    assert teacher.train_data_dir == r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\1_FLIR\train"
+    assert teacher.exp_dir == teacher.saved_model_dir == r"E:\Github_code_upload\Multimodal_Dehaze_code\Teacher_Train"
+    assert ema.real_data_dir == r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\2_M3FD"
+    assert ema.source_anchor_data_dir == teacher.train_data_dir
+    assert ema.source_checkpoint == r"E:\Github_code_upload\Multimodal_Dehaze_code\Teacher_Train\source_last.pt"
+    assert ema.exp_dir == ema.saved_model_dir == r"E:\Github_code_upload\Multimodal_Dehaze_code\Student_Train"
+    assert real_modal_dirs_from_args(ema) == (
+        r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\2_M3FD\hazy",
+        r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\2_M3FD\ir",
+    )
 
 
 def test_ema_parser_exposes_only_ema_runtime_and_anchor_path_arguments():
@@ -30,6 +49,7 @@ def test_ema_parser_exposes_only_ema_runtime_and_anchor_path_arguments():
     assert (args.real_batch_size, args.source_anchor_batch_size, args.num_workers) == (1, 1, 0)
     assert args.real_data_dir == "real-root"
     assert args.source_anchor_data_dir == "anchor-root"
+    assert args.real_tir_dir == r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\2_M3FD\ir"
     for forbidden in (
         "base_channels", "train_data_dir", "q_l1_weight", "omega_regions_per_image",
         "allow_ema_training_override",
@@ -55,14 +75,14 @@ def test_ema_resolution_inherits_only_source_whitelist_and_uses_cli_ema_values()
     assert validated.q_l1_weight == checkpoint_config["q_l1_weight"]
     assert validated.real_data_dir == "real-root"
     assert validated.source_anchor_data_dir == "anchor-root"
-    assert validated.learning_rate == pytest.approx(0.0003)
+    assert validated.start_lr == pytest.approx(0.0003)
     assert validated.ema_decay == pytest.approx(0.95)
     assert "train_data_dir" not in resolved
 
 
 @pytest.mark.parametrize("raw_argv, message", [
-    (["--source_anchor_data_dir", "anchor"], "real_data_dir"),
-    (["--real_data_dir", "real"], "source_anchor_data_dir"),
+    (["--real_data_dir", "", "--source_anchor_data_dir", "anchor"], "real_data_dir"),
+    (["--real_data_dir", "real", "--source_anchor_data_dir", ""], "source_anchor_data_dir"),
 ])
 def test_ema_validation_rejects_empty_current_data_paths(raw_argv, message):
     from option.EMA import build_parser, resolve_ema_config, validate_config

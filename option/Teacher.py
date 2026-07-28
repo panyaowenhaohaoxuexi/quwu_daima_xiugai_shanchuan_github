@@ -20,6 +20,11 @@ FORMAL_TRAINING_LOSS_WEIGHTS = {
 }
 
 
+LOCAL_SOURCE_TRAIN_DIR = r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\1_FLIR\train"
+LOCAL_VALIDATION_DATA_DIR = r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\1_FLIR\test"
+LOCAL_TEACHER_OUTPUT_DIR = r"E:\Github_code_upload\Multimodal_Dehaze_code\Teacher_Train"
+
+
 def _mark_explicit_training_objective(namespace, name):
     explicit = list(getattr(namespace, "_explicit_training_objective_keys", ()))
     if name not in explicit:
@@ -94,10 +99,12 @@ def add_model_arguments(parser):
 
 
 def add_synthetic_data_arguments(parser):
-    parser.add_argument("--train_data_dir", default="")
+    parser.add_argument("--train_data_dir", default=LOCAL_SOURCE_TRAIN_DIR)
+    parser.add_argument("--validation_data_dir", default=LOCAL_VALIDATION_DATA_DIR)
     parser.add_argument("--train_size", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--num_workers", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--validation_batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--density_gt_semantics", choices=("transmission", "density"), default="transmission")
     parser.add_argument("--density_map_normalization", choices=("dtype_range", "fixed_range", "dataset_calibrated_range"), default="dtype_range")
     parser.add_argument("--density_fixed_min", type=float)
@@ -128,8 +135,11 @@ def add_source_training_arguments(parser):
     parser.add_argument("--omega_min_area", type=int, default=16)
     parser.add_argument("--omega_max_area", type=int, default=256)
     parser.add_argument("--max_consecutive_empty_omega_steps", type=int, default=100)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--iters_per_epoch", type=int, default=5000)
+    parser.add_argument("--start_lr", "--learning_rate", dest="start_lr", type=float, default=1e-4)
+    parser.add_argument("--end_lr", type=float, default=1e-6)
+    parser.add_argument("--no_lr_sche", action="store_true", help="disable CoA cosine learning-rate schedule")
     parser.add_argument("--resume_checkpoint", default="")
 
 
@@ -154,8 +164,8 @@ def add_source_loss_arguments(parser):
 
 
 def add_output_arguments(parser):
-    parser.add_argument("--exp_dir", default="experiment")
-    parser.add_argument("--saved_model_dir", default="")
+    parser.add_argument("--exp_dir", default=LOCAL_TEACHER_OUTPUT_DIR)
+    parser.add_argument("--saved_model_dir", default=LOCAL_TEACHER_OUTPUT_DIR)
     parser.add_argument("--saved_data_dir", default="")
 
 
@@ -184,8 +194,8 @@ def _validate_model_and_source_flow(args):
         raise ValueError("invalid route/counterfactual schedule")
     if args.counterfactual_chunk_size < 1 or args.deform_num_samples < 1 or args.deform_max_offset < 0:
         raise ValueError("invalid counterfactual/deform configuration")
-    if args.train_size < 1 or args.batch_size < 1 or args.num_workers < 0:
-        raise ValueError("train_size/batch_size must be positive and num_workers must be non-negative")
+    if args.train_size < 1 or args.batch_size < 1 or args.validation_batch_size < 1 or args.num_workers < 0:
+        raise ValueError("train_size/batch sizes must be positive and num_workers must be non-negative")
     if args.num_structure_renderers < 1 or args.memory_max_tokens < 1 or args.memory_query_chunk_size < 1:
         raise ValueError("invalid renderer or memory configuration")
     if args.memory_exclusion_extra_margin < 0:
@@ -240,8 +250,10 @@ def validate_config(args):
     _validate_model_and_source_flow(args)
     _validate_preprocessing(args)
     validate_source_loss_arguments(args)
-    if args.epochs < 1 or args.learning_rate <= 0:
-        raise ValueError("epochs and learning_rate must be positive")
+    if not args.train_data_dir or not args.validation_data_dir:
+        raise ValueError("train_data_dir and validation_data_dir must be provided")
+    if args.epochs < 1 or args.iters_per_epoch < 1 or args.start_lr <= 0 or args.end_lr <= 0:
+        raise ValueError("epochs, iters_per_epoch, start_lr, and end_lr must be positive")
     return args
 
 

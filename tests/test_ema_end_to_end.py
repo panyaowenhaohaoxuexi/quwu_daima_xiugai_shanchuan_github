@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 import torch
@@ -40,7 +42,7 @@ def test_ema_entrypoint_runs_real_and_source_anchor_from_source_checkpoint(tmp_p
     from Teacher import main as source_main
     source_dir = tmp_path / "source-checkpoint"
     source_main([
-        "--train_data_dir", str(tmp_path), "--train_size", "32", "--epochs", "1", "--device", "cpu",
+        "--train_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path), "--train_size", "32", "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu",
         "--base_channels", "8", "--memory_max_tokens", "16", "--memory_topk", "2",
         "--counterfactual_start_step", "100", "--route_loss_start_step", "100",
         "--saved_model_dir", str(source_dir), "--exp_dir", str(tmp_path / "source-exp"),
@@ -50,7 +52,9 @@ def test_ema_entrypoint_runs_real_and_source_anchor_from_source_checkpoint(tmp_p
     checkpoint_dir = tmp_path / "ema-checkpoints"
     main([
         "--source_checkpoint", str(source_dir / "source_last.pt"), "--source_anchor_data_dir", str(tmp_path),
-        "--real_data_dir", str(tmp_path / "real"), "--epochs", "1", "--device", "cpu",
+        "--validation_data_dir", str(tmp_path),
+        "--real_data_dir", str(tmp_path / "real"), "--real_tir_dir", str(tmp_path / "real" / "tir"),
+        "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu",
         "--saved_model_dir", str(checkpoint_dir), "--exp_dir", str(tmp_path / "ema-experiment"),
     ])
     checkpoint = torch.load(checkpoint_dir / "ema_last.pt", map_location="cpu")
@@ -58,19 +62,31 @@ def test_ema_entrypoint_runs_real_and_source_anchor_from_source_checkpoint(tmp_p
     assert checkpoint["ema_global_step"] == 1
     assert set(checkpoint) == {
         "format_version", "training_stage", "student", "teacher", "optimizer", "epoch",
-        "source_global_step", "ema_global_step", "config",
+        "source_global_step", "ema_global_step", "config", "best_psnr",
     }
+    assert (checkpoint_dir / "ema_best.pt").is_file()
+    experiment_dir = tmp_path / "ema-experiment"
+    summary = json.loads((experiment_dir / "run_summary.json").read_text(encoding="utf-8"))
+    events = [json.loads(line) for line in (experiment_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert summary["stage"] == "ema"
+    assert summary["clip_resources"]["rn101_loaded"] is True
+    assert summary["dataset_sizes"] == {"real": 1, "source_anchor": 1, "validation": 1}
+    assert {event["event"] for event in events} == {"train_step", "validation"}
+    assert "loss_clip" in next(event for event in events if event["event"] == "train_step")
 
     main([
         "--resume_checkpoint", str(checkpoint_dir / "ema_last.pt"), "--source_anchor_data_dir", str(tmp_path),
-        "--real_data_dir", str(tmp_path / "real"), "--epochs", "2", "--device", "cpu",
+        "--validation_data_dir", str(tmp_path),
+        "--real_data_dir", str(tmp_path / "real"), "--real_tir_dir", str(tmp_path / "real" / "tir"),
+        "--epochs", "2", "--iters_per_epoch", "1", "--device", "cpu",
         "--learning_rate", "0.003", "--saved_model_dir", str(checkpoint_dir),
         "--exp_dir", str(tmp_path / "ema-experiment-resume"),
     ])
     resumed = torch.load(checkpoint_dir / "ema_last.pt", map_location="cpu")
     assert resumed["ema_global_step"] == 2
-    assert resumed["config"]["learning_rate"] == 0.003
-    assert resumed["optimizer"]["param_groups"][0]["lr"] == 0.003
+    assert resumed["config"]["start_lr"] == 0.003
+    assert (checkpoint_dir / "ema_best.pt").is_file()
+    assert resumed["optimizer"]["param_groups"][0]["lr"] == pytest.approx(1e-8)
 
 
 def test_ema_lambda_router_zero_does_not_raise_for_empty_q_regions(tmp_path):
@@ -88,7 +104,7 @@ def test_ema_lambda_router_zero_does_not_raise_for_empty_q_regions(tmp_path):
     from Teacher import main as source_main
     source_dir = tmp_path / "source"
     source_main([
-        "--train_data_dir", str(tmp_path), "--train_size", "32", "--epochs", "1", "--device", "cpu",
+        "--train_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path), "--train_size", "32", "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu",
         "--base_channels", "8", "--memory_max_tokens", "16", "--memory_topk", "2",
         "--counterfactual_start_step", "100", "--route_loss_start_step", "100",
         "--lambda_router", "0", "--q_min_valid_support", "64",
@@ -100,7 +116,9 @@ def test_ema_lambda_router_zero_does_not_raise_for_empty_q_regions(tmp_path):
     ema_dir = tmp_path / "ema"
     main([
         "--source_checkpoint", str(source_dir / "source_last.pt"), "--source_anchor_data_dir", str(tmp_path),
-        "--real_data_dir", str(tmp_path / "real"), "--epochs", "1", "--device", "cpu",
+        "--validation_data_dir", str(tmp_path),
+        "--real_data_dir", str(tmp_path / "real"), "--real_tir_dir", str(tmp_path / "real" / "tir"),
+        "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu",
         "--saved_model_dir", str(ema_dir), "--exp_dir", str(tmp_path / "ema-exp"),
     ])
     assert (ema_dir / "ema_last.pt").is_file()

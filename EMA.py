@@ -5,18 +5,22 @@ import copy
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import torch
 from torch import nn
-from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from data.data_loader import RealMultiModalDataset, SynthMultiModalDataset, collate_real, collate_synth
 from loss.ema import real_consistency_loss, stability_weights
 from option.EMA import (build_ema_checkpoint_config, build_parser, prepare_experiment_dirs,
-                        resolve_ema_config, save_config, tir_normalization_config_from_args, validate_config)
+                        real_modal_dirs_from_args, resolve_ema_config, save_config,
+                        tir_normalization_config_from_args, validate_config)
 from training.source import OmegaSampler, compute_source_batch_losses
+from training.schedule import build_coa_adam, cycle_batches, set_cosine_learning_rate
+from training.observability import TrainingLogger
+from training.validation import evaluate_paired_validation, save_best_if_improved
 from utils.checkpoint import (build_ema_checkpoint, build_model_from_config, load_ema_checkpoint,
                               load_strict_v2_state_dict, preflight_ema_resume_checkpoint,
                               preflight_source_initialization_checkpoint)
@@ -170,6 +174,8 @@ def _real_loss(teacher, student, hazy, tir, generator, args, *, clip_criterion=N
 
 def main(argv=None):
     raw_args = build_parser().parse_args(argv)
+    if raw_args.resume_checkpoint:
+        raw_args.source_checkpoint = ""
     if bool(raw_args.source_checkpoint) == bool(raw_args.resume_checkpoint):
         raise ValueError("EMA requires exactly one of --source_checkpoint or --resume_checkpoint")
     checkpoint = torch.load(raw_args.resume_checkpoint or raw_args.source_checkpoint, map_location="cpu")
@@ -186,21 +192,22 @@ def main(argv=None):
     require_coa_clip_cuda(device)
     clip_criterion, text_features = initialize_coa_clip(device)
     student = build_model_from_config(vars(args)).to(device)
-    optimizer = AdamW(student.parameters(), lr=args.learning_rate)
+    optimizer = build_coa_adam(student.parameters(), learning_rate=args.start_lr)
     if expected_stage == "source":
         load_strict_v2_state_dict(student, checkpoint_preflight["states"]["model"], label="Source model")
         teacher, start_epoch = initialize_teacher(student), 0
-        source_global_step, ema_global_step = checkpoint_preflight["metadata"]["global_step"], 0
+        source_global_step, ema_global_step, best_psnr = checkpoint_preflight["metadata"]["global_step"], 0, float("-inf")
     else:
         teacher = initialize_teacher(student)
         restored = load_ema_checkpoint(checkpoint, student, teacher, optimizer)
-        start_epoch, source_global_step, ema_global_step = restored["epoch"], restored["source_global_step"], restored["ema_global_step"]
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = args.learning_rate
+        start_epoch, source_global_step, ema_global_step, best_psnr = (
+            restored["epoch"], restored["source_global_step"], restored["ema_global_step"], restored.get("best_psnr", float("-inf"))
+        )
     geometry_generator = torch.Generator().manual_seed(args.model_init_seed + 201)
     omega_generator = torch.Generator(device=device).manual_seed(args.model_init_seed + 101)
     omega_sampler = OmegaSampler(args.omega_regions_per_image, args.omega_min_area, args.omega_max_area, args.model_init_seed)
-    real_dataset = RealMultiModalDataset(f"{args.real_data_dir}/hazy", f"{args.real_data_dir}/tir",
+    real_hazy_dir, real_tir_dir = real_modal_dirs_from_args(args)
+    real_dataset = RealMultiModalDataset(real_hazy_dir, real_tir_dir,
                                          pair_alignment_policy=args.pair_alignment_policy,
                                          tir_normalization_config=tir_normalization_config_from_args(args))
     source_dataset = SynthMultiModalDataset(args.source_anchor_data_dir, train=True, size=args.train_size,
@@ -211,19 +218,55 @@ def main(argv=None):
         augmentation_seed_base=args.model_init_seed)
     real_loader = DataLoader(real_dataset, batch_size=args.real_batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_real)
     source_loader = DataLoader(source_dataset, batch_size=args.source_anchor_batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_synth)
+    validation_dataset = SynthMultiModalDataset(args.validation_data_dir, train=False, size="full",
+        density_gt_semantics=args.density_gt_semantics, density_map_normalization=args.density_map_normalization,
+        density_fixed_min=args.density_fixed_min, density_fixed_max=args.density_fixed_max,
+        density_calibrated_min=args.density_calibrated_min, density_calibrated_max=args.density_calibrated_max,
+        tir_normalization_config=tir_normalization_config_from_args(args), pair_alignment_policy=args.pair_alignment_policy)
+    validation_loader = DataLoader(validation_dataset, batch_size=args.validation_batch_size, shuffle=False,
+                                   num_workers=args.num_workers, collate_fn=collate_synth)
     prepare_experiment_dirs(args)
     save_config(args)
     empty_omega_streak = 0
+    total_steps = args.epochs * args.iters_per_epoch
+    real_iterator, source_iterator = cycle_batches(real_loader), cycle_batches(source_loader)
+    logger = TrainingLogger(args.exp_dir or args.saved_model_dir, resume=expected_stage == "ema")
+    logger.write_run_summary({
+        "stage": "ema", "device": str(device), "seed": args.model_init_seed,
+        "dataset_sizes": {"real": len(real_dataset), "source_anchor": len(source_dataset),
+                          "validation": len(validation_dataset)},
+        "batch_configuration": {"real": args.real_batch_size, "source_anchor": args.source_anchor_batch_size,
+                                "validation": args.validation_batch_size, "num_workers": args.num_workers},
+        "schedule": {"epochs": args.epochs, "iters_per_epoch": args.iters_per_epoch,
+                     "total_steps": total_steps, "start_lr": args.start_lr, "end_lr": args.end_lr,
+                     "ema_decay": args.ema_decay},
+        "parameter_counts": {"student": sum(parameter.numel() for parameter in student.parameters()),
+                             "teacher": sum(parameter.numel() for parameter in teacher.parameters()),
+                             "rgb_encoder": sum(parameter.numel() for parameter in student.rgb_encoder.parameters()),
+                             "tir_encoder": sum(parameter.numel() for parameter in student.tir_encoder.parameters())},
+        "res2net_pretrained_loaded": True,
+        "res2net_pretrained_path": student.rgb_encoder.pretrained_path,
+        "clip_resources": {"vit_b32_loaded": True, "rn101_loaded": True, "haze_prompt_loaded": True},
+        "initialization_checkpoint": raw_args.resume_checkpoint or raw_args.source_checkpoint,
+        "output_directories": {"experiment": args.exp_dir, "models": args.saved_model_dir,
+                               "diagnostics": args.saved_data_dir},
+    })
+    print(f"ema startup device={device} real={len(real_dataset)} source_anchor={len(source_dataset)} "
+          f"validation={len(validation_dataset)} epochs={args.epochs} iters_per_epoch={args.iters_per_epoch} "
+          f"total_steps={total_steps} student_params={sum(parameter.numel() for parameter in student.parameters()):,} "
+          f"res2net={student.rgb_encoder.pretrained_path} clip=ViT-B/32,RN101,haze_prompt")
     for epoch in range(start_epoch, args.epochs):
         source_dataset.set_sampler_epoch(epoch)
         student.train(); set_batchnorm_eval(student); teacher.eval(); set_batchnorm_eval(teacher)
-        source_iterator = iter(source_loader)
-        for real_hazy, real_tir, _ in real_loader:
-            try:
-                source_batch = next(source_iterator)
-            except StopIteration:
-                source_iterator = iter(source_loader)
-                source_batch = next(source_iterator)
+        for logical_step in range(args.iters_per_epoch):
+            step_started = perf_counter()
+            real_hazy, real_tir, _ = next(real_iterator)
+            source_batch = next(source_iterator)
+            schedule_step = epoch * args.iters_per_epoch + logical_step + 1
+            learning_rate = set_cosine_learning_rate(
+                optimizer, step=schedule_step, total_steps=total_steps, start_lr=args.start_lr,
+                end_lr=args.end_lr, no_lr_sche=args.no_lr_sche,
+            )
             optimizer.zero_grad(set_to_none=True)
             real = _real_loss(teacher, student, real_hazy.to(device), real_tir.to(device), geometry_generator, args,
                               clip_criterion=clip_criterion, text_features=text_features)
@@ -233,7 +276,6 @@ def main(argv=None):
             adapt = adaptation_loss(real, source, args)
             _require_finite(adapt, student, epoch=epoch, step=ema_global_step)
             optimizer.step()
-            update_teacher_after_success(teacher, student, args.ema_decay)
             route_supervision_enabled = args.lambda_router * source["state"]["lambda_route"] > 0
             empty_omega_streak = empty_omega_streak + 1 if (
                 route_supervision_enabled and not source["route_supervision"]["valid_q_region_count"]
@@ -241,10 +283,37 @@ def main(argv=None):
             if empty_omega_streak >= args.max_consecutive_empty_omega_steps:
                 raise RuntimeError(f"ema empty Omega limit: epoch={epoch} step={ema_global_step}")
             source_global_step += 1; ema_global_step += 1
+            logger.log_event(
+                "train_step", epoch=epoch + 1, epoch_step=logical_step + 1,
+                ema_global_step=ema_global_step, source_global_step=source_global_step,
+                learning_rate=learning_rate, duration_seconds=perf_counter() - step_started,
+                loss_total=adapt, loss_real=real["L_real"], loss_clip=real["L_clip"],
+                loss_source_anchor=source["losses"]["total"],
+                **{f"loss_real_{name.lower()}": value for name, value in real.items()},
+                **{f"loss_source_{name}": value for name, value in source["losses"].items()},
+                **{f"schedule_{name}": value for name, value in source["state"].items()},
+                **{f"route_{name}": value for name, value in source["route_supervision"].items()},
+            )
+            if ema_global_step % 50 == 0:
+                print(f"ema epoch={epoch + 1} step={ema_global_step} loss={adapt.item():.5f} "
+                      f"real={real['L_real'].item():.5f} clip={real['L_clip'].item():.5f} "
+                      f"anchor={source['losses']['total'].item():.5f} lr={learning_rate:.9f}")
+        update_teacher_after_success(teacher, student, args.ema_decay)
+        validation = evaluate_paired_validation(student, validation_loader, device, route_temperature=args.route_tau_end)
+        candidate = build_ema_checkpoint(student, teacher, optimizer, epoch=epoch + 1,
+            source_global_step=source_global_step, ema_global_step=ema_global_step,
+            config=build_ema_checkpoint_config(checkpoint_config, args), best_psnr=max(best_psnr, validation["psnr"]))
+        is_best = validation["psnr"] > best_psnr
         if args.saved_model_dir:
-            torch.save(build_ema_checkpoint(student, teacher, optimizer, epoch=epoch + 1,
-                source_global_step=source_global_step, ema_global_step=ema_global_step,
-                config=build_ema_checkpoint_config(checkpoint_config, args)), Path(args.saved_model_dir) / "ema_last.pt")
+            output_dir = Path(args.saved_model_dir)
+            best_psnr = save_best_if_improved(validation["psnr"], best_psnr, candidate, output_dir / "ema_best.pt")
+            candidate["best_psnr"] = best_psnr
+            torch.save(candidate, output_dir / "ema_last.pt")
+        logger.log_event("validation", epoch=epoch + 1, ema_global_step=ema_global_step,
+                         source_global_step=source_global_step, learning_rate=learning_rate,
+                         psnr=validation["psnr"], ssim=validation["ssim"], best_psnr=best_psnr, is_best=is_best)
+        print(f"ema validation epoch={epoch + 1} psnr={validation['psnr']:.4f} "
+              f"ssim={validation['ssim']:.4f} best_psnr={best_psnr:.4f} is_best={is_best}")
     return student, teacher
 
 

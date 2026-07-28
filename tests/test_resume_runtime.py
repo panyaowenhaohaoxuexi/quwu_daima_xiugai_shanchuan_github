@@ -22,7 +22,7 @@ def test_source_resume_uses_checkpoint_semantics_and_current_runtime_values():
     assert merged["train_data_dir"] == "new-data"
     assert merged["device"] == "cpu"
     assert merged["epochs"] == 9
-    assert merged["learning_rate"] == 0.002
+    assert merged["start_lr"] == 0.002
     assert merged["batch_size"] == 3
     assert merged["num_workers"] == 2
     assert merged["saved_model_dir"] == "new-output"
@@ -66,4 +66,4 @@ def test_ema_resume_keeps_checkpoint_ema_semantics_and_current_runtime_values():
     assert merged["source_anchor_data_dir"] == "new-source"
     assert merged["device"] == "cpu"
     assert merged["epochs"] == 5
-    assert merged["learning_rate"] == 0.003
+    assert merged["start_lr"] == 0.003

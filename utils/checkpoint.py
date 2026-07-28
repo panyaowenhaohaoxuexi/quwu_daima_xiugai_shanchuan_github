@@ -146,18 +146,24 @@ def build_model_from_config(config):
     return FogRoutedRGBTIRDehazer(**{key: config[key] for key in MODEL_CONFIG_KEYS})
 
 
-def build_source_checkpoint(model, optimizer, *, epoch, global_step, config):
+def build_source_checkpoint(model, optimizer, *, epoch, global_step, config, best_psnr=None):
     require_complete_model_config(config)
-    return {"format_version": CHECKPOINT_FORMAT_VERSION, "training_stage": "source", "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-            "epoch": int(epoch), "global_step": int(global_step), "config": dict(config)}
+    checkpoint = {"format_version": CHECKPOINT_FORMAT_VERSION, "training_stage": "source", "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                  "epoch": int(epoch), "global_step": int(global_step), "config": dict(config)}
+    if best_psnr is not None:
+        checkpoint["best_psnr"] = float(best_psnr)
+    return checkpoint
 
 
-def build_ema_checkpoint(student, teacher, optimizer, *, epoch, source_global_step, ema_global_step, config):
+def build_ema_checkpoint(student, teacher, optimizer, *, epoch, source_global_step, ema_global_step, config, best_psnr=None):
     require_complete_model_config(config)
-    return {"format_version": CHECKPOINT_FORMAT_VERSION, "training_stage": "ema", "student": student.state_dict(), "teacher": teacher.state_dict(),
-            "optimizer": optimizer.state_dict(), "epoch": int(epoch),
-            "source_global_step": int(source_global_step), "ema_global_step": int(ema_global_step),
-            "config": dict(config)}
+    checkpoint = {"format_version": CHECKPOINT_FORMAT_VERSION, "training_stage": "ema", "student": student.state_dict(), "teacher": teacher.state_dict(),
+                  "optimizer": optimizer.state_dict(), "epoch": int(epoch),
+                  "source_global_step": int(source_global_step), "ema_global_step": int(ema_global_step),
+                  "config": dict(config)}
+    if best_psnr is not None:
+        checkpoint["best_psnr"] = float(best_psnr)
+    return checkpoint
 
 
 def require_stage(checkpoint, stage):
@@ -177,8 +183,11 @@ def load_source_checkpoint(checkpoint, model, optimizer=None):
             optimizer.load_state_dict(preflight["optimizer_state"])
         except (KeyError, TypeError, RuntimeError, ValueError) as exc:
             raise RuntimeError("Source optimizer state is incompatible") from exc
-    return {"epoch": preflight["metadata"]["epoch"],
-            "global_step": preflight["metadata"]["global_step"]}
+    state = {"epoch": preflight["metadata"]["epoch"],
+             "global_step": preflight["metadata"]["global_step"]}
+    if "best_psnr" in checkpoint:
+        state["best_psnr"] = float(checkpoint["best_psnr"])
+    return state
 
 
 def load_ema_checkpoint(checkpoint, student, teacher, optimizer=None):
@@ -195,9 +204,12 @@ def load_ema_checkpoint(checkpoint, student, teacher, optimizer=None):
             optimizer.load_state_dict(preflight["optimizer_state"])
         except (KeyError, TypeError, RuntimeError, ValueError) as exc:
             raise RuntimeError("EMA optimizer state is incompatible") from exc
-    return {"epoch": preflight["metadata"]["epoch"],
-            "source_global_step": preflight["metadata"]["source_global_step"],
-            "ema_global_step": preflight["metadata"]["ema_global_step"]}
+    state = {"epoch": preflight["metadata"]["epoch"],
+             "source_global_step": preflight["metadata"]["source_global_step"],
+             "ema_global_step": preflight["metadata"]["ema_global_step"]}
+    if "best_psnr" in checkpoint:
+        state["best_psnr"] = float(checkpoint["best_psnr"])
+    return state
 
 
 def tir_normalization_config(config):

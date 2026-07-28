@@ -39,8 +39,8 @@ def test_ema_startup_uses_cpu_geometry_generator_before_model_construction():
     assert "geometry_generator = torch.Generator().manual_seed(" in source
     assert "omega_generator = torch.Generator(device=device).manual_seed(" in source
     assert source.index("_set_seed(args.model_init_seed)") < source.index("student = build_model_from_config")
-    assert source.index("student = build_model_from_config") < source.index("optimizer = AdamW")
-    assert source.index("optimizer = AdamW") < source.index("geometry_generator = torch.Generator()")
+    assert source.index("student = build_model_from_config") < source.index("optimizer = build_coa_adam")
+    assert source.index("optimizer = build_coa_adam") < source.index("geometry_generator = torch.Generator()")
     assert source.index("omega_generator = torch.Generator(device=device)") < source.index("real_dataset = RealMultiModalDataset")
 
 
@@ -62,14 +62,16 @@ def test_ema_cuda_smoke_has_no_geometry_generator_device_mismatch(tmp_path):
 
     source_dir, ema_dir = tmp_path / "source", tmp_path / "ema"
     source_main([
-        "--train_data_dir", str(tmp_path), "--train_size", "32", "--epochs", "1", "--device", "cpu",
+        "--train_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path), "--train_size", "32", "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu",
         "--base_channels", "8", "--memory_max_tokens", "16", "--memory_topk", "2",
         "--counterfactual_start_step", "100", "--route_loss_start_step", "100",
         "--saved_model_dir", str(source_dir), "--exp_dir", str(tmp_path / "source-exp"),
     ])
     ema_main([
         "--source_checkpoint", str(source_dir / "source_last.pt"), "--source_anchor_data_dir", str(tmp_path),
-        "--real_data_dir", str(tmp_path / "real"), "--epochs", "1", "--device", "cuda",
+        "--validation_data_dir", str(tmp_path),
+        "--real_data_dir", str(tmp_path / "real"), "--real_tir_dir", str(tmp_path / "real" / "tir"),
+        "--epochs", "1", "--iters_per_epoch", "1", "--device", "cuda",
         "--saved_model_dir", str(ema_dir), "--exp_dir", str(tmp_path / "ema-exp"),
     ])
     assert (ema_dir / "ema_last.pt").is_file()

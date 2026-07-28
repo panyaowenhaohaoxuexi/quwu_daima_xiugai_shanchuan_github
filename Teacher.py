@@ -3,16 +3,19 @@
 import argparse
 import random
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import torch
-from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from data.data_loader import SynthMultiModalDataset, collate_synth
 from option.Teacher import (build_parser, persisted_config_from_args, prepare_experiment_dirs,
                             save_config, tir_normalization_config_from_args, validate_config)
 from training.source import OmegaSampler, compute_source_batch_losses
+from training.schedule import build_coa_adam, cycle_batches, set_cosine_learning_rate
+from training.observability import TrainingLogger
+from training.validation import evaluate_paired_validation, save_best_if_improved
 from utils.checkpoint import (build_model_from_config, build_source_checkpoint, load_source_checkpoint,
                               preflight_source_resume_checkpoint)
 from utils.metrics import psnr, ssim_global
@@ -20,8 +23,8 @@ from utils.visualize_fog_routed import build_diagnostic_panel
 
 
 SOURCE_RUNTIME_KEYS = (
-    "train_data_dir", "resume_checkpoint", "device", "epochs", "learning_rate",
-    "batch_size", "num_workers", "exp_dir", "saved_model_dir", "saved_data_dir",
+    "train_data_dir", "validation_data_dir", "resume_checkpoint", "device", "epochs", "iters_per_epoch", "start_lr", "end_lr", "no_lr_sche",
+    "batch_size", "validation_batch_size", "num_workers", "exp_dir", "saved_model_dir", "saved_data_dir",
 )
 
 
@@ -82,24 +85,61 @@ def main(argv=None):
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
                         collate_fn=collate_synth)
+    validation_dataset = SynthMultiModalDataset(
+        args.validation_data_dir, train=False, size="full", density_gt_semantics=args.density_gt_semantics,
+        density_map_normalization=args.density_map_normalization, density_fixed_min=args.density_fixed_min,
+        density_fixed_max=args.density_fixed_max, density_calibrated_min=args.density_calibrated_min,
+        density_calibrated_max=args.density_calibrated_max, tir_normalization_config=tir_normalization_config_from_args(args),
+        pair_alignment_policy=args.pair_alignment_policy,
+    )
+    validation_loader = DataLoader(validation_dataset, batch_size=args.validation_batch_size, shuffle=False,
+                                   num_workers=args.num_workers, collate_fn=collate_synth)
     model = build_model_from_config(config).to(device)
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate)
-    start_epoch, global_step = 0, 0
+    optimizer = build_coa_adam(model.parameters(), learning_rate=args.start_lr)
+    start_epoch, global_step, best_psnr = 0, 0, float("-inf")
     if resume is not None:
         restored = load_source_checkpoint(resume, model, optimizer)
-        start_epoch, global_step = restored["epoch"], restored["global_step"]
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = args.learning_rate
+        start_epoch, global_step, best_psnr = restored["epoch"], restored["global_step"], restored.get("best_psnr", float("-inf"))
     omega_sampler = OmegaSampler(args.omega_regions_per_image, args.omega_min_area,
                                  args.omega_max_area, seed=args.model_init_seed)
     omega_generator = torch.Generator(device=device).manual_seed(args.model_init_seed + 101)
     empty_omega_streak = 0
+    total_steps = args.epochs * args.iters_per_epoch
+    batch_iterator = cycle_batches(loader)
+    logger = TrainingLogger(args.exp_dir or args.saved_model_dir, resume=resume is not None)
+    logger.write_run_summary({
+        "stage": "source", "device": str(device), "seed": args.model_init_seed,
+        "dataset_sizes": {"train": len(dataset), "validation": len(validation_dataset)},
+        "batch_configuration": {"train": args.batch_size, "validation": args.validation_batch_size,
+                                "num_workers": args.num_workers},
+        "schedule": {"epochs": args.epochs, "iters_per_epoch": args.iters_per_epoch,
+                     "total_steps": total_steps, "start_lr": args.start_lr, "end_lr": args.end_lr},
+        "parameter_counts": {"rgb_encoder": sum(parameter.numel() for parameter in model.rgb_encoder.parameters()),
+                             "tir_encoder": sum(parameter.numel() for parameter in model.tir_encoder.parameters()),
+                             "total": sum(parameter.numel() for parameter in model.parameters())},
+        "res2net_pretrained_loaded": True,
+        "res2net_pretrained_path": model.rgb_encoder.pretrained_path,
+        "output_directories": {"experiment": args.exp_dir, "models": args.saved_model_dir,
+                               "diagnostics": args.saved_data_dir},
+    })
+    print(f"source startup device={device} train={len(dataset)} validation={len(validation_dataset)} "
+          f"epochs={args.epochs} iters_per_epoch={args.iters_per_epoch} total_steps={total_steps} "
+          f"params={sum(parameter.numel() for parameter in model.parameters()):,} "
+          f"res2net={model.rgb_encoder.pretrained_path}")
     for epoch in range(start_epoch, args.epochs):
         dataset.set_sampler_epoch(epoch)
         model.train()
-        for hazy, clear, tir, density in loader:
+        logical_step = 0
+        while logical_step < args.iters_per_epoch:
+            step_started = perf_counter()
+            hazy, clear, tir, density = next(batch_iterator)
             if hazy.numel() == 0:
                 continue
+            schedule_step = epoch * args.iters_per_epoch + logical_step + 1
+            learning_rate = set_cosine_learning_rate(
+                optimizer, step=schedule_step, total_steps=total_steps, start_lr=args.start_lr,
+                end_lr=args.end_lr, no_lr_sche=args.no_lr_sche,
+            )
             hazy, clear, tir, density = (value.to(device) for value in (hazy, clear, tir, density))
             optimizer.zero_grad(set_to_none=True)
             result = compute_source_batch_losses(model, (hazy, clear, tir, density), args, omega_sampler, global_step,
@@ -115,17 +155,38 @@ def main(argv=None):
             if empty_omega_streak >= args.max_consecutive_empty_omega_steps:
                 raise RuntimeError(f"source empty Omega limit: epoch={epoch} step={global_step}")
             global_step += 1
+            logical_step += 1
+            train_psnr = psnr(result["output"]["pred_clear"].detach(), clear).item()
+            train_ssim = ssim_global(result["output"]["pred_clear"].detach(), clear).item()
+            logger.log_event(
+                "train_step", epoch=epoch + 1, epoch_step=logical_step, global_step=global_step,
+                learning_rate=learning_rate, duration_seconds=perf_counter() - step_started,
+                train_psnr=train_psnr, train_ssim=train_ssim,
+                **{f"loss_{name}": value for name, value in result["losses"].items()},
+                **{f"schedule_{name}": value for name, value in result["state"].items()},
+                **{f"route_{name}": value for name, value in result["route_supervision"].items()},
+            )
             if global_step % 50 == 0:
                 print(f"source epoch={epoch + 1} step={global_step} loss={loss.item():.5f} "
-                      f"psnr={psnr(result['output']['pred_clear'].detach(), clear).item():.3f} "
-                      f"ssim={ssim_global(result['output']['pred_clear'].detach(), clear).item():.4f}")
+                      f"global={result['losses']['global'].item():.5f} route={result['losses']['route'].item():.5f} "
+                      f"lr={learning_rate:.9f} psnr={train_psnr:.3f} ssim={train_ssim:.4f}")
             if args.saved_data_dir and global_step % 500 == 0:
                 build_diagnostic_panel(hazy, tir, clear, density, result["output"], q=result["q"]).save(
                     Path(args.saved_data_dir) / f"source_step_{global_step:08d}.png"
                 )
+        validation = evaluate_paired_validation(model, validation_loader, device, route_temperature=args.route_tau_end)
+        candidate = build_source_checkpoint(model, optimizer, epoch=epoch + 1, global_step=global_step,
+                                            config=config, best_psnr=max(best_psnr, validation["psnr"]))
+        is_best = validation["psnr"] > best_psnr
         if args.saved_model_dir:
-            torch.save(build_source_checkpoint(model, optimizer, epoch=epoch + 1, global_step=global_step,
-                                               config=config), Path(args.saved_model_dir) / "source_last.pt")
+            output_dir = Path(args.saved_model_dir)
+            best_psnr = save_best_if_improved(validation["psnr"], best_psnr, candidate, output_dir / "source_best.pt")
+            candidate["best_psnr"] = best_psnr
+            torch.save(candidate, output_dir / "source_last.pt")
+        logger.log_event("validation", epoch=epoch + 1, global_step=global_step, learning_rate=learning_rate,
+                         psnr=validation["psnr"], ssim=validation["ssim"], best_psnr=best_psnr, is_best=is_best)
+        print(f"source validation epoch={epoch + 1} psnr={validation['psnr']:.4f} "
+              f"ssim={validation['ssim']:.4f} best_psnr={best_psnr:.4f} is_best={is_best}")
     return model
 
 
