@@ -96,8 +96,8 @@ def add_model_arguments(parser):
 def add_synthetic_data_arguments(parser):
     parser.add_argument("--train_data_dir", default="")
     parser.add_argument("--train_size", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=16)
     parser.add_argument("--density_gt_semantics", choices=("transmission", "density"), default="transmission")
     parser.add_argument("--density_map_normalization", choices=("dtype_range", "fixed_range", "dataset_calibrated_range"), default="dtype_range")
     parser.add_argument("--density_fixed_min", type=float)

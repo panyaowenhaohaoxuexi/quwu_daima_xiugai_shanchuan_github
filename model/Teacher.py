@@ -14,6 +14,7 @@ from torch.nn import functional as F
 from .hde import HDE
 from .monotonic_router import MonotonicFogRouter
 from .appearance_memory import MemoryRetriever, TIRConditionedAppearancePrior
+from .res2net import CoARes2NetRGBEncoder
 from .structure_appearance_transformer import StructureAppearanceTransformerStage
 from utils.model_config_validation import require_positive_integer, validate_model_config_values
 
@@ -155,7 +156,7 @@ class FogRoutedRGBTIRDehazer(nn.Module):
         self.memory_query_chunk_size = memory_query_chunk_size
         self.hde = HDE()
         self.router = MonotonicFogRouter(router_hidden_channels)
-        self.rgb_encoder = PyramidEncoder(base_channels)
+        self.rgb_encoder = CoARes2NetRGBEncoder(base_channels)
         self.tir_encoder = PyramidEncoder(base_channels)
         self.scale_names = ("h2", "h4", "h8", "h16")
         rgb_widths = self.rgb_encoder.widths

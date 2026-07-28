@@ -1,10 +1,28 @@
 import numpy as np
+import pytest
 import torch
+from torch import nn
 from PIL import Image
 
 
 def _write_rgb(path, value):
     Image.new("RGB", (32, 32), (value, value, value)).save(path)
+
+
+@pytest.fixture(autouse=True)
+def _mock_coa_clip_for_cpu_ema_smoke(monkeypatch):
+    import EMA
+
+    class _ZeroClipLoss(nn.Module):
+        def forward(self, prediction, _text_features):
+            return prediction.mean() * 0
+
+    monkeypatch.setattr(
+        EMA,
+        "initialize_coa_clip",
+        lambda device: (_ZeroClipLoss().to(device), torch.zeros(1, 1, device=device)),
+    )
+    monkeypatch.setattr(EMA, "require_coa_clip_cuda", lambda _device: None)
 
 
 def test_ema_entrypoint_runs_real_and_source_anchor_from_source_checkpoint(tmp_path):

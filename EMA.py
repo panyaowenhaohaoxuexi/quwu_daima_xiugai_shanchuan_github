@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
@@ -31,6 +32,63 @@ def set_batchnorm_eval(module):
     for child in module.modules():
         if isinstance(child, torch.nn.modules.batchnorm._BatchNorm):
             child.eval()
+
+
+class TextEncoder(nn.Module):
+    """CoA's prompt encoder for the frozen CLIP text tower."""
+
+    def __init__(self, clip_model):
+        super().__init__()
+        self.transformer = clip_model.transformer
+        self.positional_embedding = clip_model.positional_embedding
+        self.ln_final = clip_model.ln_final
+        self.text_projection = clip_model.text_projection
+        self.dtype = clip_model.dtype
+
+    def forward(self, prompts, tokenized_prompts):
+        value = prompts + self.positional_embedding.type(self.dtype)
+        value = value.permute(1, 0, 2)
+        value = self.transformer(value)
+        value = value.permute(1, 0, 2)
+        value = self.ln_final(value).type(self.dtype)
+        return value[torch.arange(value.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+
+
+def require_coa_clip_cuda(device):
+    """CoA's unchanged CLIP package creates CUDA tensors at import time."""
+    if device.type != "cuda":
+        raise RuntimeError("CoA CLIP EMA requires --device cuda")
+
+
+def initialize_coa_clip(device):
+    """Initialize ViT-B/32, RN101, and haze prompt exactly as CoA EMA does."""
+    import clip
+    from CLIP import L_clip_from_feature
+
+    clip_model, _ = clip.load("ViT-B/32", device=torch.device("cpu"), download_root="./clip_model/")
+    clip_model.to(device)
+    for parameter in clip_model.parameters():
+        parameter.requires_grad = False
+    res_model, _ = clip.load("RN101", device=torch.device("cpu"), download_root="./clip_model/")
+    res_model.to(device)
+    for parameter in res_model.parameters():
+        parameter.requires_grad = False
+    data = torch.load("./clip_model/haze_prompt.pth")
+    new_state_dict = {}
+    for name, value in data.items():
+        new_state_dict[name[7:]] = value
+    embedding_prompt = nn.Parameter(new_state_dict["embedding_prompt"].to(device), requires_grad=False)
+    text_encoder = TextEncoder(clip_model)
+    tokenized_prompts = torch.cat([clip.tokenize(prompt) for prompt in [" ".join(["X"] * 16)]])
+    text_features = text_encoder(embedding_prompt, tokenized_prompts)
+    clip_model.eval()
+    res_model.eval()
+    return L_clip_from_feature().to(device), text_features
+
+
+def adaptation_loss(real_losses, source_losses, args):
+    return (real_losses["L_real"] + args.w_loss_Clip * real_losses["L_clip"]
+            + args.lambda_anchor * source_losses["losses"]["total"])
 
 
 @dataclass(frozen=True)
@@ -89,7 +147,7 @@ def _require_finite(loss, model, *, epoch, step):
             raise RuntimeError(f"ema non-finite gradient: epoch={epoch} step={step} loss={float(loss.detach())} parameter={name}")
 
 
-def _real_loss(teacher, student, hazy, tir, generator, args):
+def _real_loss(teacher, student, hazy, tir, generator, args, *, clip_criterion=None, text_features=None):
     transforms = tuple(_sample_geometry(generator) for _ in range(3))
     with torch.no_grad():
         a = teacher(transforms[0].apply(hazy), transforms[0].apply(tir), route_temperature=args.route_tau_end, route_mode="hard")
@@ -100,10 +158,14 @@ def _real_loss(teacher, student, hazy, tir, generator, args):
     r_a, r_b = transforms[0].inverse(a["route_soft"]), transforms[1].inverse(b["route_soft"])
     weights = stability_weights(j_a, j_b, m_a, m_b, r_a, r_b, args.ema_sigma_j, args.ema_sigma_m,
                                args.ema_sigma_r, args.ema_stability_min_weight)
-    return real_consistency_loss(transforms[2].inverse(s["pred_clear"]), 0.5 * (j_a + j_b),
-                                 transforms[2].inverse(s["density_map"]), 0.5 * (m_a + m_b),
-                                 transforms[2].inverse(s["route_soft"]), 0.5 * (r_a + r_b), *weights,
-                                 lambda_j=args.lambda_ema_j, lambda_m=args.lambda_ema_m, lambda_r=args.lambda_ema_r)
+    student_clear = transforms[2].inverse(s["pred_clear"])
+    losses = real_consistency_loss(student_clear, 0.5 * (j_a + j_b),
+                                   transforms[2].inverse(s["density_map"]), 0.5 * (m_a + m_b),
+                                   transforms[2].inverse(s["route_soft"]), 0.5 * (r_a + r_b), *weights,
+                                   lambda_j=args.lambda_ema_j, lambda_m=args.lambda_ema_m, lambda_r=args.lambda_ema_r)
+    losses["L_clip"] = (clip_criterion(student_clear, text_features)
+                        if clip_criterion is not None else student_clear.new_zeros(()))
+    return losses
 
 
 def main(argv=None):
@@ -121,6 +183,8 @@ def main(argv=None):
     )))
     _set_seed(args.model_init_seed)
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
+    require_coa_clip_cuda(device)
+    clip_criterion, text_features = initialize_coa_clip(device)
     student = build_model_from_config(vars(args)).to(device)
     optimizer = AdamW(student.parameters(), lr=args.learning_rate)
     if expected_stage == "source":
@@ -161,11 +225,12 @@ def main(argv=None):
                 source_iterator = iter(source_loader)
                 source_batch = next(source_iterator)
             optimizer.zero_grad(set_to_none=True)
-            real = _real_loss(teacher, student, real_hazy.to(device), real_tir.to(device), geometry_generator, args)
+            real = _real_loss(teacher, student, real_hazy.to(device), real_tir.to(device), geometry_generator, args,
+                              clip_criterion=clip_criterion, text_features=text_features)
             source = compute_source_batch_losses(student, tuple(value.to(device) for value in source_batch), args,
                                                  omega_sampler, source_global_step, force_anchor_mode=True,
                                                  omega_generator=omega_generator)
-            adapt = real["L_real"] + args.lambda_anchor * source["losses"]["total"]
+            adapt = adaptation_loss(real, source, args)
             _require_finite(adapt, student, epoch=epoch, step=ema_global_step)
             optimizer.step()
             update_teacher_after_success(teacher, student, args.ema_decay)

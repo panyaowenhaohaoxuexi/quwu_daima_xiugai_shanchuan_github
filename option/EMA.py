@@ -40,7 +40,7 @@ EMA_PARSER_KEYS = (
     "device", "real_data_dir", "source_anchor_data_dir", "source_checkpoint", "resume_checkpoint",
     "real_batch_size", "source_anchor_batch_size", "num_workers", "epochs", "learning_rate",
     "ema_decay", "ema_sigma_j", "ema_sigma_m", "ema_sigma_r", "ema_stability_min_weight",
-    "lambda_ema_j", "lambda_ema_m", "lambda_ema_r", "lambda_anchor",
+    "lambda_ema_j", "lambda_ema_m", "lambda_ema_r", "lambda_anchor", "w_loss_Clip",
     "exp_dir", "saved_model_dir", "saved_data_dir",
 )
 EMA_RUNTIME_KEYS = (
@@ -94,6 +94,7 @@ def build_parser():
     parser.add_argument("--lambda_ema_m", type=float, default=1.0)
     parser.add_argument("--lambda_ema_r", type=float, default=1.0)
     parser.add_argument("--lambda_anchor", type=float, default=1.0)
+    parser.add_argument("--w_loss_Clip", default=0.5, type=float, help="weight of CoA CLIP loss")
     parser.add_argument("--exp_dir", default="experiment")
     parser.add_argument("--saved_model_dir", default="")
     parser.add_argument("--saved_data_dir", default="")
@@ -187,6 +188,8 @@ def validate_config(args):
         raise ValueError("EMA batch sizes must be positive and num_workers must be non-negative")
     if args.epochs < 1 or args.learning_rate <= 0:
         raise ValueError("EMA epochs and learning_rate must be positive")
+    if args.w_loss_Clip < 0:
+        raise ValueError("w_loss_Clip must be non-negative")
     return args
 
 
