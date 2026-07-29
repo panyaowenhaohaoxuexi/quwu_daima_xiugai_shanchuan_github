@@ -20,9 +20,9 @@ FORMAL_TRAINING_LOSS_WEIGHTS = {
 }
 
 
-LOCAL_SOURCE_TRAIN_DIR = r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\1_FLIR\train"
-LOCAL_VALIDATION_DATA_DIR = r"F:\1_paper_pan\1_Dehaze_Paper\2_Dataset\1_main_benchmark\1_FLIR\test"
-LOCAL_TEACHER_OUTPUT_DIR = r"E:\Github_code_upload\Multimodal_Dehaze_code\Teacher_Train"
+LOCAL_SOURCE_TRAIN_DIR = r"/root/autodl-tmp/1_FLIR/train"
+LOCAL_VALIDATION_DATA_DIR = r"/root/autodl-tmp/1_FLIR/test"
+LOCAL_TEACHER_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model/1_Teacher_train"
 
 
 def _mark_explicit_training_objective(namespace, name):
@@ -95,16 +95,16 @@ def add_model_arguments(parser):
     parser.add_argument("--boundary_width", type=int, default=1)
     parser.add_argument("--route_tau_start", type=float, default=1.0)
     parser.add_argument("--route_tau_end", type=float, default=0.2)
-    parser.add_argument("--route_hard_start_step", type=int, default=10000)
+    parser.add_argument("--route_hard_start_step", type=int, default=3000)
 
 
 def add_synthetic_data_arguments(parser):
     parser.add_argument("--train_data_dir", default=LOCAL_SOURCE_TRAIN_DIR)
     parser.add_argument("--validation_data_dir", default=LOCAL_VALIDATION_DATA_DIR)
     parser.add_argument("--train_size", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--validation_batch_size", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=16)
     parser.add_argument("--density_gt_semantics", choices=("transmission", "density"), default="transmission")
     parser.add_argument("--density_map_normalization", choices=("dtype_range", "fixed_range", "dataset_calibrated_range"), default="dtype_range")
     parser.add_argument("--density_fixed_min", type=float)
@@ -126,17 +126,17 @@ def add_synthetic_data_arguments(parser):
 
 def add_source_training_arguments(parser):
     parser.add_argument("--counterfactual_chunk_size", type=int, default=4)
-    parser.add_argument("--counterfactual_start_step", type=int, default=1000)
-    parser.add_argument("--route_loss_start_step", type=int, default=1000)
-    parser.add_argument("--route_loss_warmup_steps", type=int, default=1000)
-    parser.add_argument("--binary_loss_start_step", type=int, default=5000)
-    parser.add_argument("--binary_loss_warmup_steps", type=int, default=1000)
+    parser.add_argument("--counterfactual_start_step", type=int, default=300)
+    parser.add_argument("--route_loss_start_step", type=int, default=300)
+    parser.add_argument("--route_loss_warmup_steps", type=int, default=300)
+    parser.add_argument("--binary_loss_start_step", type=int, default=1500)
+    parser.add_argument("--binary_loss_warmup_steps", type=int, default=300)
     parser.add_argument("--omega_regions_per_image", type=int, default=6)
     parser.add_argument("--omega_min_area", type=int, default=16)
     parser.add_argument("--omega_max_area", type=int, default=256)
     parser.add_argument("--max_consecutive_empty_omega_steps", type=int, default=100)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--iters_per_epoch", type=int, default=5000)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--iters_per_epoch", type=int, default=1000)
     parser.add_argument("--start_lr", "--learning_rate", dest="start_lr", type=float, default=1e-4)
     parser.add_argument("--end_lr", type=float, default=1e-6)
     parser.add_argument("--no_lr_sche", action="store_true", help="disable CoA cosine learning-rate schedule")
