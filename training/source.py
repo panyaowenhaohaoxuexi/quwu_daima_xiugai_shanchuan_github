@@ -20,7 +20,8 @@ def source_route_schedule(global_step, *, tau_start, tau_end, temperature_anneal
     """Return the V2 temperature and GT-to-predicted-route teacher schedule."""
     return {
         "route_temperature": linear_anneal(tau_start, tau_end, global_step, temperature_anneal_steps),
-        "teacher_gate_alpha": max(0.0, 1.0 - float(global_step) / max(1, teacher_anneal_steps)),
+        "teacher_gate_alpha": (0.0 if teacher_anneal_steps == 0 else
+                                max(0.0, 1.0 - float(global_step) / teacher_anneal_steps)),
     }
 
 
