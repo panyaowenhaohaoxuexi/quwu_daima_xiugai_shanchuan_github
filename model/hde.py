@@ -233,6 +233,12 @@ class HDE(nn.Module):
         h8 = self.structure_h8(self._downsample(h4))
         h16 = self.structure_h16(self._downsample(h8))
         structure_pyramid = {"h2": h2, "h4": h4, "h8": h8, "h16": h16}
+        routing_features = {
+            "fm_vis": fm_vis,
+            "fm_ir": fm_ir,
+            "struct_diff_gap": struct_diff_gap,
+            "struct_diff_gmp": struct_diff_gmp,
+        }
 
         if return_debug:
             debug = {
@@ -257,6 +263,7 @@ class HDE(nn.Module):
             return {
                 "density_map": density_map,
                 "tir_structure_pyramid": structure_pyramid,
+                "routing_features": routing_features,
                 "debug": debug,
             }
         if return_feat:
@@ -264,5 +271,6 @@ class HDE(nn.Module):
         return {
             "density_map": density_map,
             "tir_structure_pyramid": structure_pyramid,
+            "routing_features": routing_features,
             "debug": None,
         }

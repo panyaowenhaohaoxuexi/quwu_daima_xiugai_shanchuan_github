@@ -10,7 +10,7 @@ def test_hde_returns_shared_ir_structure_pyramid_with_gradients():
 
     output = hde(rgb, tir)
 
-    assert set(output) == {"density_map", "tir_structure_pyramid", "debug"}
+    assert set(output) == {"density_map", "tir_structure_pyramid", "routing_features", "debug"}
     pyramid = output["tir_structure_pyramid"]
     assert tuple(pyramid) == ("h2", "h4", "h8", "h16")
     assert pyramid["h2"].shape[-2:] == (16, 16)
@@ -18,6 +18,10 @@ def test_hde_returns_shared_ir_structure_pyramid_with_gradients():
     assert pyramid["h8"].shape[-2:] == (4, 4)
     assert pyramid["h16"].shape[-2:] == (2, 2)
     assert output["debug"] is None
+    routing = output["routing_features"]
+    assert set(routing) == {"fm_vis", "fm_ir", "struct_diff_gap", "struct_diff_gmp"}
+    assert routing["fm_vis"].shape == routing["fm_ir"].shape == (1, 96, 32, 32)
+    assert routing["struct_diff_gap"].shape == routing["struct_diff_gmp"].shape == (1, 1, 32, 32)
 
     (output["density_map"].mean() + pyramid["h2"].mean()).backward()
     assert tir.grad is not None

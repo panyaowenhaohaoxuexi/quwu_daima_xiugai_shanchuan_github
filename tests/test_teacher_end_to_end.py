@@ -11,38 +11,22 @@ def _write_rgb(path, value):
     Image.new("RGB", (32, 32), (value, value, value)).save(path)
 
 
-@pytest.fixture(autouse=True)
-def _stub_vgg19_contrast_for_cpu_source_smoke(monkeypatch):
-    import Teacher
-
-    class _OneSSIM(nn.Module):
-        def forward(self, prediction, _clear):
-            return prediction.new_ones(())
-
-    class _ZeroContrast(nn.Module):
-        def forward(self, prediction, _clear, _hazy):
-            return prediction.mean() * 0
-
-    monkeypatch.setattr(Teacher, "build_source_reconstruction_criteria",
-                        lambda device: (_OneSSIM().to(device), _ZeroContrast().to(device)))
-
-
 def test_source_training_entrypoint_runs_tiny_batch_and_writes_epoch_checkpoint(tmp_path):
-    for directory in ("clear", "ir", "hazy/mist", "Transmission_Map_GT/mist"):
+    for directory in ("clear", "ir", "hazy/1_mist", "Transmission_Map_GT/1_mist", "mask_GT/1_mist"):
         (tmp_path / directory).mkdir(parents=True, exist_ok=True)
     _write_rgb(tmp_path / "clear" / "sample.png", 90)
     _write_rgb(tmp_path / "ir" / "sample.png", 40)
-    _write_rgb(tmp_path / "hazy" / "mist" / "sample.png", 120)
+    _write_rgb(tmp_path / "hazy" / "1_mist" / "sample.png", 120)
     Image.fromarray(np.full((32, 32), 50000, dtype=np.uint16), mode="I;16").save(
-        tmp_path / "Transmission_Map_GT" / "mist" / "sample.png"
+        tmp_path / "Transmission_Map_GT" / "1_mist" / "sample.png"
     )
+    Image.fromarray(np.ones((32, 32), dtype=np.uint8) * 255, mode="L").save(tmp_path / "mask_GT" / "1_mist" / "sample.png")
 
     from Teacher import main
     checkpoint_dir = tmp_path / "checkpoints"
     main([
         "--train_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path), "--train_size", "32", "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu",
         "--base_channels", "8", "--memory_max_tokens", "16", "--memory_topk", "2",
-        "--counterfactual_start_step", "100", "--route_loss_start_step", "100",
         "--saved_model_dir", str(checkpoint_dir), "--exp_dir", str(tmp_path / "experiment"),
     ])
 
@@ -65,7 +49,6 @@ def test_source_training_entrypoint_runs_tiny_batch_and_writes_epoch_checkpoint(
     main([
         "--train_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path), "--train_size", "32", "--epochs", "2", "--iters_per_epoch", "1", "--device", "cpu",
         "--base_channels", "8", "--memory_max_tokens", "16", "--memory_topk", "2",
-        "--counterfactual_start_step", "100", "--route_loss_start_step", "100",
         "--saved_model_dir", str(checkpoint_dir), "--exp_dir", str(tmp_path / "experiment-resume"),
         "--resume_checkpoint", str(checkpoint_dir / "source_last.pt"),
         "--learning_rate", "0.002",

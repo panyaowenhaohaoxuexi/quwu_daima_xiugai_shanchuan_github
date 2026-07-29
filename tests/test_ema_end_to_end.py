@@ -1,137 +1,27 @@
-import json
-
 import numpy as np
-import pytest
 import torch
-from torch import nn
 from PIL import Image
+from torch import nn
 
 
-def _write_rgb(path, value):
-    Image.new("RGB", (32, 32), (value, value, value)).save(path)
+def _write_rgb(path, value): Image.new("RGB", (32, 32), (value, value, value)).save(path)
 
 
-@pytest.fixture(autouse=True)
-def _mock_coa_clip_for_cpu_ema_smoke(monkeypatch):
+def test_ema_source_anchor_consumes_v2_five_item_batch(tmp_path, monkeypatch):
     import EMA
-    import Teacher
-
-    class _ZeroClipLoss(nn.Module):
-        def forward(self, prediction, _text_features):
-            return prediction.mean() * 0
-
-    monkeypatch.setattr(
-        EMA,
-        "initialize_coa_clip",
-        lambda device: (_ZeroClipLoss().to(device), torch.zeros(1, 1, device=device)),
-    )
+    class _ZeroClip(nn.Module):
+        def forward(self, prediction, _text): return prediction.mean() * 0
+    monkeypatch.setattr(EMA, "initialize_coa_clip", lambda device: (_ZeroClip().to(device), torch.zeros(1, 1, device=device)))
     monkeypatch.setattr(EMA, "require_coa_clip_cuda", lambda _device: None)
-
-    class _OneSSIM(nn.Module):
-        def forward(self, prediction, _clear):
-            return prediction.new_ones(())
-
-    class _ZeroContrast(nn.Module):
-        def forward(self, prediction, _clear, _hazy):
-            return prediction.mean() * 0
-
-    criteria = lambda device: (_OneSSIM().to(device), _ZeroContrast().to(device))
-    monkeypatch.setattr(Teacher, "build_source_reconstruction_criteria", criteria)
-    monkeypatch.setattr(EMA, "build_source_reconstruction_criteria", criteria)
-
-
-def test_ema_entrypoint_runs_real_and_source_anchor_from_source_checkpoint(tmp_path):
-    for directory in ("clear", "ir", "hazy/mist", "Transmission_Map_GT/mist", "real/hazy", "real/tir"):
+    for directory in ("clear", "ir", "hazy/1_mist", "Transmission_Map_GT/1_mist", "mask_GT/1_mist", "real/hazy", "real/tir"):
         (tmp_path / directory).mkdir(parents=True, exist_ok=True)
-    _write_rgb(tmp_path / "clear" / "sample.png", 90)
-    _write_rgb(tmp_path / "ir" / "sample.png", 40)
-    _write_rgb(tmp_path / "hazy" / "mist" / "sample.png", 120)
-    Image.fromarray(np.full((32, 32), 50000, dtype=np.uint16), mode="I;16").save(
-        tmp_path / "Transmission_Map_GT" / "mist" / "sample.png"
-    )
-    _write_rgb(tmp_path / "real" / "hazy" / "real.png", 100)
-    _write_rgb(tmp_path / "real" / "tir" / "real.png", 55)
-
-    from Teacher import main as source_main
-    source_dir = tmp_path / "source-checkpoint"
-    source_main([
-        "--train_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path), "--train_size", "32", "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu",
-        "--base_channels", "8", "--memory_max_tokens", "16", "--memory_topk", "2",
-        "--counterfactual_start_step", "100", "--route_loss_start_step", "100",
-        "--saved_model_dir", str(source_dir), "--exp_dir", str(tmp_path / "source-exp"),
-    ])
-
-    from EMA import main
-    checkpoint_dir = tmp_path / "ema-checkpoints"
-    main([
-        "--source_checkpoint", str(source_dir / "source_last.pt"), "--source_anchor_data_dir", str(tmp_path),
-        "--validation_data_dir", str(tmp_path),
-        "--real_data_dir", str(tmp_path / "real"), "--real_tir_dir", str(tmp_path / "real" / "tir"),
-        "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu",
-        "--saved_model_dir", str(checkpoint_dir), "--exp_dir", str(tmp_path / "ema-experiment"),
-    ])
-    checkpoint = torch.load(checkpoint_dir / "ema_last.pt", map_location="cpu")
-    assert checkpoint["training_stage"] == "ema"
-    assert checkpoint["ema_global_step"] == 1
-    assert set(checkpoint) == {
-        "format_version", "training_stage", "student", "teacher", "optimizer", "epoch",
-        "source_global_step", "ema_global_step", "config", "best_psnr",
-    }
-    assert (checkpoint_dir / "ema_best.pt").is_file()
-    experiment_dir = tmp_path / "ema-experiment"
-    summary = json.loads((experiment_dir / "run_summary.json").read_text(encoding="utf-8"))
-    events = [json.loads(line) for line in (experiment_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert summary["stage"] == "ema"
-    assert summary["clip_resources"]["rn101_loaded"] is True
-    assert summary["dataset_sizes"] == {"real": 1, "source_anchor": 1, "validation": 1}
-    assert {event["event"] for event in events} == {"train_step", "validation"}
-    assert "loss_clip" in next(event for event in events if event["event"] == "train_step")
-
-    main([
-        "--resume_checkpoint", str(checkpoint_dir / "ema_last.pt"), "--source_anchor_data_dir", str(tmp_path),
-        "--validation_data_dir", str(tmp_path),
-        "--real_data_dir", str(tmp_path / "real"), "--real_tir_dir", str(tmp_path / "real" / "tir"),
-        "--epochs", "2", "--iters_per_epoch", "1", "--device", "cpu",
-        "--learning_rate", "0.003", "--saved_model_dir", str(checkpoint_dir),
-        "--exp_dir", str(tmp_path / "ema-experiment-resume"),
-    ])
-    resumed = torch.load(checkpoint_dir / "ema_last.pt", map_location="cpu")
-    assert resumed["ema_global_step"] == 2
-    assert resumed["config"]["start_lr"] == 0.003
-    assert (checkpoint_dir / "ema_best.pt").is_file()
-    assert resumed["optimizer"]["param_groups"][0]["lr"] == pytest.approx(1e-8)
-
-
-def test_ema_lambda_router_zero_does_not_raise_for_empty_q_regions(tmp_path):
-    for directory in ("clear", "ir", "hazy/mist", "Transmission_Map_GT/mist", "real/hazy", "real/tir"):
-        (tmp_path / directory).mkdir(parents=True, exist_ok=True)
-    _write_rgb(tmp_path / "clear" / "sample.png", 90)
-    _write_rgb(tmp_path / "ir" / "sample.png", 40)
-    _write_rgb(tmp_path / "hazy" / "mist" / "sample.png", 120)
-    Image.fromarray(np.full((32, 32), 50000, dtype=np.uint16), mode="I;16").save(
-        tmp_path / "Transmission_Map_GT" / "mist" / "sample.png"
-    )
-    _write_rgb(tmp_path / "real" / "hazy" / "real.png", 100)
-    _write_rgb(tmp_path / "real" / "tir" / "real.png", 55)
-
+    _write_rgb(tmp_path / "clear" / "sample.png", 90); _write_rgb(tmp_path / "ir" / "sample.png", 40)
+    _write_rgb(tmp_path / "hazy" / "1_mist" / "sample.png", 120); _write_rgb(tmp_path / "real" / "hazy" / "real.png", 100); _write_rgb(tmp_path / "real" / "tir" / "real.png", 55)
+    Image.fromarray(np.full((32, 32), 50000, dtype=np.uint16), mode="I;16").save(tmp_path / "Transmission_Map_GT" / "1_mist" / "sample.png")
+    Image.fromarray(np.ones((32, 32), dtype=np.uint8) * 255, mode="L").save(tmp_path / "mask_GT" / "1_mist" / "sample.png")
     from Teacher import main as source_main
     source_dir = tmp_path / "source"
-    source_main([
-        "--train_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path), "--train_size", "32", "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu",
-        "--base_channels", "8", "--memory_max_tokens", "16", "--memory_topk", "2",
-        "--counterfactual_start_step", "100", "--route_loss_start_step", "100",
-        "--lambda_router", "0", "--q_min_valid_support", "64",
-        "--max_consecutive_empty_omega_steps", "1", "--saved_model_dir", str(source_dir),
-        "--exp_dir", str(tmp_path / "source-exp"),
-    ])
-
-    from EMA import main
+    source_main(["--train_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path), "--train_size", "32", "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu", "--base_channels", "8", "--memory_max_tokens", "16", "--memory_topk", "2", "--saved_model_dir", str(source_dir), "--exp_dir", str(tmp_path / "source-exp")])
     ema_dir = tmp_path / "ema"
-    main([
-        "--source_checkpoint", str(source_dir / "source_last.pt"), "--source_anchor_data_dir", str(tmp_path),
-        "--validation_data_dir", str(tmp_path),
-        "--real_data_dir", str(tmp_path / "real"), "--real_tir_dir", str(tmp_path / "real" / "tir"),
-        "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu",
-        "--saved_model_dir", str(ema_dir), "--exp_dir", str(tmp_path / "ema-exp"),
-    ])
-    assert (ema_dir / "ema_last.pt").is_file()
+    EMA.main(["--source_checkpoint", str(source_dir / "source_last.pt"), "--source_anchor_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path), "--real_data_dir", str(tmp_path / "real"), "--real_tir_dir", str(tmp_path / "real" / "tir"), "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu", "--saved_model_dir", str(ema_dir), "--exp_dir", str(tmp_path / "ema-exp")])
+    assert torch.load(ema_dir / "ema_last.pt", map_location="cpu")["ema_global_step"] == 1

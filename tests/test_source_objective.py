@@ -1,36 +1,30 @@
 import torch
 
-from loss.source import compute_source_objective
+from loss.source import compute_physical_mask_losses
 
 
-def test_source_objective_uses_q_only_inside_omega_and_binary_penalty():
-    pred = torch.zeros(1, 3, 2, 2, requires_grad=True)
-    clear = torch.zeros_like(pred)
+def test_physical_mask_objective_supervises_each_mask_pixel_and_backpropagates_logits():
+    prediction = torch.zeros(1, 3, 2, 2, requires_grad=True)
+    clear = torch.zeros_like(prediction)
     density = torch.zeros(1, 1, 2, 2, requires_grad=True)
-    density_gt = torch.zeros_like(density)
-    route = torch.full((1, 1, 2, 2), 0.25, requires_grad=True)
-    q = torch.ones_like(route)
-    omega = torch.zeros_like(route)
-    omega[..., 0, 0] = 1
-    output = compute_source_objective(
-        pred, clear, density, density_gt, route, torch.zeros_like(route), q, omega,
-        global_contrast_weight=0.0,
-    )
+    logits = torch.tensor([[[[-4.0, 4.0], [4.0, -4.0]]]], requires_grad=True)
+    mask = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]])
 
-    output["total"].backward()
-    assert route.grad[..., 0, 0].abs() > 0
-    assert route.grad[..., 1, 1].abs() > 0  # binary penalty remains global
-    assert torch.isfinite(output["total"])
+    losses = compute_physical_mask_losses(prediction, clear, density, torch.zeros_like(density), logits, mask,
+                                          lambda_density=2.0, lambda_route=3.0, density_smooth_l1_beta=0.1)
+
+    losses["total"].backward()
+    assert set(losses) == {"reconstruction", "density", "route", "total", "pos_weight"}
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+    assert losses["route"] > 0
 
 
-def test_source_objective_applies_outer_router_weight_to_density_route_and_binary_only():
-    tensors = dict(
-        pred_clear=torch.ones(1, 3, 2, 2), clear_rgb=torch.zeros(1, 3, 2, 2),
-        density_map=torch.ones(1, 1, 2, 2), density_gt=torch.zeros(1, 1, 2, 2),
-        route_soft=torch.full((1, 1, 2, 2), 0.25), boundary_map=torch.zeros(1, 1, 2, 2),
-        q=torch.ones(1, 1, 2, 2), omega_support=torch.ones(1, 1, 2, 2), global_contrast_weight=0.0,
-    )
-    without_router = compute_source_objective(**tensors, lambda_router=0.0)
-    with_router = compute_source_objective(**tensors, lambda_router=1.0)
-
-    assert with_router["total"] > without_router["total"]
+@torch.no_grad()
+def test_physical_mask_objective_is_finite_for_empty_and_full_masks():
+    prediction = torch.zeros(1, 3, 2, 2)
+    density = torch.zeros(1, 1, 2, 2)
+    logits = torch.zeros_like(density)
+    for mask in (torch.zeros_like(density), torch.ones_like(density)):
+        losses = compute_physical_mask_losses(prediction, prediction, density, density, logits, mask)
+        assert torch.isfinite(losses["total"])
+        assert 1.0 <= float(losses["pos_weight"]) <= 100.0

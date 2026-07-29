@@ -18,8 +18,7 @@ def _model_config():
         "deform_max_offset": 2.0, "num_structure_renderers": 2, "memory_max_tokens": 16,
         "memory_topk": 2, "memory_query_chunk_size": 64, "memory_attention_temperature": 0.07,
         "memory_reliability_epsilon": 1e-6, "memory_reliable_ratio_threshold": 0.01,
-        "memory_confidence_threshold": 0.1, "memory_exclusion_extra_margin": 0,
-        "boundary_width": 1, "decoder_num_heads": 4, "decoder_depth": 1,
+        "memory_confidence_threshold": 0.1, "decoder_num_heads": 4, "decoder_depth": 1,
         "decoder_window_size": 7, "decoder_window_chunk_size": 128, "decoder_mlp_ratio": 4.0,
         "decoder_attention_dropout": 0.0, "decoder_projection_dropout": 0.0,
         "decoder_ffn_dropout": 0.0,
@@ -30,13 +29,25 @@ def test_checkpoint_v2_format_and_strict_state_load_errors_are_explicit():
     with pytest.raises(ValueError, match="format_version must be 2"):
         require_checkpoint_format({"format_version": 1})
     model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
-    with pytest.raises(RuntimeError, match="v2 structure-appearance Transformer"):
+    with pytest.raises(RuntimeError, match="不兼容 V2 物理 mask 路由架构"):
         load_strict_v2_state_dict(model, {}, label="Source model")
     checkpoint = build_source_checkpoint(model, torch.optim.AdamW(model.parameters()), epoch=0, global_step=0,
                                          config=_model_config())
     assert checkpoint["format_version"] == CHECKPOINT_FORMAT_VERSION
     with pytest.raises(ValueError, match="checkpoint lacks model configuration"):
         build_model_from_config({"base_channels": 8})
+
+
+def test_v2_preflight_rejects_monotonic_router_or_old_route_configuration():
+    config = _model_config()
+    config["counterfactual_start_step"] = 1
+    with pytest.raises(ValueError, match="不兼容 V2 物理 mask 路由架构"):
+        require_complete_model_config(config)
+    model = FogRoutedRGBTIRDehazer(base_channels=8, memory_max_tokens=16, memory_topk=2)
+    legacy_state = dict(model.state_dict())
+    legacy_state["router.raw_weight_in"] = torch.ones(8)
+    with pytest.raises(RuntimeError, match="不兼容 V2 物理 mask 路由架构"):
+        load_strict_v2_state_dict(model, legacy_state, label="Source model")
 
 
 def test_v2_checkpoint_builders_require_complete_model_config_without_runtime_fields():

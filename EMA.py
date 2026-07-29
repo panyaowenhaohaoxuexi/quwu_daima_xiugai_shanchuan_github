@@ -17,7 +17,7 @@ from loss.ema import real_consistency_loss, stability_weights
 from option.EMA import (build_ema_checkpoint_config, build_parser, prepare_experiment_dirs,
                         real_modal_dirs_from_args, resolve_ema_config, save_config,
                         tir_normalization_config_from_args, validate_config)
-from training.source import OmegaSampler, build_source_reconstruction_criteria, compute_source_batch_losses
+from training.source import compute_physical_mask_batch_losses
 from training.schedule import build_coa_adam, cycle_batches, set_cosine_learning_rate
 from training.observability import TrainingLogger
 from training.validation import evaluate_paired_validation, save_best_if_improved
@@ -204,8 +204,6 @@ def main(argv=None):
             restored["epoch"], restored["source_global_step"], restored["ema_global_step"], restored.get("best_psnr", float("-inf"))
         )
     geometry_generator = torch.Generator().manual_seed(args.model_init_seed + 201)
-    omega_generator = torch.Generator(device=device).manual_seed(args.model_init_seed + 101)
-    omega_sampler = OmegaSampler(args.omega_regions_per_image, args.omega_min_area, args.omega_max_area, args.model_init_seed)
     real_hazy_dir, real_tir_dir = real_modal_dirs_from_args(args)
     real_dataset = RealMultiModalDataset(real_hazy_dir, real_tir_dir,
                                          pair_alignment_policy=args.pair_alignment_policy,
@@ -227,8 +225,6 @@ def main(argv=None):
                                    num_workers=args.num_workers, collate_fn=collate_synth)
     prepare_experiment_dirs(args)
     save_config(args)
-    reconstruction_criteria = build_source_reconstruction_criteria(device)
-    empty_omega_streak = 0
     total_steps = args.epochs * args.iters_per_epoch
     real_iterator, source_iterator = cycle_batches(real_loader), cycle_batches(source_loader)
     logger = TrainingLogger(args.exp_dir or args.saved_model_dir, resume=expected_stage == "ema")
@@ -271,19 +267,11 @@ def main(argv=None):
             optimizer.zero_grad(set_to_none=True)
             real = _real_loss(teacher, student, real_hazy.to(device), real_tir.to(device), geometry_generator, args,
                               clip_criterion=clip_criterion, text_features=text_features)
-            source = compute_source_batch_losses(student, tuple(value.to(device) for value in source_batch), args,
-                                                  omega_sampler, source_global_step, force_anchor_mode=True,
-                                                  omega_generator=omega_generator,
-                                                  reconstruction_criteria=reconstruction_criteria)
+            source = compute_physical_mask_batch_losses(student, tuple(value.to(device) for value in source_batch),
+                                                        args, source_global_step)
             adapt = adaptation_loss(real, source, args)
             _require_finite(adapt, student, epoch=epoch, step=ema_global_step)
             optimizer.step()
-            route_supervision_enabled = args.lambda_router * source["state"]["lambda_route"] > 0
-            empty_omega_streak = empty_omega_streak + 1 if (
-                route_supervision_enabled and not source["route_supervision"]["valid_q_region_count"]
-            ) else 0
-            if empty_omega_streak >= args.max_consecutive_empty_omega_steps:
-                raise RuntimeError(f"ema empty Omega limit: epoch={epoch} step={ema_global_step}")
             source_global_step += 1; ema_global_step += 1
             logger.log_event(
                 "train_step", epoch=epoch + 1, epoch_step=logical_step + 1,
@@ -294,7 +282,6 @@ def main(argv=None):
                 **{f"loss_real_{name.lower()}": value for name, value in real.items()},
                 **{f"loss_source_{name}": value for name, value in source["losses"].items()},
                 **{f"schedule_{name}": value for name, value in source["state"].items()},
-                **{f"route_{name}": value for name, value in source["route_supervision"].items()},
             )
             if ema_global_step % 50 == 0:
                 print(f"ema epoch={epoch + 1} step={ema_global_step} loss={adapt.item():.5f} "

@@ -17,7 +17,6 @@ def _config():
         "memory_max_tokens": 16, "memory_topk": 2, "memory_query_chunk_size": 64,
         "memory_attention_temperature": 0.07, "memory_reliability_epsilon": 1e-6,
         "memory_reliable_ratio_threshold": 0.01, "memory_confidence_threshold": 0.1,
-        "memory_exclusion_extra_margin": 0, "boundary_width": 1,
         "decoder_num_heads": 4, "decoder_depth": 1, "decoder_window_size": 7,
         "decoder_window_chunk_size": 128, "decoder_mlp_ratio": 4.0,
         "decoder_attention_dropout": 0.0, "decoder_projection_dropout": 0.0,
@@ -34,9 +33,6 @@ def test_positive_integer_validation_rejects_non_integral_or_nonpositive_values(
 def test_integer_validators_accept_python_and_numpy_integrals_and_only_nonnegative_allows_zero():
     assert require_positive_integer("channels", 3) == 3
     assert require_positive_integer("channels", np.int64(3)) == 3
-    assert require_nonnegative_integer("memory_exclusion_extra_margin", 0) == 0
-    with pytest.raises(ValueError, match="non-negative integer.*received True"):
-        require_nonnegative_integer("memory_exclusion_extra_margin", True)
 
 
 @pytest.mark.parametrize("key,value", [

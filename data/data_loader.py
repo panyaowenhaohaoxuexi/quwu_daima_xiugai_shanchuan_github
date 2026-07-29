@@ -15,7 +15,7 @@ from torchvision.transforms import functional as TF
 
 COMMON_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 SYNTH_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
-DEFAULT_HAZE_LEVELS = ("mist", "middle", "dense")
+DEFAULT_HAZE_LEVELS = ("1_mist", "2_middle", "3_dense", "4_local_extreme")
 
 
 def _normalization_bounds(normalization, fixed_min=None, fixed_max=None,
@@ -97,7 +97,7 @@ def load_scalar_map_as_float_tensor(path, normalization="dtype_range", *, fixed_
     ).unsqueeze(0)
 
 
-def convert_density_semantics(raw_map, density_gt_semantics="transmission"):
+def convert_density_semantics(raw_map, density_gt_semantics="density"):
     if density_gt_semantics not in ("transmission", "density"):
         raise ValueError(f"unsupported density_gt_semantics={density_gt_semantics!r}")
     return (1.0 - raw_map if density_gt_semantics == "transmission" else raw_map).clamp(0.0, 1.0)
@@ -212,9 +212,9 @@ def _image_size(path):
 
 
 class SynthMultiModalDataset(data.Dataset):
-    """Paired synthetic `(hazy RGB, clear RGB, TIR, density)` samples."""
+    """Paired synthetic `(hazy RGB, clear RGB, TIR, density, completion mask)` samples."""
 
-    def __init__(self, root, train=True, size=256, haze_levels=None, density_gt_semantics="transmission",
+    def __init__(self, root, train=True, size=256, haze_levels=None, density_gt_semantics="density",
                  density_map_normalization="dtype_range", density_fixed_min=None, density_fixed_max=None,
                  density_calibrated_min=None, density_calibrated_max=None, tir_normalization_config=None,
                  pair_alignment_policy="strict", augmentation_seed_base=0, sampler_epoch=0):
@@ -229,10 +229,11 @@ class SynthMultiModalDataset(data.Dataset):
         self.pair_alignment_policy = pair_alignment_policy
         self.augmentation_seed_base, self.sampler_epoch = int(augmentation_seed_base), int(sampler_epoch)
         self.samples, self.level_counts = [], {level: 0 for level in self.haze_levels}
-        self.missing_counts = {"clear": 0, "ir": 0, "density": 0}
+        self.missing_counts = {"clear": 0, "ir": 0, "density": 0, "mask": 0}
         clear_index, tir_index = _stem_index(os.path.join(root, "clear"), SYNTH_IMAGE_EXTS), _stem_index(os.path.join(root, "ir"), SYNTH_IMAGE_EXTS)
         for level in self.haze_levels:
             density_index = _stem_index(os.path.join(root, "Transmission_Map_GT", level), SYNTH_IMAGE_EXTS)
+            mask_index = _stem_index(os.path.join(root, "mask_GT", level), SYNTH_IMAGE_EXTS)
             hazy_dir = os.path.join(root, "hazy", level)
             _stem_index(hazy_dir, SYNTH_IMAGE_EXTS)
             for filename in _list_image_files(hazy_dir, SYNTH_IMAGE_EXTS):
@@ -240,14 +241,16 @@ class SynthMultiModalDataset(data.Dataset):
                 clear_path, _ = _lookup_stem(clear_index, stem)
                 tir_path, _ = _lookup_stem(tir_index, stem)
                 density_path, _ = _lookup_stem(density_index, stem)
-                if clear_path is None or tir_path is None or density_path is None:
+                mask_path, _ = _lookup_stem(mask_index, stem)
+                if clear_path is None or tir_path is None or density_path is None or mask_path is None:
                     self.missing_counts["clear"] += int(clear_path is None)
                     self.missing_counts["ir"] += int(tir_path is None)
                     self.missing_counts["density"] += int(density_path is None)
+                    self.missing_counts["mask"] += int(mask_path is None)
                     continue
                 self.samples.append({"image_name": filename, "haze_level": level,
-                                     "hazy_path": os.path.join(hazy_dir, filename), "clear_path": clear_path,
-                                     "tir_path": tir_path, "density_path": density_path})
+                                      "hazy_path": os.path.join(hazy_dir, filename), "clear_path": clear_path,
+                                      "tir_path": tir_path, "density_path": density_path, "mask_path": mask_path})
                 self.level_counts[level] += 1
 
     def set_sampler_epoch(self, epoch):
@@ -272,9 +275,18 @@ class SynthMultiModalDataset(data.Dataset):
                 "rot90_turns": int(torch.randint(0, 4, (), generator=generator))}
 
     @staticmethod
-    def _apply_geometry(tensors, description):
+    def _apply_geometry(tensors, description, interpolation_modes=None):
         size = (description["resized_height"], description["resized_width"])
-        tensors = [F.interpolate(tensor.unsqueeze(0), size=size, mode="bilinear", align_corners=False)[0] for tensor in tensors]
+        interpolation_modes = interpolation_modes or ("bilinear",) * len(tensors)
+        if len(interpolation_modes) != len(tensors):
+            raise ValueError("interpolation_modes must match tensors")
+        resized = []
+        for tensor, mode in zip(tensors, interpolation_modes):
+            kwargs = {"size": size, "mode": mode}
+            if mode in ("linear", "bilinear", "bicubic", "trilinear"):
+                kwargs["align_corners"] = False
+            resized.append(F.interpolate(tensor.unsqueeze(0), **kwargs)[0])
+        tensors = resized
         top, left, height, width = (description[key] for key in ("crop_top", "crop_left", "crop_height", "crop_width"))
         tensors = [tensor[..., top:top + height, left:left + width] for tensor in tensors]
         if description["horizontal_flip"]:
@@ -283,8 +295,8 @@ class SynthMultiModalDataset(data.Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        sizes = {name: _image_size(sample[f"{name}_path"]) for name in ("hazy", "clear", "tir", "density")}
-        if sizes["clear"] != sizes["hazy"] or sizes["density"] != sizes["hazy"] or (
+        sizes = {name: _image_size(sample[f"{name}_path"]) for name in ("hazy", "clear", "tir", "density", "mask")}
+        if sizes["clear"] != sizes["hazy"] or sizes["density"] != sizes["hazy"] or sizes["mask"] != sizes["hazy"] or (
             sizes["tir"] != sizes["hazy"] and self.pair_alignment_policy != "resize_tir_to_rgb"
         ):
             raise ValueError(f"pair alignment failed policy={self.pair_alignment_policy}, sizes={sizes}")
@@ -293,11 +305,15 @@ class SynthMultiModalDataset(data.Dataset):
         density = convert_density_semantics(load_scalar_map_as_float_tensor(
             sample["density_path"], normalization=self.density_map_normalization, **self.density_normalization_kwargs
         ), self.density_gt_semantics)
+        completion_mask = (load_scalar_map_as_float_tensor(sample["mask_path"]) > 0.5).float()
         if tir.shape[-2:] != hazy.shape[-2:]:
             tir = F.interpolate(tir.unsqueeze(0), size=hazy.shape[-2:], mode="bilinear", align_corners=False)[0]
         if self.train:
-            hazy, clear, tir, density = self._apply_geometry([hazy, clear, tir, density], self.geometry_description(index, hazy.shape[-2:]))
-        return hazy, clear, tir, density.clamp(0.0, 1.0)
+            hazy, clear, tir, density, completion_mask = self._apply_geometry(
+                [hazy, clear, tir, density, completion_mask], self.geometry_description(index, hazy.shape[-2:]),
+                interpolation_modes=("bilinear", "bilinear", "bilinear", "bilinear", "nearest"),
+            )
+        return hazy, clear, tir, density.clamp(0.0, 1.0), (completion_mask > 0.5).float()
 
     def __len__(self):
         return len(self.samples)
@@ -305,7 +321,7 @@ class SynthMultiModalDataset(data.Dataset):
 
 def collate_synth(batch):
     batch = [item for item in batch if item is not None and item[0] is not None]
-    return default_collate(batch) if batch else (torch.tensor([]),) * 4
+    return default_collate(batch) if batch else (torch.tensor([]),) * 5
 
 
 class RealMultiModalDataset(data.Dataset):

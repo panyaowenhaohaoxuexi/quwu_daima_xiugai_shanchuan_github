@@ -1,0 +1,33 @@
+{
+  "batch_configuration": {
+    "num_workers": 0,
+    "train": 1,
+    "validation": 1
+  },
+  "dataset_sizes": {
+    "train": 8445,
+    "validation": 3621
+  },
+  "device": "cuda",
+  "output_directories": {
+    "diagnostics": "",
+    "experiment": "E:\\Github_code_upload\\Multimodal_Dehaze_code\\Teacher_Train",
+    "models": "E:\\Github_code_upload\\Multimodal_Dehaze_code\\Teacher_Train"
+  },
+  "parameter_counts": {
+    "rgb_encoder": 28278104,
+    "tir_encoder": 188048,
+    "total": 29727797
+  },
+  "res2net_pretrained_loaded": true,
+  "res2net_pretrained_path": "E:\\Github_code_upload\\Multimodal_Dehaze_code\\model\\imagenet_model\\res2net101_v1b_26w_4s-0812c246.pth",
+  "schedule": {
+    "end_lr": 1e-06,
+    "epochs": 20,
+    "iters_per_epoch": 5000,
+    "start_lr": 0.0001,
+    "total_steps": 100000
+  },
+  "seed": 20260724,
+  "stage": "source"
+}

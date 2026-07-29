@@ -12,7 +12,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .hde import HDE
-from .monotonic_router import MonotonicFogRouter
+from .feature_guided_router import FeatureGuidedRouter
 from .appearance_memory import MemoryRetriever, TIRConditionedAppearancePrior
 from .res2net import CoARes2NetRGBEncoder
 from .structure_appearance_transformer import StructureAppearanceTransformerStage
@@ -129,8 +129,7 @@ class FogRoutedRGBTIRDehazer(nn.Module):
                  deform_max_offset=2.0, num_structure_renderers=2, memory_max_tokens=256,
                  memory_topk=8, memory_attention_temperature=0.07,
                  memory_reliability_epsilon=1e-6, memory_reliable_ratio_threshold=0.01,
-                 memory_confidence_threshold=0.1, memory_exclusion_extra_margin=0,
-                 boundary_width=1, memory_query_chunk_size=1024, decoder_num_heads=4,
+                 memory_confidence_threshold=0.1, memory_query_chunk_size=1024, decoder_num_heads=4,
                  decoder_depth=1, decoder_window_size=7, decoder_window_chunk_size=128,
                  decoder_mlp_ratio=4.0, decoder_attention_dropout=0.0,
                  decoder_projection_dropout=0.0, decoder_ffn_dropout=0.0):
@@ -144,18 +143,15 @@ class FogRoutedRGBTIRDehazer(nn.Module):
         memory_max_tokens = require_positive_integer("memory_max_tokens", memory_max_tokens)
         memory_topk = require_positive_integer("memory_topk", memory_topk)
         memory_query_chunk_size = require_positive_integer("memory_query_chunk_size", memory_query_chunk_size)
-        boundary_width = require_positive_integer("boundary_width", boundary_width)
         decoder_num_heads = require_positive_integer("decoder_num_heads", decoder_num_heads)
         decoder_depth = require_positive_integer("decoder_depth", decoder_depth)
         decoder_window_size = require_positive_integer("decoder_window_size", decoder_window_size)
         decoder_window_chunk_size = require_positive_integer("decoder_window_chunk_size", decoder_window_chunk_size)
         self.base_channels = base_channels
-        self.boundary_width = boundary_width
         self.deform_max_offset = float(deform_max_offset)
-        self.memory_exclusion_extra_margin = int(memory_exclusion_extra_margin)
         self.memory_query_chunk_size = memory_query_chunk_size
         self.hde = HDE()
-        self.router = MonotonicFogRouter(router_hidden_channels)
+        self.router = FeatureGuidedRouter(router_hidden_channels)
         self.rgb_encoder = CoARes2NetRGBEncoder(base_channels)
         self.tir_encoder = PyramidEncoder(base_channels)
         self.scale_names = ("h2", "h4", "h8", "h16")
@@ -226,7 +222,7 @@ class FogRoutedRGBTIRDehazer(nn.Module):
     def encode_context(self, hazy_rgb, tir, route_temperature=1.0):
         padded_rgb, padded_tir, validity, original_size = self._pad_inputs(hazy_rgb, tir)
         hde_output = self.hde(padded_rgb, padded_tir)
-        route = self.router(hde_output["density_map"], route_temperature)
+        route = self.router(hde_output["density_map"], hde_output["routing_features"], route_temperature)
         return {
             "density_map": hde_output["density_map"],
             "tir_structure_pyramid": hde_output["tir_structure_pyramid"],
@@ -241,24 +237,6 @@ class FogRoutedRGBTIRDehazer(nn.Module):
             return F.adaptive_max_pool2d(mask, size).clamp(0, 1)
         return F.interpolate(mask, size=size, mode="nearest").clamp(0, 1)
 
-    def _memory_exclusion_at_scale(self, exclusion_full, size, scale_index):
-        """Conservatively remove RGB values whose receptive field reaches Omega.
-
-        The h2 appearance value sees the encoder stem/downsample, the local
-        deformable offset and the fusion residual projection.  Deeper scales
-        have a larger encoder receptive field, so the token-grid radius grows
-        monotonically with scale.  This is intentionally conservative: an
-        empty memory falls back to the TIR-conditioned prior rather than leak
-        local RGB into a completion counterfactual.
-        """
-        exclusion = self._scale_mask(exclusion_full, size, conservative=True)
-        radius = appearance_receptive_field_radius_by_scale(
-            self.deform_max_offset, self.memory_exclusion_extra_margin,
-        )[self.scale_names[scale_index]]
-        if radius > 0:
-            exclusion = F.max_pool2d(exclusion, 2 * radius + 1, stride=1, padding=radius)
-        return exclusion.clamp(0, 1)
-
     @staticmethod
     def _route_gradient(route):
         dx = F.pad((route[..., :, 1:] - route[..., :, :-1]).abs(), (0, 1, 0, 0))
@@ -268,14 +246,12 @@ class FogRoutedRGBTIRDehazer(nn.Module):
     def _boundary(self, soft_route, hard_route, mode):
         if mode == "soft":
             return self._route_gradient(soft_route).clamp(0, 1)
-        dilated = F.max_pool2d(hard_route, 2 * self.boundary_width + 1, stride=1, padding=self.boundary_width)
-        eroded = -F.max_pool2d(-hard_route, 2 * self.boundary_width + 1, stride=1, padding=self.boundary_width)
+        dilated = F.max_pool2d(hard_route, 3, stride=1, padding=1)
+        eroded = -F.max_pool2d(-hard_route, 3, stride=1, padding=1)
         return (dilated - eroded).clamp(0, 1)
 
     def decode_with_route(self, context: Dict[str, torch.Tensor], route_mode="soft",
                           route_override_value: Optional[torch.Tensor] = None,
-                          route_override_mask: Optional[torch.Tensor] = None,
-                          memory_exclude_mask: Optional[torch.Tensor] = None,
                           return_debug=False, boundary_mode=None):
         if route_mode not in ("soft", "hard"):
             raise ValueError("route_mode must be 'soft' or 'hard'")
@@ -283,28 +259,18 @@ class FogRoutedRGBTIRDehazer(nn.Module):
             boundary_mode = route_mode
         if boundary_mode not in ("soft", "hard"):
             raise ValueError("boundary_mode must be 'soft' or 'hard'")
-        if (route_override_value is None) != (route_override_mask is None):
-            raise ValueError("route_override_value and route_override_mask must be provided together")
         original_size = context["original_size"]
         active = context["route_soft"] if route_mode == "soft" else context["route_hard"]
-        soft_route, hard_route = context["route_soft"], context["route_hard"]
         expected = (active.shape[0], 1, *original_size)
-        for name, tensor in (("route_override_value", route_override_value), ("route_override_mask", route_override_mask),
-                             ("memory_exclude_mask", memory_exclude_mask)):
-            if tensor is not None and tuple(tensor.shape) != expected:
-                raise ValueError(f"{name} must have shape {expected}")
+        if route_override_value is not None and tuple(route_override_value.shape) != expected:
+            raise ValueError(f"route_override_value must have shape {expected}")
         if route_override_value is not None:
             pad_h = active.shape[-2] - original_size[0]
             pad_w = active.shape[-1] - original_size[1]
-            override_value = F.pad(route_override_value.detach().clamp(0, 1), (0, pad_w, 0, pad_h))
-            override_mask = F.pad(route_override_mask.detach().clamp(0, 1), (0, pad_w, 0, pad_h))
-        else:
-            override_value = override_mask = None
-        if memory_exclude_mask is not None:
-            exclude_full = F.pad(memory_exclude_mask.detach().clamp(0, 1),
-                                 (0, active.shape[-1] - original_size[1], 0, active.shape[-2] - original_size[0]))
-        else:
-            exclude_full = torch.zeros_like(active)
+            active = F.pad(route_override_value.clamp(0, 1), (0, pad_w, 0, pad_h))
+        soft_route = active
+        hard_route = (active >= 0.5).to(active.dtype)
+        exclude_full = torch.zeros_like(active)
         structures, appearances, validity_scales, debug_scales = {}, {}, {}, {}
         reporting = None
         for name in self.scale_names:
@@ -316,16 +282,9 @@ class FogRoutedRGBTIRDehazer(nn.Module):
             route = F.interpolate(active, size=size, mode="nearest")
             soft = F.interpolate(soft_route, size=size, mode="nearest")
             hard = F.interpolate(hard_route, size=size, mode="nearest")
-            if override_mask is not None:
-                mask = self._scale_mask(override_mask, size, conservative=True)
-                value = self._scale_mask(override_value, size)
-                route = torch.where(mask > 0.5, value, route)
-                soft_for_boundary = torch.where(mask > 0.5, value, soft)
-                hard_for_boundary = torch.where(mask > 0.5, value, hard)
-            else:
-                mask = torch.zeros_like(route)
-                soft_for_boundary, hard_for_boundary = soft, hard
-            exclusion = self._memory_exclusion_at_scale(exclude_full, size, self.scale_names.index(name))
+            mask = torch.ones_like(route) if route_override_value is not None else torch.zeros_like(route)
+            soft_for_boundary, hard_for_boundary = soft, hard
+            exclusion = self._scale_mask(exclude_full, size, conservative=True)
             A = self.appearance[name](rgb)
             S = self.structure[name](context["tir_structure_pyramid"][name])
             O, offsets, sample_weights = self.sampler[name](S, A)

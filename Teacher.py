@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from data.data_loader import SynthMultiModalDataset, collate_synth
 from option.Teacher import (build_parser, persisted_config_from_args, prepare_experiment_dirs,
                             save_config, tir_normalization_config_from_args, validate_config)
-from training.source import OmegaSampler, build_source_reconstruction_criteria, compute_source_batch_losses
+from training.source import compute_physical_mask_batch_losses
 from training.schedule import build_coa_adam, cycle_batches, set_cosine_learning_rate
 from training.observability import TrainingLogger
 from training.validation import evaluate_paired_validation, save_best_if_improved
@@ -96,15 +96,10 @@ def main(argv=None):
                                    num_workers=args.num_workers, collate_fn=collate_synth)
     model = build_model_from_config(config).to(device)
     optimizer = build_coa_adam(model.parameters(), learning_rate=args.start_lr)
-    reconstruction_criteria = build_source_reconstruction_criteria(device)
     start_epoch, global_step, best_psnr = 0, 0, float("-inf")
     if resume is not None:
         restored = load_source_checkpoint(resume, model, optimizer)
         start_epoch, global_step, best_psnr = restored["epoch"], restored["global_step"], restored.get("best_psnr", float("-inf"))
-    omega_sampler = OmegaSampler(args.omega_regions_per_image, args.omega_min_area,
-                                 args.omega_max_area, seed=args.model_init_seed)
-    omega_generator = torch.Generator(device=device).manual_seed(args.model_init_seed + 101)
-    empty_omega_streak = 0
     total_steps = args.epochs * args.iters_per_epoch
     batch_iterator = cycle_batches(loader)
     logger = TrainingLogger(args.exp_dir or args.saved_model_dir, resume=resume is not None)
@@ -133,7 +128,7 @@ def main(argv=None):
         logical_step = 0
         while logical_step < args.iters_per_epoch:
             step_started = perf_counter()
-            hazy, clear, tir, density = next(batch_iterator)
+            hazy, clear, tir, density, completion_mask = next(batch_iterator)
             if hazy.numel() == 0:
                 continue
             schedule_step = epoch * args.iters_per_epoch + logical_step + 1
@@ -141,21 +136,14 @@ def main(argv=None):
                 optimizer, step=schedule_step, total_steps=total_steps, start_lr=args.start_lr,
                 end_lr=args.end_lr, no_lr_sche=args.no_lr_sche,
             )
-            hazy, clear, tir, density = (value.to(device) for value in (hazy, clear, tir, density))
+            hazy, clear, tir, density, completion_mask = (value.to(device) for value in (hazy, clear, tir, density, completion_mask))
             optimizer.zero_grad(set_to_none=True)
-            result = compute_source_batch_losses(model, (hazy, clear, tir, density), args, omega_sampler, global_step,
-                                                 omega_generator=omega_generator,
-                                                 reconstruction_criteria=reconstruction_criteria)
+            result = compute_physical_mask_batch_losses(model, (hazy, clear, tir, density, completion_mask), args, global_step)
             loss = result["losses"]["total"]
             _require_finite_loss(loss, epoch=epoch, step=global_step)
             loss.backward()
             _require_finite_gradients(model, epoch=epoch, step=global_step, loss=loss)
             optimizer.step()
-            valid = result["route_supervision"]["valid_q_region_count"]
-            enabled = args.lambda_router * result["state"]["lambda_route"] > 0
-            empty_omega_streak = empty_omega_streak + 1 if enabled and not valid else 0
-            if empty_omega_streak >= args.max_consecutive_empty_omega_steps:
-                raise RuntimeError(f"source empty Omega limit: epoch={epoch} step={global_step}")
             global_step += 1
             logical_step += 1
             train_psnr = psnr(result["output"]["pred_clear"].detach(), clear).item()
@@ -166,14 +154,13 @@ def main(argv=None):
                 train_psnr=train_psnr, train_ssim=train_ssim,
                 **{f"loss_{name}": value for name, value in result["losses"].items()},
                 **{f"schedule_{name}": value for name, value in result["state"].items()},
-                **{f"route_{name}": value for name, value in result["route_supervision"].items()},
             )
             if global_step % 50 == 0:
                 print(f"source epoch={epoch + 1} step={global_step} loss={loss.item():.5f} "
-                      f"global={result['losses']['global'].item():.5f} route={result['losses']['route'].item():.5f} "
+                      f"reconstruction={result['losses']['reconstruction'].item():.5f} route={result['losses']['route'].item():.5f} "
                       f"lr={learning_rate:.9f} psnr={train_psnr:.3f} ssim={train_ssim:.4f}")
             if args.saved_data_dir and global_step % 500 == 0:
-                build_diagnostic_panel(hazy, tir, clear, density, result["output"], q=result["q"]).save(
+                build_diagnostic_panel(hazy, tir, clear, density, completion_mask, result["output"]).save(
                     Path(args.saved_data_dir) / f"source_step_{global_step:08d}.png"
                 )
         validation = evaluate_paired_validation(model, validation_loader, device, route_temperature=args.route_tau_end)

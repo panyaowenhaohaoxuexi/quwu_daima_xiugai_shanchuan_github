@@ -14,6 +14,20 @@ from .model_config_validation import (
 )
 
 CHECKPOINT_FORMAT_VERSION = 2
+LEGACY_ROUTE_CONFIG_KEYS = frozenset({
+    "boundary_width", "memory_exclusion_extra_margin", "counterfactual_chunk_size",
+    "counterfactual_start_step", "route_loss_start_step", "route_loss_warmup_steps",
+    "route_hard_start_step", "binary_loss_start_step", "binary_loss_warmup_steps",
+    "omega_regions_per_image", "omega_min_area", "omega_max_area",
+    "max_consecutive_empty_omega_steps", "q_temperature", "q_window_size",
+    "q_min_valid_support", "lambda_binary", "lambda_global", "lambda_fuse",
+    "lambda_comp", "lambda_boundary", "lambda_router",
+})
+LEGACY_ROUTER_STATE_MARKERS = ("router.raw_weight_in", "router.raw_weight_out", "router.bias_in", "router.bias_out")
+
+
+def _legacy_v2_error(detail):
+    return f"不兼容 V2 物理 mask 路由架构: {detail}"
 
 def require_checkpoint_dict(checkpoint):
     if not isinstance(checkpoint, dict):
@@ -32,15 +46,22 @@ def require_checkpoint_format(checkpoint):
 def load_strict_v2_state_dict(model, state_dict, *, label):
     if not isinstance(state_dict, Mapping):
         raise TypeError(f"{label} state_dict must be a mapping")
+    if any(key in state_dict for key in LEGACY_ROUTER_STATE_MARKERS):
+        raise RuntimeError(_legacy_v2_error("checkpoint contains MonotonicFogRouter parameters"))
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as exc:
-        raise RuntimeError(f"{label} state_dict is incompatible with the v2 structure-appearance Transformer architecture") from exc
+        raise RuntimeError(_legacy_v2_error(f"{label} state_dict does not match FeatureGuidedRouter")) from exc
 
 
 def require_complete_model_config(config):
     if not isinstance(config, Mapping):
         raise TypeError("checkpoint config must be a mapping")
+    legacy = sorted(LEGACY_ROUTE_CONFIG_KEYS.intersection(config))
+    router_name = str(config.get("router_class", config.get("router_type", "")))
+    if legacy or router_name == "MonotonicFogRouter":
+        detail = ("old-route config keys=" + ", ".join(legacy)) if legacy else "router_class=MonotonicFogRouter"
+        raise ValueError(_legacy_v2_error(detail))
     missing = [key for key in MODEL_CONFIG_KEYS if key not in config]
     if missing:
         raise ValueError("checkpoint lacks model configuration: " + ", ".join(missing))

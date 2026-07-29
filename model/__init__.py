@@ -1,6 +1,6 @@
 """Public formal model interface."""
 
 from .Teacher import FogRoutedRGBTIRDehazer
-from .monotonic_router import MonotonicFogRouter
+from .feature_guided_router import FeatureGuidedRouter
 
-__all__ = ["FogRoutedRGBTIRDehazer", "MonotonicFogRouter"]
+__all__ = ["FogRoutedRGBTIRDehazer", "FeatureGuidedRouter"]

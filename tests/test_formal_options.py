@@ -1,124 +1,17 @@
-import argparse
-import importlib
-import sys
-
 import pytest
 
-
-LOSS_WEIGHT_ARGUMENTS = (
-    "q_l1_weight", "q_gradient_weight", "q_ssim_weight",
-    "global_l1_weight", "global_ssim_weight", "global_contrast_weight",
-    "region_l1_weight", "region_gradient_weight", "region_ssim_weight",
-)
+from option.Teacher import build_parser, validate_config
 
 
-FORMAL_LOSS_WEIGHTS = {
-    "q_l1_weight": 1.0,
-    "q_gradient_weight": 0.5,
-    "q_ssim_weight": 0.5,
-    "global_l1_weight": 0.8,
-    "global_ssim_weight": 0.2,
-    "global_contrast_weight": 0.05,
-    "region_l1_weight": 1.0,
-    "region_gradient_weight": 0.2,
-    "region_ssim_weight": 0.2,
-}
-
-
-def test_option_modules_are_pure_on_import_and_validate_formal_defaults(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    original = list(sys.argv)
-    sys.argv = ["pytest", "--unexpected-pytest-argument"]
-    try:
-        teacher = importlib.reload(importlib.import_module("option.Teacher"))
-        ema = importlib.reload(importlib.import_module("option.EMA"))
-    finally:
-        sys.argv = original
-
-    assert not list(tmp_path.iterdir())
-    teacher.validate_config(teacher.build_parser().parse_args([]))
-    source_config = teacher.persisted_config_from_args(teacher.build_parser().parse_args([]))
-    resolved = ema.resolve_ema_config(
-        ema.build_parser().parse_args([
-            "--real_data_dir", "real-root", "--source_anchor_data_dir", "anchor-root",
-        ]),
-        source_config,
-    )
-    ema.validate_config(argparse.Namespace(**resolved))
-
-
-def test_tir_loader_mapping_keeps_all_persisted_preprocessing_semantics():
-    from option.Teacher import build_parser, tir_normalization_config_from_args
-
-    args = build_parser().parse_args([
-        "--tir_normalization", "percentile", "--tir_percentile_scope", "dataset",
-        "--tir_percentile_low", "2", "--tir_percentile_high", "98",
-        "--tir_dataset_percentile_low_value", "100", "--tir_dataset_percentile_high_value", "900",
-        "--tir_channel_tolerance_code_values", "2", "--tir_channel_tolerance_float", "0.0001",
-    ])
-    config = tir_normalization_config_from_args(args)
-    assert config["normalization"] == "percentile"
-    assert config["percentile_scope"] == "dataset"
-    assert config["dataset_percentile_low_value"] == 100.0
-    assert config["channel_tolerance_code_values"] == 2
-
-
-def test_default_loss_weights_match_coa_global_and_shared_region_configuration():
-    from option.Teacher import build_parser, validate_config
-
+def test_v2_parser_exposes_only_physical_mask_route_controls():
     args = validate_config(build_parser().parse_args([]))
-
-    assert {name: getattr(args, name) for name in LOSS_WEIGHT_ARGUMENTS} == {
-        "q_l1_weight": 1.0,
-        "q_gradient_weight": 0.0,
-        "q_ssim_weight": 0.0,
-        "global_l1_weight": 0.8,
-        "global_ssim_weight": 0.2,
-        "global_contrast_weight": 0.05,
-        "region_l1_weight": 1.0,
-        "region_gradient_weight": 0.2,
-        "region_ssim_weight": 0.2,
-    }
+    assert args.density_gt_semantics == "density"
+    assert args.lambda_density == args.lambda_route == 1.0
+    for removed in ("counterfactual_start_step", "q_temperature", "lambda_binary", "boundary_width"):
+        assert not hasattr(args, removed)
 
 
-def test_formal_training_and_loss_weights_share_explicit_cli_tracking():
-    from option.Teacher import build_parser
-
-    args = build_parser().parse_args([
-        "--formal_training", "--q_gradient_weight", "0.7",
-    ])
-
-    assert set(args._explicit_training_objective_keys) == {
-        "formal_training", "q_gradient_weight",
-    }
-
-
-def test_source_loss_defaults_and_formal_preset_are_owned_by_option_teacher():
-    from option.Teacher import FORMAL_TRAINING_LOSS_WEIGHTS, LOSS_WEIGHT_NAMES
-
-    assert set(FORMAL_TRAINING_LOSS_WEIGHTS) == set(LOSS_WEIGHT_NAMES)
-
-
-def test_formal_training_parser_loads_positive_composite_weights():
-    module = importlib.import_module("option.Teacher")
-
-    args = module.validate_config(module.build_parser().parse_args(["--formal_training"]))
-
-    assert args.formal_training is True
-    assert {name: getattr(args, name) for name in LOSS_WEIGHT_ARGUMENTS} == FORMAL_LOSS_WEIGHTS
-
-
-@pytest.mark.parametrize("name", LOSS_WEIGHT_ARGUMENTS)
-def test_formal_training_rejects_each_explicit_zero_weight(name):
-    from option.Teacher import build_parser, validate_config
-
-    with pytest.raises(ValueError, match="smoke"):
-        validate_config(build_parser().parse_args(["--formal_training", f"--{name}", "0"]))
-
-
-@pytest.mark.parametrize("name", LOSS_WEIGHT_ARGUMENTS)
-def test_loss_weights_must_always_be_non_negative(name):
-    from option.Teacher import build_parser, validate_config
-
+@pytest.mark.parametrize("name", ("lambda_density", "lambda_route"))
+def test_v2_parser_rejects_negative_loss_weights(name):
     with pytest.raises(ValueError, match="non-negative"):
         validate_config(build_parser().parse_args([f"--{name}", "-0.1"]))

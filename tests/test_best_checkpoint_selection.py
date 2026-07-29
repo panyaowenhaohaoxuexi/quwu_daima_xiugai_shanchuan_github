@@ -9,7 +9,7 @@ def test_validation_uses_paired_clear_targets_and_returns_mean_psnr_ssim():
             return {"pred_clear": hazy}
 
     batch = (torch.full((1, 3, 8, 8), 0.6), torch.full((1, 3, 8, 8), 0.6),
-             torch.zeros((1, 3, 8, 8)), torch.zeros((1, 1, 8, 8)))
+             torch.zeros((1, 3, 8, 8)), torch.zeros((1, 1, 8, 8)), torch.zeros((1, 1, 8, 8)))
     metrics = evaluate_paired_validation(IdentityModel(), [batch], torch.device("cpu"), route_temperature=0.2)
 
     assert metrics["psnr"] > 100

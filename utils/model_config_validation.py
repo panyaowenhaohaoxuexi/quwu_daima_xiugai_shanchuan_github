@@ -8,7 +8,7 @@ MODEL_CONFIG_KEYS = (
     "base_channels", "router_hidden_channels", "deform_num_samples", "deform_max_offset",
     "num_structure_renderers", "memory_max_tokens", "memory_topk", "memory_query_chunk_size",
     "memory_attention_temperature", "memory_reliability_epsilon", "memory_reliable_ratio_threshold",
-    "memory_confidence_threshold", "memory_exclusion_extra_margin", "boundary_width",
+    "memory_confidence_threshold",
     "decoder_num_heads", "decoder_depth", "decoder_window_size", "decoder_window_chunk_size",
     "decoder_mlp_ratio", "decoder_attention_dropout", "decoder_projection_dropout", "decoder_ffn_dropout",
 )
@@ -42,11 +42,10 @@ def validate_model_config_values(config):
     """Validate only architecture/state-dict semantics without constructing a model."""
     for name in (
         "base_channels", "router_hidden_channels", "deform_num_samples", "num_structure_renderers",
-        "memory_max_tokens", "memory_topk", "memory_query_chunk_size", "boundary_width",
+        "memory_max_tokens", "memory_topk", "memory_query_chunk_size",
         "decoder_num_heads", "decoder_depth", "decoder_window_size", "decoder_window_chunk_size",
     ):
         require_positive_integer(name, config[name])
-    require_nonnegative_integer("memory_exclusion_extra_margin", config["memory_exclusion_extra_margin"])
     for name in ("deform_max_offset",):
         require_finite_float(name, config[name], minimum=0.0)
     for name in ("memory_attention_temperature", "memory_reliability_epsilon", "decoder_mlp_ratio"):

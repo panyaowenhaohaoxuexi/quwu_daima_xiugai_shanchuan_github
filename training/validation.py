@@ -13,7 +13,7 @@ def evaluate_paired_validation(model, loader, device, *, route_temperature):
     was_training = model.training
     model.eval()
     psnr_values, ssim_values = [], []
-    for hazy, clear, tir, _density in loader:
+    for hazy, clear, tir, _density, _completion_mask in loader:
         if hazy.numel() == 0:
             continue
         output = model(hazy.to(device), tir.to(device), route_temperature=route_temperature, route_mode="hard")

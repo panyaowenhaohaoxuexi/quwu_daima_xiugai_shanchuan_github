@@ -12,7 +12,7 @@ def test_model_package_exports_only_formal_model_and_router():
     package = importlib.import_module("model")
     teacher_module = importlib.import_module("model.Teacher")
 
-    assert package.__all__ == ["FogRoutedRGBTIRDehazer", "MonotonicFogRouter"]
+    assert package.__all__ == ["FogRoutedRGBTIRDehazer", "FeatureGuidedRouter"]
     assert importlib.util.find_spec("model.fog_routed_dehazer") is None
     assert package.FogRoutedRGBTIRDehazer is teacher_module.FogRoutedRGBTIRDehazer
 
@@ -111,4 +111,3 @@ def test_readme_distinguishes_training_entrypoints_model_definition_and_formal_c
     assert "`EMA.py`" in readme and "`Eval.py`" in readme
     assert "not a third training stage" in readme
     assert "model/fog_routed_dehazer.py" in readme and "does not exist" in readme
-    assert "--formal_training" in readme
