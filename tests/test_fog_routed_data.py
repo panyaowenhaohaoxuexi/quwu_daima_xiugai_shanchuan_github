@@ -104,6 +104,20 @@ def test_real_dataset_returns_only_hazy_tir_and_metadata(tmp_path):
     assert "clear" not in metadata and "density" not in metadata and "mask" not in metadata
 
 
+def test_real_dataset_pairs_m3fd_vis_prefix_with_ir_prefix(tmp_path):
+    hazy_dir, tir_dir = tmp_path / "hazy", tmp_path / "tir"
+    hazy_dir.mkdir()
+    tir_dir.mkdir()
+    _write_rgb(hazy_dir / "vis-000.png", value=40)
+    Image.fromarray(np.full((7, 9), 1000, dtype=np.uint16), mode="I;16").save(tir_dir / "ir-000.png")
+
+    dataset = RealMultiModalDataset(hazy_dir, tir_dir, pair_alignment_policy="strict")
+    _hazy, _tir, metadata = dataset[0]
+
+    assert metadata["sample_id"] == "vis-000"
+    assert metadata["tir_path"].endswith("ir-000.png")
+
+
 def test_real_collate_rejects_mixed_spatial_sizes_instead_of_silent_padding():
     first = (torch.zeros(3, 8, 8), torch.zeros(3, 8, 8), {"sample_id": "a"})
     second = (torch.zeros(3, 9, 8), torch.zeros(3, 9, 8), {"sample_id": "b"})

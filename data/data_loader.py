@@ -335,7 +335,10 @@ class RealMultiModalDataset(data.Dataset):
         index = _stem_index(self.tir_dir, COMMON_IMAGE_EXTS)
         self.samples = []
         for name in _list_image_files(self.hazy_dir, COMMON_IMAGE_EXTS):
-            tir_path, _ = _lookup_stem(index, os.path.splitext(name)[0])
+            stem = os.path.splitext(name)[0]
+            tir_path, _ = _lookup_stem(index, stem)
+            if tir_path is None and stem.lower().startswith("vis-"):
+                tir_path, _ = _lookup_stem(index, "ir-" + stem[4:])
             if tir_path is None:
                 raise FileNotFoundError(f"missing TIR pair for real sample: {os.path.join(self.hazy_dir, name)}")
             self.samples.append((os.path.join(self.hazy_dir, name), tir_path))
