@@ -3,7 +3,6 @@
 import argparse
 import copy
 import random
-from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
@@ -13,12 +12,13 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from data.data_loader import RealMultiModalDataset, SynthMultiModalDataset, collate_real, collate_synth
-from loss.source import build_regional_reconstruction_criteria
 from loss.ema import real_consistency_loss, stability_weights
+from loss.source import build_regional_reconstruction_criteria
 from option.EMA import (build_ema_checkpoint_config, build_parser, prepare_experiment_dirs,
                         real_modal_dirs_from_args, resolve_ema_config, save_config,
                         tir_normalization_config_from_args, validate_config)
 from training.source import compute_physical_mask_batch_losses
+from training.real_adaptation import real_adaptation_loss
 from training.schedule import build_coa_adam, cycle_batches, set_cosine_learning_rate
 from training.observability import TrainingLogger
 from training.validation import evaluate_paired_validation, save_best_if_improved
@@ -96,25 +96,6 @@ def adaptation_loss(real_losses, source_losses, args):
             + args.lambda_anchor * source_losses["losses"]["total"])
 
 
-@dataclass(frozen=True)
-class _Geometry:
-    rot90_k: int
-    horizontal_flip: bool
-
-    def apply(self, tensor):
-        tensor = torch.rot90(tensor, self.rot90_k, dims=(-2, -1))
-        return torch.flip(tensor, dims=(-1,)) if self.horizontal_flip else tensor
-
-    def inverse(self, tensor):
-        tensor = torch.flip(tensor, dims=(-1,)) if self.horizontal_flip else tensor
-        return torch.rot90(tensor, (-self.rot90_k) % 4, dims=(-2, -1))
-
-
-def _sample_geometry(generator):
-    return _Geometry(int(torch.randint(0, 4, (), generator=generator)),
-                     bool(torch.randint(0, 2, (), generator=generator)))
-
-
 def initialize_teacher(student):
     teacher = copy.deepcopy(student)
     teacher.eval()
@@ -150,27 +131,6 @@ def _require_finite(loss, model, *, epoch, step):
     for name, parameter in model.named_parameters():
         if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
             raise RuntimeError(f"ema non-finite gradient: epoch={epoch} step={step} loss={float(loss.detach())} parameter={name}")
-
-
-def _real_loss(teacher, student, hazy, tir, generator, args, *, clip_criterion=None, text_features=None):
-    transforms = tuple(_sample_geometry(generator) for _ in range(3))
-    with torch.no_grad():
-        a = teacher(transforms[0].apply(hazy), transforms[0].apply(tir), route_temperature=args.route_tau_end, route_mode="hard")
-        b = teacher(transforms[1].apply(hazy), transforms[1].apply(tir), route_temperature=args.route_tau_end, route_mode="hard")
-    s = student(transforms[2].apply(hazy), transforms[2].apply(tir), route_temperature=args.route_tau_end, route_mode="hard")
-    j_a, j_b = transforms[0].inverse(a["pred_clear"]), transforms[1].inverse(b["pred_clear"])
-    m_a, m_b = transforms[0].inverse(a["density_map"]), transforms[1].inverse(b["density_map"])
-    r_a, r_b = transforms[0].inverse(a["route_soft"]), transforms[1].inverse(b["route_soft"])
-    weights = stability_weights(j_a, j_b, m_a, m_b, r_a, r_b, args.ema_sigma_j, args.ema_sigma_m,
-                               args.ema_sigma_r, args.ema_stability_min_weight)
-    student_clear = transforms[2].inverse(s["pred_clear"])
-    losses = real_consistency_loss(student_clear, 0.5 * (j_a + j_b),
-                                   transforms[2].inverse(s["density_map"]), 0.5 * (m_a + m_b),
-                                   transforms[2].inverse(s["route_soft"]), 0.5 * (r_a + r_b), *weights,
-                                   lambda_j=args.lambda_ema_j, lambda_m=args.lambda_ema_m, lambda_r=args.lambda_ema_r)
-    losses["L_clip"] = (clip_criterion(student_clear, text_features)
-                        if clip_criterion is not None else student_clear.new_zeros(()))
-    return losses
 
 
 def main(argv=None):
@@ -267,8 +227,8 @@ def main(argv=None):
                 end_lr=args.end_lr, no_lr_sche=args.no_lr_sche,
             )
             optimizer.zero_grad(set_to_none=True)
-            real = _real_loss(teacher, student, real_hazy.to(device), real_tir.to(device), geometry_generator, args,
-                              clip_criterion=clip_criterion, text_features=text_features)
+            real = real_adaptation_loss(teacher, student, real_hazy.to(device), real_tir.to(device), geometry_generator, args,
+                                        route_multiplier=1.0, clip_criterion=clip_criterion, text_features=text_features)
             source = compute_physical_mask_batch_losses(
                 student, tuple(value.to(device) for value in source_batch), args, source_global_step,
                 reconstruction_criteria=reconstruction_criteria,
