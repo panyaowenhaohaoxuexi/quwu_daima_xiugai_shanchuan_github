@@ -1,6 +1,7 @@
 import torch
 
-from UDA import build_target_reference_loader, route_consistency_multiplier, style_source_batch
+from UDA import (build_source_anchor_loader, build_target_reference_loader,
+                 route_consistency_multiplier, style_source_batch)
 
 
 def test_stage_a_target_reference_loader_discards_only_incomplete_multi_image_batch():
@@ -11,6 +12,15 @@ def test_stage_a_target_reference_loader_discards_only_incomplete_multi_image_ba
 
     assert [hazy.shape[0] for hazy, _tir, _metadata in multi_image_batches] == [2, 2]
     assert [hazy.shape[0] for hazy, _tir, _metadata in single_image_batches] == [1, 1, 1, 1, 1]
+
+
+def test_stage_a_source_anchor_loader_discards_incomplete_multi_image_batch():
+    sample = (torch.zeros(3, 8, 8), torch.zeros(3, 8, 8), torch.zeros(3, 8, 8),
+              torch.zeros(1, 8, 8), torch.zeros(1, 8, 8))
+
+    batches = list(build_source_anchor_loader([sample] * 5, batch_size=2, num_workers=0, drop_last=True))
+
+    assert [hazy.shape[0] for hazy, _clear, _tir, _density, _mask in batches] == [2, 2]
 
 
 def test_style_source_batch_preserves_physical_labels_and_can_style_every_sample():

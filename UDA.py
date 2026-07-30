@@ -150,7 +150,16 @@ def build_target_reference_loader(dataset, *, batch_size, num_workers, drop_last
     )
 
 
-def _build_datasets_and_loaders(args, *, target_batch_size, target_drop_last=False):
+def build_source_anchor_loader(dataset, *, batch_size, num_workers, drop_last):
+    """Build a Source five-tuple loader with Stage-A full-batch control."""
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        collate_fn=collate_synth, drop_last=drop_last,
+    )
+
+
+def _build_datasets_and_loaders(args, *, target_batch_size, target_drop_last=False,
+                                source_drop_last=False):
     """Construct only formal paired datasets; M3FD has no invented labels."""
     normalizer = tir_normalization_config_from_args(args)
     real_hazy_dir, real_tir_dir = real_modal_dirs_from_args(args)
@@ -179,8 +188,10 @@ def _build_datasets_and_loaders(args, *, target_batch_size, target_drop_last=Fal
             real_dataset, batch_size=target_batch_size, num_workers=args.num_workers,
             drop_last=target_drop_last,
         ),
-        DataLoader(source_dataset, batch_size=args.source_anchor_batch_size, shuffle=True,
-                   num_workers=args.num_workers, collate_fn=collate_synth),
+        build_source_anchor_loader(
+            source_dataset, batch_size=args.source_anchor_batch_size, num_workers=args.num_workers,
+            drop_last=source_drop_last,
+        ),
         DataLoader(validation_dataset, batch_size=args.validation_batch_size, shuffle=False,
                    num_workers=args.num_workers, collate_fn=collate_synth),
     )
@@ -218,6 +229,7 @@ def _run_source_style_stage(args, checkpoint, checkpoint_config):
     datasets_and_loaders = _build_datasets_and_loaders(
         args, target_batch_size=args.source_anchor_batch_size,
         target_drop_last=args.source_anchor_batch_size > 1,
+        source_drop_last=args.source_anchor_batch_size > 1,
     )
     real_dataset, source_dataset, validation_dataset, real_loader, source_loader, validation_loader = datasets_and_loaders
     prepare_experiment_dirs(args)
