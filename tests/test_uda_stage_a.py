@@ -1,6 +1,16 @@
 import torch
 
-from UDA import route_consistency_multiplier, style_source_batch
+from UDA import build_target_reference_loader, route_consistency_multiplier, style_source_batch
+
+
+def test_stage_a_target_reference_loader_discards_only_incomplete_multi_image_batch():
+    dataset = [(torch.zeros(3, 8, 8), torch.zeros(3, 8, 8), {"sample_id": str(index)}) for index in range(5)]
+
+    multi_image_batches = list(build_target_reference_loader(dataset, batch_size=2, num_workers=0, drop_last=True))
+    single_image_batches = list(build_target_reference_loader(dataset, batch_size=1, num_workers=0, drop_last=False))
+
+    assert [hazy.shape[0] for hazy, _tir, _metadata in multi_image_batches] == [2, 2]
+    assert [hazy.shape[0] for hazy, _tir, _metadata in single_image_batches] == [1, 1, 1, 1, 1]
 
 
 def test_style_source_batch_preserves_physical_labels_and_can_style_every_sample():
@@ -71,11 +81,12 @@ def test_stage_a_entrypoint_writes_a_source_checkpoint(tmp_path, monkeypatch):
     uda_dir = tmp_path / "uda"
     probe_dir = tmp_path / "probe"
     UDA.main(["--stage", "source_style", "--source_checkpoint", str(source_dir / "source_last.pt"),
-              "--source_anchor_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path),
-              "--real_data_dir", str(tmp_path / "real"), "--real_tir_dir", str(tmp_path / "real" / "tir"),
-              "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu", "--style_probability", "1.0",
-              "--style_beta_min", "1.0", "--style_beta_max", "1.0", "--saved_model_dir", str(uda_dir),
-              "--exp_dir", str(tmp_path / "uda-exp"), "--probe_hazy", str(tmp_path / "real" / "hazy" / "real.png"),
+                  "--source_anchor_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path),
+                  "--real_data_dir", str(tmp_path / "real"), "--real_tir_dir", str(tmp_path / "real" / "tir"),
+                  "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu", "--style_probability", "1.0",
+                  "--style_beta_min", "1.0", "--style_beta_max", "1.0", "--saved_model_dir", str(uda_dir),
+                  "--source_anchor_batch_size", "1", "--real_batch_size", "1", "--num_workers", "0",
+                  "--exp_dir", str(tmp_path / "uda-exp"), "--probe_hazy", str(tmp_path / "real" / "hazy" / "real.png"),
               "--probe_tir", str(tmp_path / "real" / "tir" / "real.png"), "--probe_output_dir", str(probe_dir),
               "--saved_data_dir", str(tmp_path / "uda-diagnostics")])
     checkpoint = torch.load(uda_dir / "source_style_last.pt", map_location="cpu")
@@ -132,6 +143,7 @@ def test_stage_b_entrypoint_delays_real_route_consistency(tmp_path, monkeypatch)
               "--source_anchor_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path),
               "--real_data_dir", str(tmp_path / "real"), "--real_tir_dir", str(tmp_path / "real" / "tir"),
               "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu", "--saved_model_dir", str(uda_dir),
+              "--source_anchor_batch_size", "1", "--real_batch_size", "1", "--num_workers", "0",
               "--exp_dir", str(exp_dir), "--saved_data_dir", str(tmp_path / "uda-ema-diagnostics"),
               "--route_consistency_warmup_steps", "10", "--probe_hazy", "", "--probe_tir", ""])
     checkpoint = torch.load(uda_dir / "uda_ema_last.pt", map_location="cpu")

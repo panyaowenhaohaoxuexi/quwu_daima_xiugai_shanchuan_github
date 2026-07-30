@@ -142,7 +142,15 @@ def style_source_batch(source_batch, target_hazy, target_tir, *, generator, prob
     return (styled.hazy, styled.clear, styled.tir, density_gt, completion_mask_gt), apply_mask.to(hazy.device)
 
 
-def _build_datasets_and_loaders(args, *, target_batch_size):
+def build_target_reference_loader(dataset, *, batch_size, num_workers, drop_last):
+    """Build a real loader, optionally requiring full batches for Stage A."""
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        collate_fn=collate_real, drop_last=drop_last,
+    )
+
+
+def _build_datasets_and_loaders(args, *, target_batch_size, target_drop_last=False):
     """Construct only formal paired datasets; M3FD has no invented labels."""
     normalizer = tir_normalization_config_from_args(args)
     real_hazy_dir, real_tir_dir = real_modal_dirs_from_args(args)
@@ -167,8 +175,10 @@ def _build_datasets_and_loaders(args, *, target_batch_size):
     )
     return (
         real_dataset, source_dataset, validation_dataset,
-        DataLoader(real_dataset, batch_size=target_batch_size, shuffle=True, num_workers=args.num_workers,
-                   collate_fn=collate_real),
+        build_target_reference_loader(
+            real_dataset, batch_size=target_batch_size, num_workers=args.num_workers,
+            drop_last=target_drop_last,
+        ),
         DataLoader(source_dataset, batch_size=args.source_anchor_batch_size, shuffle=True,
                    num_workers=args.num_workers, collate_fn=collate_synth),
         DataLoader(validation_dataset, batch_size=args.validation_batch_size, shuffle=False,
@@ -205,7 +215,10 @@ def _run_source_style_stage(args, checkpoint, checkpoint_config):
     source_preflight = preflight_source_initialization_checkpoint(checkpoint)
     load_strict_v2_state_dict(model, source_preflight["states"]["model"], label="Source model")
     optimizer = build_coa_adam(model.parameters(), learning_rate=args.start_lr)
-    datasets_and_loaders = _build_datasets_and_loaders(args, target_batch_size=args.source_anchor_batch_size)
+    datasets_and_loaders = _build_datasets_and_loaders(
+        args, target_batch_size=args.source_anchor_batch_size,
+        target_drop_last=args.source_anchor_batch_size > 1,
+    )
     real_dataset, source_dataset, validation_dataset, real_loader, source_loader, validation_loader = datasets_and_loaders
     prepare_experiment_dirs(args)
     save_config(args)
