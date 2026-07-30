@@ -1,7 +1,8 @@
 """Configuration for two-stage FLIR-to-M3FD unsupervised domain adaptation."""
 
 from option.EMA import (build_ema_checkpoint_config, build_parser as build_ema_parser,
-                        persisted_config_from_args, validate_config as validate_ema_config)
+                        persisted_config_from_args, resolve_ema_config,
+                        validate_config as validate_ema_config)
 from utils.model_config_validation import MODEL_CONFIG_KEYS
 
 
@@ -44,9 +45,27 @@ def validate_config(args):
         raise ValueError("route consistency schedule steps must be non-negative")
     if bool(args.probe_hazy) != bool(args.probe_tir):
         raise ValueError("probe_hazy and probe_tir must be provided together")
+    if args.probe_hazy and not args.probe_output_dir:
+        raise ValueError("probe_output_dir is required when a target probe is configured")
     if all(key in vars(args) for key in MODEL_CONFIG_KEYS):
         validate_ema_config(args)
     return args
+
+
+def resolve_uda_config(raw_args, checkpoint_config, *, resume=False):
+    """Combine source architecture semantics with UDA runtime configuration.
+
+    The model and Source-loss options must always be read from the compatible
+    Source checkpoint.  UDA-only scheduling options stay user-configurable,
+    except when resuming an EMA-stage UDA checkpoint.
+    """
+    raw = vars(raw_args)
+    resolved = resolve_ema_config(raw_args, checkpoint_config, resume=resume)
+    semantic_values = (
+        {key: checkpoint_config[key] for key in UDA_SEMANTIC_KEYS}
+        if resume else {key: raw[key] for key in UDA_SEMANTIC_KEYS}
+    )
+    return {**resolved, **semantic_values}
 
 
 def build_uda_checkpoint_config(model_config, args):

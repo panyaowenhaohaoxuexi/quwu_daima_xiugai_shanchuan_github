@@ -66,7 +66,7 @@ def test_coa_clip_initialization_loads_vit_rn101_and_haze_prompt(monkeypatch):
 
 
 def test_real_loss_returns_coa_clip_term_for_student_clear_prediction(monkeypatch):
-    import EMA
+    from training import real_adaptation
 
     class _Dehazer(nn.Module):
         def __init__(self, scale):
@@ -80,8 +80,8 @@ def test_real_loss_returns_coa_clip_term_for_student_clear_prediction(monkeypatc
                 "route_soft": hazy[:, :1] * 0,
             }
 
-    monkeypatch.setattr(EMA, "stability_weights", lambda *_args: (1, 1, 1))
-    monkeypatch.setattr(EMA, "real_consistency_loss", lambda *args, **_kwargs: {"L_real": args[0].mean() * 0})
+    monkeypatch.setattr(real_adaptation, "stability_weights", lambda *_args: (1, 1, 1))
+    monkeypatch.setattr(real_adaptation, "real_consistency_loss", lambda *args, **_kwargs: {"L_real": args[0].mean() * 0, "L_R": args[0].mean() * 0})
     args = types.SimpleNamespace(
         route_tau_end=0.2,
         ema_sigma_j=0.1,
@@ -96,7 +96,7 @@ def test_real_loss_returns_coa_clip_term_for_student_clear_prediction(monkeypatc
     hazy = torch.ones(1, 3, 4, 4)
     student = _Dehazer(2.0)
 
-    result = EMA._real_loss(
+    result = real_adaptation.real_adaptation_loss(
         _Dehazer(1.0), student, hazy, hazy, torch.Generator().manual_seed(3), args,
         clip_criterion=criterion, text_features=torch.ones(1, 1),
     )
