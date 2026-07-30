@@ -13,6 +13,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from data.data_loader import RealMultiModalDataset, SynthMultiModalDataset, collate_real, collate_synth
+from loss.source import build_regional_reconstruction_criteria
 from loss.ema import real_consistency_loss, stability_weights
 from option.EMA import (build_ema_checkpoint_config, build_parser, prepare_experiment_dirs,
                         real_modal_dirs_from_args, resolve_ema_config, save_config,
@@ -189,6 +190,7 @@ def main(argv=None):
     )))
     _set_seed(args.model_init_seed)
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
+    reconstruction_criteria = build_regional_reconstruction_criteria(device)
     require_coa_clip_cuda(device)
     clip_criterion, text_features = initialize_coa_clip(device)
     student = build_model_from_config(vars(args)).to(device)
@@ -267,8 +269,10 @@ def main(argv=None):
             optimizer.zero_grad(set_to_none=True)
             real = _real_loss(teacher, student, real_hazy.to(device), real_tir.to(device), geometry_generator, args,
                               clip_criterion=clip_criterion, text_features=text_features)
-            source = compute_physical_mask_batch_losses(student, tuple(value.to(device) for value in source_batch),
-                                                        args, source_global_step)
+            source = compute_physical_mask_batch_losses(
+                student, tuple(value.to(device) for value in source_batch), args, source_global_step,
+                reconstruction_criteria=reconstruction_criteria,
+            )
             adapt = adaptation_loss(real, source, args)
             _require_finite(adapt, student, epoch=epoch, step=ema_global_step)
             optimizer.step()

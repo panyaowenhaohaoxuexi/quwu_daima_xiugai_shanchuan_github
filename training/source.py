@@ -25,7 +25,7 @@ def source_route_schedule(global_step, *, tau_start, tau_end, temperature_anneal
     }
 
 
-def compute_physical_mask_batch_losses(model, source_batch, args, global_step):
+def compute_physical_mask_batch_losses(model, source_batch, args, global_step, *, reconstruction_criteria):
     """The sole Source loss entry point; consumes five tensors and decodes once."""
     hazy, clear, tir, density_gt, completion_mask_gt = source_batch
     state = source_route_schedule(
@@ -36,9 +36,18 @@ def compute_physical_mask_batch_losses(model, source_batch, args, global_step):
     context = model.encode_context(hazy, tir, route_temperature=state["route_temperature"])
     gate = state["teacher_gate_alpha"] * completion_mask_gt + (1.0 - state["teacher_gate_alpha"]) * context["route_soft"]
     output = model.decode_with_route(context, route_mode="soft", route_override_value=gate)
+    global_ssim_criterion, global_contrast_criterion = reconstruction_criteria
     losses = compute_physical_mask_losses(
         output["pred_clear"], clear, output["density_map"], density_gt, output["route_logits"],
-        completion_mask_gt, lambda_density=args.lambda_density, lambda_route=args.lambda_route,
-        density_smooth_l1_beta=args.density_smooth_l1_beta,
+        completion_mask_gt, route_for_reconstruction=gate, boundary_map=output["boundary_map"],
+        hazy_rgb=hazy, global_ssim_criterion=global_ssim_criterion,
+        global_contrast_criterion=global_contrast_criterion, lambda_density=args.lambda_density,
+        lambda_route=args.lambda_route, density_smooth_l1_beta=args.density_smooth_l1_beta,
+        lambda_global=args.lambda_global, lambda_fuse=args.lambda_fuse, lambda_comp=args.lambda_comp,
+        lambda_boundary=args.lambda_boundary, global_l1_weight=args.global_l1_weight,
+        global_ssim_weight=args.global_ssim_weight, global_contrast_weight=args.global_contrast_weight,
+        region_l1_weight=args.region_l1_weight, region_gradient_weight=args.region_gradient_weight,
+        region_ssim_weight=args.region_ssim_weight, reconstruction_ssim_window=args.reconstruction_ssim_window,
+        reconstruction_min_valid_support=args.reconstruction_min_valid_support,
     )
     return {"output": output, "losses": losses, "gate": gate, "state": state}

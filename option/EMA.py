@@ -21,7 +21,11 @@ INHERITED_SOURCE_KEYS = (*MODEL_CONFIG_KEYS, "model_init_seed", "route_tau_start
                          "tir_fixed_max", "tir_percentile_low", "tir_percentile_high", "tir_percentile_scope",
                          "tir_dataset_percentile_low_value", "tir_dataset_percentile_high_value",
                          "tir_channel_tolerance_code_values", "tir_channel_tolerance_float", "pair_alignment_policy",
-                         "density_smooth_l1_beta", "lambda_density", "lambda_route")
+                         "density_smooth_l1_beta", "lambda_density", "lambda_route", "lambda_global",
+                         "lambda_fuse", "lambda_comp", "lambda_boundary", "global_l1_weight",
+                         "global_ssim_weight", "global_contrast_weight", "region_l1_weight",
+                         "region_gradient_weight", "region_ssim_weight", "reconstruction_ssim_window",
+                         "reconstruction_min_valid_support")
 EMA_RUNTIME_KEYS = ("device", "real_data_dir", "real_tir_dir", "source_anchor_data_dir", "validation_data_dir",
                     "source_checkpoint", "resume_checkpoint", "real_batch_size", "source_anchor_batch_size",
                     "validation_batch_size", "num_workers", "epochs", "iters_per_epoch", "start_lr", "end_lr",

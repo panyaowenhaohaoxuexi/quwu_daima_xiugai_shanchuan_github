@@ -12,6 +12,11 @@ def _write_rgb(path, value):
 
 
 def test_source_training_entrypoint_runs_tiny_batch_and_writes_epoch_checkpoint(tmp_path):
+    import Teacher
+    Teacher.build_regional_reconstruction_criteria = lambda device: (
+        type("OneSSIM", (nn.Module,), {"forward": lambda self, prediction, _clear: prediction.new_ones(())})().to(device),
+        type("ZeroContrast", (nn.Module,), {"forward": lambda self, prediction, _clear, _hazy: prediction.mean() * 0})().to(device),
+    )
     for directory in ("clear", "ir", "hazy/1_mist", "Transmission_Map_GT/1_mist", "mask_GT/1_mist"):
         (tmp_path / directory).mkdir(parents=True, exist_ok=True)
     _write_rgb(tmp_path / "clear" / "sample.png", 90)

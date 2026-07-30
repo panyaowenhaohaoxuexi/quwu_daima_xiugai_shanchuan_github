@@ -32,8 +32,6 @@ def test_legacy_model_kd_and_loss_modules_are_removed():
         "KD",
         "option.KD",
         "loss.Feature_alignment",
-        "loss.cr",
-        "loss.SSIM",
         "loss.teacher_region_loss",
     )
     for module_name in removed_modules:

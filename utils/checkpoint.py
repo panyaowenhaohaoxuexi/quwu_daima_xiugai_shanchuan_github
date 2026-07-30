@@ -20,8 +20,7 @@ LEGACY_ROUTE_CONFIG_KEYS = frozenset({
     "route_hard_start_step", "binary_loss_start_step", "binary_loss_warmup_steps",
     "omega_regions_per_image", "omega_min_area", "omega_max_area",
     "max_consecutive_empty_omega_steps", "q_temperature", "q_window_size",
-    "q_min_valid_support", "lambda_binary", "lambda_global", "lambda_fuse",
-    "lambda_comp", "lambda_boundary", "lambda_router",
+    "q_min_valid_support", "lambda_binary", "lambda_router",
 })
 LEGACY_ROUTER_STATE_MARKERS = ("router.raw_weight_in", "router.raw_weight_out", "router.bias_in", "router.bias_out")
 

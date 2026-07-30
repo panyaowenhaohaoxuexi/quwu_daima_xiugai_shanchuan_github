@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from data.data_loader import SynthMultiModalDataset, collate_synth
+from loss.source import build_regional_reconstruction_criteria
 from option.Teacher import (build_parser, persisted_config_from_args, prepare_experiment_dirs,
                             save_config, tir_normalization_config_from_args, validate_config)
 from training.source import compute_physical_mask_batch_losses
@@ -75,6 +76,7 @@ def main(argv=None):
     save_config(args)
     _set_seed(args.model_init_seed)
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
+    reconstruction_criteria = build_regional_reconstruction_criteria(device)
     config = persisted_config_from_args(args)
     dataset = SynthMultiModalDataset(
         args.train_data_dir, train=True, size=args.train_size, density_gt_semantics=args.density_gt_semantics,
@@ -138,7 +140,10 @@ def main(argv=None):
             )
             hazy, clear, tir, density, completion_mask = (value.to(device) for value in (hazy, clear, tir, density, completion_mask))
             optimizer.zero_grad(set_to_none=True)
-            result = compute_physical_mask_batch_losses(model, (hazy, clear, tir, density, completion_mask), args, global_step)
+            result = compute_physical_mask_batch_losses(
+                model, (hazy, clear, tir, density, completion_mask), args, global_step,
+                reconstruction_criteria=reconstruction_criteria,
+            )
             loss = result["losses"]["total"]
             _require_finite_loss(loss, epoch=epoch, step=global_step)
             loss.backward()

@@ -81,6 +81,12 @@ def add_training_arguments(parser):
     parser.add_argument("--no_lr_sche", action="store_true"); parser.add_argument("--resume_checkpoint", default="")
     parser.add_argument("--density_smooth_l1_beta", type=float, default=0.1)
     parser.add_argument("--lambda_density", type=float, default=1.0); parser.add_argument("--lambda_route", type=float, default=1.0)
+    parser.add_argument("--lambda_global", type=float, default=1.0); parser.add_argument("--lambda_fuse", type=float, default=1.0)
+    parser.add_argument("--lambda_comp", type=float, default=1.0); parser.add_argument("--lambda_boundary", type=float, default=1.0)
+    parser.add_argument("--global_l1_weight", type=float, default=0.8); parser.add_argument("--global_ssim_weight", type=float, default=0.2)
+    parser.add_argument("--global_contrast_weight", type=float, default=0.05); parser.add_argument("--region_l1_weight", type=float, default=1.0)
+    parser.add_argument("--region_gradient_weight", type=float, default=0.2); parser.add_argument("--region_ssim_weight", type=float, default=0.2)
+    parser.add_argument("--reconstruction_ssim_window", type=int, default=7); parser.add_argument("--reconstruction_min_valid_support", type=int, default=4)
 
 
 def build_parser():
@@ -101,7 +107,9 @@ def validate_config(args):
     if args.route_temperature_anneal_steps < 0 or args.route_teacher_anneal_steps < 0: raise ValueError("route anneal steps must be non-negative")
     if args.train_size < 1 or min(args.batch_size, args.validation_batch_size) < 1 or args.num_workers < 0: raise ValueError("invalid Source batch configuration")
     if args.epochs < 1 or args.iters_per_epoch < 1 or min(args.start_lr, args.end_lr) <= 0: raise ValueError("invalid Source schedule")
-    if args.lambda_density < 0 or args.lambda_route < 0: raise ValueError("lambda coefficients must be non-negative")
+    if any(getattr(args, key) < 0 for key in vars(args) if key.startswith("lambda_") or key.endswith("_weight")): raise ValueError("loss weights must be non-negative")
+    if args.reconstruction_ssim_window <= 0 or args.reconstruction_ssim_window % 2 == 0: raise ValueError("reconstruction_ssim_window must be positive and odd")
+    if args.reconstruction_min_valid_support < 1: raise ValueError("reconstruction_min_valid_support must be >= 1")
     if args.tir_normalization == "fixed_range" and not args.tir_fixed_max > args.tir_fixed_min: raise ValueError("TIR fixed max must exceed min")
     if not 0 <= args.tir_percentile_low < args.tir_percentile_high <= 100: raise ValueError("invalid TIR percentiles")
     if args.density_map_normalization == "fixed_range" and not args.density_fixed_max > args.density_fixed_min: raise ValueError("density fixed max must exceed min")

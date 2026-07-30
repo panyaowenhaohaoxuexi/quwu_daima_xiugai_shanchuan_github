@@ -13,6 +13,11 @@ def test_ema_source_anchor_consumes_v2_five_item_batch(tmp_path, monkeypatch):
         def forward(self, prediction, _text): return prediction.mean() * 0
     monkeypatch.setattr(EMA, "initialize_coa_clip", lambda device: (_ZeroClip().to(device), torch.zeros(1, 1, device=device)))
     monkeypatch.setattr(EMA, "require_coa_clip_cuda", lambda _device: None)
+    criteria = lambda device: (type("OneSSIM", (nn.Module,), {"forward": lambda self, prediction, _clear: prediction.new_ones(())})().to(device),
+                               type("ZeroContrast", (nn.Module,), {"forward": lambda self, prediction, _clear, _hazy: prediction.mean() * 0})().to(device))
+    monkeypatch.setattr(EMA, "build_regional_reconstruction_criteria", criteria)
+    import Teacher
+    monkeypatch.setattr(Teacher, "build_regional_reconstruction_criteria", criteria)
     for directory in ("clear", "ir", "hazy/1_mist", "Transmission_Map_GT/1_mist", "mask_GT/1_mist", "real/hazy", "real/tir"):
         (tmp_path / directory).mkdir(parents=True, exist_ok=True)
     _write_rgb(tmp_path / "clear" / "sample.png", 90); _write_rgb(tmp_path / "ir" / "sample.png", 40)
