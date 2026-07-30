@@ -76,7 +76,8 @@ def test_stage_a_entrypoint_writes_a_source_checkpoint(tmp_path, monkeypatch):
               "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu", "--style_probability", "1.0",
               "--style_beta_min", "1.0", "--style_beta_max", "1.0", "--saved_model_dir", str(uda_dir),
               "--exp_dir", str(tmp_path / "uda-exp"), "--probe_hazy", str(tmp_path / "real" / "hazy" / "real.png"),
-              "--probe_tir", str(tmp_path / "real" / "tir" / "real.png"), "--probe_output_dir", str(probe_dir)])
+              "--probe_tir", str(tmp_path / "real" / "tir" / "real.png"), "--probe_output_dir", str(probe_dir),
+              "--saved_data_dir", str(tmp_path / "uda-diagnostics")])
     checkpoint = torch.load(uda_dir / "source_style_last.pt", map_location="cpu")
     assert checkpoint["training_stage"] == "source"
     # Stage A continues the Source route/temperature schedule rather than resetting it.
@@ -131,7 +132,8 @@ def test_stage_b_entrypoint_delays_real_route_consistency(tmp_path, monkeypatch)
               "--source_anchor_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path),
               "--real_data_dir", str(tmp_path / "real"), "--real_tir_dir", str(tmp_path / "real" / "tir"),
               "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu", "--saved_model_dir", str(uda_dir),
-              "--exp_dir", str(exp_dir), "--route_consistency_warmup_steps", "10"])
+              "--exp_dir", str(exp_dir), "--saved_data_dir", str(tmp_path / "uda-ema-diagnostics"),
+              "--route_consistency_warmup_steps", "10", "--probe_hazy", "", "--probe_tir", ""])
     checkpoint = torch.load(uda_dir / "uda_ema_last.pt", map_location="cpu")
     assert checkpoint["training_stage"] == "ema"
     steps = [json.loads(line) for line in (exp_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]

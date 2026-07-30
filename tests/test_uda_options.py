@@ -1,6 +1,15 @@
 import pytest
 
-from option.UDA import build_parser, resolve_uda_config, validate_config
+from option.UDA import (UDA_RUN_STAGE, UDA_SOURCE_CHECKPOINT, UDA_STAGE_A_OUTPUT_DIR,
+                        build_parser, resolve_uda_config, validate_config)
+
+
+def test_uda_runs_from_central_code_defaults_without_cli_arguments():
+    args = build_parser().parse_args([])
+
+    assert args.stage == UDA_RUN_STAGE
+    assert args.source_checkpoint == UDA_SOURCE_CHECKPOINT
+    assert args.saved_model_dir == UDA_STAGE_A_OUTPUT_DIR
 
 
 def test_uda_parser_exposes_two_stages_and_target_style_defaults():

@@ -30,6 +30,8 @@ python Eval.py --checkpoint <source_or_ema_checkpoint> --hazy_dir <rgb_dir> --ti
 
 `UDA.py` 将 M3FD 明确作为无标注目标域：不生成 M3FD 的 clear、`M_GT` 或 `mask_GT`，不新增风格迁移预训练模型，也不改变硬路由的 0.5 阈值。
 
+训练参数、数据路径、输出目录和探针路径都集中在 [option/UDA.py](option/UDA.py) 顶部的“Direct training configuration”区域。通常无需传终端参数：配置完成后直接运行 `python UDA.py`。Stage A 验收后，仅把 `UDA_RUN_STAGE` 改为 `"ema"`；程序会自动改用 `source_style_best.pt` 和 Stage B 输出目录。
+
 先运行 Stage A。它仅用 M3FD RGB/TIR 的全局统计对 FLIR 的 `hazy/clear/tir` 做有界同步变换，FLIR 的五元组物理监督保持不变：
 
 ```powershell
