@@ -252,7 +252,9 @@ class FogRoutedRGBTIRDehazer(nn.Module):
 
     def decode_with_route(self, context: Dict[str, torch.Tensor], route_mode="soft",
                           route_override_value: Optional[torch.Tensor] = None,
-                          return_debug=False, boundary_mode=None):
+                          return_debug=False, boundary_mode=None,
+                          fusion_delta_scale: float = 1.0,
+                          capture_fusion_intermediates: bool = False):
         if route_mode not in ("soft", "hard"):
             raise ValueError("route_mode must be 'soft' or 'hard'")
         if boundary_mode is None:
@@ -272,6 +274,7 @@ class FogRoutedRGBTIRDehazer(nn.Module):
         hard_route = (active >= 0.5).to(active.dtype)
         exclude_full = torch.zeros_like(active)
         structures, appearances, validity_scales, debug_scales = {}, {}, {}, {}
+        fusion_intermediates = None
         reporting = None
         for name in self.scale_names:
             rgb = context["rgb_pyramid"][name]
@@ -291,6 +294,7 @@ class FogRoutedRGBTIRDehazer(nn.Module):
             renderer_weights = torch.softmax(self.selector[name](torch.cat((A, O), dim=1)), dim=1)
             delta = sum(renderer_weights[:, index:index + 1] * renderer(torch.cat((S, O), dim=1))
                         for index, renderer in enumerate(self.renderers[name]))
+            delta = delta * fusion_delta_scale
             density = F.interpolate(context["density_map"], size=size, mode="bilinear", align_corners=False)
             magnitude = torch.sigmoid(self.magnitude[name](density))
             fusion_candidate = self.fusion_residual[name](A + magnitude * delta)
@@ -313,6 +317,13 @@ class FogRoutedRGBTIRDehazer(nn.Module):
             }
             if name == "h2":
                 reporting = (confidence, fallback, mass, ratio, gate, boundary)
+                if capture_fusion_intermediates:
+                    fusion_intermediates = {
+                        "A": A.detach(), "S": S.detach(), "O": O.detach(),
+                        "delta": delta.detach(), "fusion_candidate": fusion_candidate.detach(),
+                        "completion_candidate": completion_candidate.detach(),
+                        "magnitude": magnitude.detach(),
+                    }
         decoded = None
         previous_name = None
         for name in reversed(self.scale_names):
@@ -340,6 +351,8 @@ class FogRoutedRGBTIRDehazer(nn.Module):
             "memory_fallback_mask": self._crop(F.interpolate(fallback, size=active.shape[-2:], mode="nearest"), original_size),
             "memory_retrieval_gate": self._crop(F.interpolate(gate, size=active.shape[-2:], mode="bilinear", align_corners=False), original_size),
         }
+        if capture_fusion_intermediates and fusion_intermediates is not None:
+            output["fusion_intermediates"] = fusion_intermediates
         if return_debug:
             output["debug"] = {
                 "structure_tokens": structures, "appearance_tokens": appearances,
