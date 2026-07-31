@@ -18,21 +18,21 @@ UDA_DEVICE = "cuda"
 
 UDA_FLIR_TRAIN_DIR = r"/root/autodl-tmp/1_FLIR/train"
 UDA_FLIR_VALIDATION_DIR = r"/root/autodl-tmp/1_FLIR/test"
-UDA_M3FD_ROOT_DIR = r"/root/autodl-tmp/2_M3FD"
-UDA_M3FD_TIR_DIR = r"/root/autodl-tmp/2_M3FD/ir"
+UDA_M3FD_ROOT_DIR = r"/root/autodl-tmp/2_M3FD_IVDehaze"
+UDA_M3FD_TIR_DIR = r"/root/autodl-tmp/2_M3FD_IVDehaze/ir"
 UDA_SOURCE_CHECKPOINT = r"/root/autodl-tmp/train_data_model/1_Teacher_train/source_best.pt"
 
-UDA_STAGE_A_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model/3_UDA_stage_a"
-UDA_STAGE_B_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model/4_UDA_stage_b"
-UDA_PROBE_HAZY = r"/root/autodl-tmp/2_M3FD/hazy/00343.png"
-UDA_PROBE_TIR = r"/root/autodl-tmp/2_M3FD/ir/00343.png"
+UDA_STAGE_A_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model/2_StageA_train"
+UDA_STAGE_B_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model/3_StageB_train"
+UDA_PROBE_HAZY = r"/root/autodl-tmp/2_M3FD_IVDehaze/hazy/00896.png"
+UDA_PROBE_TIR = r"/root/autodl-tmp/2_M3FD_IVDehaze/ir/00896.png"
 
-UDA_EPOCHS = 20
+UDA_EPOCHS = 10
 UDA_ITERS_PER_EPOCH = 1000
-UDA_NUM_WORKERS = 4
-UDA_REAL_BATCH_SIZE = 1
-UDA_SOURCE_ANCHOR_BATCH_SIZE = 1
-UDA_VALIDATION_BATCH_SIZE = 1
+UDA_NUM_WORKERS = 16
+UDA_REAL_BATCH_SIZE = 8
+UDA_SOURCE_ANCHOR_BATCH_SIZE = 8
+UDA_VALIDATION_BATCH_SIZE = 8
 UDA_START_LR = 1e-7
 UDA_END_LR = 1e-8
 
