@@ -10,6 +10,10 @@ from utils.model_config_validation import validate_model_config_values
 LOCAL_SOURCE_TRAIN_DIR = r"/root/autodl-tmp/1_FLIR/train"
 LOCAL_VALIDATION_DATA_DIR = r"/root/autodl-tmp/1_FLIR/test"
 LOCAL_TEACHER_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model/1_Teacher_train"
+# Optional fixed real-domain probe.  Leave all three empty to disable it.
+LOCAL_SOURCE_PROBE_HAZY = r""
+LOCAL_SOURCE_PROBE_TIR = r""
+LOCAL_SOURCE_PROBE_OUTPUT_DIR = r""
 
 
 def persisted_config_from_args(args):
@@ -95,6 +99,9 @@ def build_parser():
     parser.add_argument("--exp_dir", default=LOCAL_TEACHER_OUTPUT_DIR)
     parser.add_argument("--saved_model_dir", default=LOCAL_TEACHER_OUTPUT_DIR)
     parser.add_argument("--saved_data_dir", default="")
+    parser.add_argument("--source_probe_hazy", default=LOCAL_SOURCE_PROBE_HAZY)
+    parser.add_argument("--source_probe_tir", default=LOCAL_SOURCE_PROBE_TIR)
+    parser.add_argument("--source_probe_output_dir", default=LOCAL_SOURCE_PROBE_OUTPUT_DIR)
     return parser
 
 
@@ -110,6 +117,10 @@ def validate_config(args):
     if any(getattr(args, key) < 0 for key in vars(args) if key.startswith("lambda_") or key.endswith("_weight")): raise ValueError("loss weights must be non-negative")
     if args.reconstruction_ssim_window <= 0 or args.reconstruction_ssim_window % 2 == 0: raise ValueError("reconstruction_ssim_window must be positive and odd")
     if args.reconstruction_min_valid_support < 1: raise ValueError("reconstruction_min_valid_support must be >= 1")
+    if bool(args.source_probe_hazy) != bool(args.source_probe_tir):
+        raise ValueError("source_probe_hazy and source_probe_tir must be provided together")
+    if args.source_probe_hazy and not args.source_probe_output_dir:
+        raise ValueError("source_probe_output_dir is required when a Source probe is configured")
     if args.tir_normalization == "fixed_range" and not args.tir_fixed_max > args.tir_fixed_min: raise ValueError("TIR fixed max must exceed min")
     if not 0 <= args.tir_percentile_low < args.tir_percentile_high <= 100: raise ValueError("invalid TIR percentiles")
     if args.density_map_normalization == "fixed_range" and not args.density_fixed_max > args.density_fixed_min: raise ValueError("density fixed max must exceed min")
@@ -118,7 +129,7 @@ def validate_config(args):
 
 
 def prepare_experiment_dirs(args):
-    for value in (args.exp_dir, args.saved_model_dir, args.saved_data_dir):
+    for value in (args.exp_dir, args.saved_model_dir, args.saved_data_dir, args.source_probe_output_dir):
         if value: Path(value).mkdir(parents=True, exist_ok=True)
 
 

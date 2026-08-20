@@ -7,9 +7,12 @@ from time import perf_counter
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from PIL import Image
 from torch.utils.data import DataLoader
+from torchvision.transforms import functional as TF
 
-from data.data_loader import SynthMultiModalDataset, collate_synth
+from data.data_loader import SynthMultiModalDataset, collate_synth, load_tir_as_float_tensor
 from loss.source import build_regional_reconstruction_criteria
 from option.Teacher import (build_parser, persisted_config_from_args, prepare_experiment_dirs,
                             save_config, tir_normalization_config_from_args, validate_config)
@@ -26,6 +29,7 @@ from utils.visualize_fog_routed import build_diagnostic_panel
 SOURCE_RUNTIME_KEYS = (
     "train_data_dir", "validation_data_dir", "resume_checkpoint", "device", "epochs", "iters_per_epoch", "start_lr", "end_lr", "no_lr_sche",
     "batch_size", "validation_batch_size", "num_workers", "exp_dir", "saved_model_dir", "saved_data_dir",
+    "source_probe_hazy", "source_probe_tir", "source_probe_output_dir",
 )
 
 
@@ -59,6 +63,38 @@ def _require_finite_gradients(model, *, epoch, step, loss):
             raise RuntimeError(
                 f"source non-finite gradient: epoch={epoch} step={step} loss={float(loss.detach())} parameter={name}"
             )
+
+
+def _probe_image(value):
+    value = value.detach().float().cpu()[0].clamp(0.0, 1.0)
+    if value.shape[0] == 1:
+        value = value.repeat(3, 1, 1)
+    if value.shape[0] != 3:
+        raise ValueError("Source probe tensor must have one or three channels")
+    return Image.fromarray(value.permute(1, 2, 0).mul(255).round().byte().numpy(), mode="RGB")
+
+
+@torch.inference_mode()
+def save_source_probe(model, hazy_path, tir_path, output_dir, *, device, route_temperature,
+                      pair_alignment_policy, tir_normalization_config, prefix):
+    """Save real RGB--TIR predictions; it never consumes real-domain ground truth."""
+    hazy = TF.to_tensor(Image.open(hazy_path).convert("RGB")).unsqueeze(0)
+    tir = load_tir_as_float_tensor(tir_path, tir_normalization_config).unsqueeze(0)
+    if tir.shape[-2:] != hazy.shape[-2:]:
+        if pair_alignment_policy == "strict":
+            raise ValueError("Source probe RGB/TIR alignment mismatch under pair_alignment_policy='strict'")
+        tir = F.interpolate(tir, size=hazy.shape[-2:], mode="bilinear", align_corners=False)
+    was_training = model.training
+    model.eval()
+    output = model(hazy.to(device), tir.to(device), route_temperature=route_temperature, route_mode="hard")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("pred_clear", "density_map", "route_soft", "route_hard", "boundary_map"):
+        _probe_image(output[name]).save(output_dir / f"{prefix}_{name}.png")
+    if was_training:
+        model.train()
+    return {"density_mean": float(output["density_map"].mean().cpu()),
+            "route_hard_fraction": float(output["route_hard"].mean().cpu())}
 
 
 def main(argv=None):
@@ -179,6 +215,15 @@ def main(argv=None):
             torch.save(candidate, output_dir / "source_last.pt")
         logger.log_event("validation", epoch=epoch + 1, global_step=global_step, learning_rate=learning_rate,
                          psnr=validation["psnr"], ssim=validation["ssim"], best_psnr=best_psnr, is_best=is_best)
+        if is_best and args.source_probe_hazy:
+            probe_metrics = save_source_probe(
+                model, args.source_probe_hazy, args.source_probe_tir, args.source_probe_output_dir,
+                device=device, route_temperature=args.route_tau_end,
+                pair_alignment_policy=args.pair_alignment_policy,
+                tir_normalization_config=tir_normalization_config_from_args(args),
+                prefix=f"source_best_epoch_{epoch + 1:04d}_step_{global_step:08d}",
+            )
+            logger.log_event("source_probe", epoch=epoch + 1, global_step=global_step, **probe_metrics)
         print(f"source validation epoch={epoch + 1} psnr={validation['psnr']:.4f} "
               f"ssim={validation['ssim']:.4f} best_psnr={best_psnr:.4f} is_best={is_best}")
     return model
