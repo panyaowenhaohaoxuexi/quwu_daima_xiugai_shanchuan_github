@@ -7,13 +7,14 @@ from pathlib import Path
 from utils.model_config_validation import validate_model_config_values
 
 
-LOCAL_SOURCE_TRAIN_DIR = r"/root/autodl-tmp/1_FLIR/train"
-LOCAL_VALIDATION_DATA_DIR = r"/root/autodl-tmp/1_FLIR/test"
-LOCAL_TEACHER_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model/1_Teacher_train"
-# Optional fixed real-domain probe.  Leave all three empty to disable it.
-LOCAL_SOURCE_PROBE_HAZY = r""
-LOCAL_SOURCE_PROBE_TIR = r""
-LOCAL_SOURCE_PROBE_OUTPUT_DIR = r""
+LOCAL_SOURCE_TRAIN_DIR = r"/root/autodl-tmp/1_FLIR_v2/train"
+LOCAL_VALIDATION_DATA_DIR = r"/root/autodl-tmp/1_FLIR_v2/test"
+LOCAL_TEACHER_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model_v3/1_Teacher_train"
+# Optional fixed real-domain probe directories.  Leave all three empty to disable it.
+# Hazy/TIR files are paired by stem; ``vis-*`` hazy files also pair with ``ir-*`` TIR files.
+LOCAL_SOURCE_PROBE_HAZY = r"/root/autodl-tmp/train_test/hazy"
+LOCAL_SOURCE_PROBE_TIR = r"/root/autodl-tmp/train_test/ir"
+LOCAL_SOURCE_PROBE_OUTPUT_DIR = r"/root/autodl-tmp/train_test/output"
 
 
 def persisted_config_from_args(args):

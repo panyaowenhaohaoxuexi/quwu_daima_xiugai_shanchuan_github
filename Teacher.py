@@ -12,7 +12,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision.transforms import functional as TF
 
-from data.data_loader import SynthMultiModalDataset, collate_synth, load_tir_as_float_tensor
+from data.data_loader import RealMultiModalDataset, SynthMultiModalDataset, collate_synth, load_tir_as_float_tensor
 from loss.source import build_regional_reconstruction_criteria
 from option.Teacher import (build_parser, persisted_config_from_args, prepare_experiment_dirs,
                             save_config, tir_normalization_config_from_args, validate_config)
@@ -95,6 +95,31 @@ def save_source_probe(model, hazy_path, tir_path, output_dir, *, device, route_t
         model.train()
     return {"density_mean": float(output["density_map"].mean().cpu()),
             "route_hard_fraction": float(output["route_hard"].mean().cpu())}
+
+
+@torch.inference_mode()
+def save_source_probe_directory(model, hazy_dir, tir_dir, output_dir, *, device, route_temperature,
+                                pair_alignment_policy, tir_normalization_config, prefix):
+    """Run and save a real RGB--TIR probe directory without any ground truth."""
+    if not Path(hazy_dir).is_dir() or not Path(tir_dir).is_dir():
+        raise ValueError("Source probe hazy and TIR inputs must both be directories")
+    dataset = RealMultiModalDataset(
+        hazy_dir, tir_dir, pair_alignment_policy=pair_alignment_policy,
+        tir_normalization_config=tir_normalization_config,
+    )
+    metrics = [
+        save_source_probe(
+            model, hazy_path, tir_path, output_dir, device=device, route_temperature=route_temperature,
+            pair_alignment_policy=pair_alignment_policy, tir_normalization_config=tir_normalization_config,
+            prefix=f"{prefix}_{Path(hazy_path).stem}",
+        )
+        for hazy_path, tir_path in dataset.samples
+    ]
+    return {
+        "probe_samples": len(metrics),
+        "density_mean": float(np.mean([item["density_mean"] for item in metrics])),
+        "route_hard_fraction": float(np.mean([item["route_hard_fraction"] for item in metrics])),
+    }
 
 
 def main(argv=None):
@@ -216,7 +241,7 @@ def main(argv=None):
         logger.log_event("validation", epoch=epoch + 1, global_step=global_step, learning_rate=learning_rate,
                          psnr=validation["psnr"], ssim=validation["ssim"], best_psnr=best_psnr, is_best=is_best)
         if is_best and args.source_probe_hazy:
-            probe_metrics = save_source_probe(
+            probe_metrics = save_source_probe_directory(
                 model, args.source_probe_hazy, args.source_probe_tir, args.source_probe_output_dir,
                 device=device, route_temperature=args.route_tau_end,
                 pair_alignment_policy=args.pair_alignment_policy,
