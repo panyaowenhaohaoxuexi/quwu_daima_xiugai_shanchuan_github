@@ -145,6 +145,7 @@ def main(argv=None):
         density_fixed_max=args.density_fixed_max, density_calibrated_min=args.density_calibrated_min,
         density_calibrated_max=args.density_calibrated_max, tir_normalization_config=tir_normalization_config_from_args(args),
         pair_alignment_policy=args.pair_alignment_policy, augmentation_seed_base=args.model_init_seed,
+        allow_missing_density=True,
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
                         collate_fn=collate_synth)
@@ -191,7 +192,7 @@ def main(argv=None):
         logical_step = 0
         while logical_step < args.iters_per_epoch:
             step_started = perf_counter()
-            hazy, clear, tir, density, completion_mask = next(batch_iterator)
+            hazy, clear, tir, density, completion_mask, density_valid = next(batch_iterator)
             if hazy.numel() == 0:
                 continue
             schedule_step = epoch * args.iters_per_epoch + logical_step + 1
@@ -199,10 +200,12 @@ def main(argv=None):
                 optimizer, step=schedule_step, total_steps=total_steps, start_lr=args.start_lr,
                 end_lr=args.end_lr, no_lr_sche=args.no_lr_sche,
             )
-            hazy, clear, tir, density, completion_mask = (value.to(device) for value in (hazy, clear, tir, density, completion_mask))
+            hazy, clear, tir, density, completion_mask, density_valid = (
+                value.to(device) for value in (hazy, clear, tir, density, completion_mask, density_valid)
+            )
             optimizer.zero_grad(set_to_none=True)
             result = compute_physical_mask_batch_losses(
-                model, (hazy, clear, tir, density, completion_mask), args, global_step,
+                model, (hazy, clear, tir, density, completion_mask, density_valid), args, global_step,
                 reconstruction_criteria=reconstruction_criteria,
             )
             loss = result["losses"]["total"]

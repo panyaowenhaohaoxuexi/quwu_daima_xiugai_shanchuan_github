@@ -212,12 +212,13 @@ def _image_size(path):
 
 
 class SynthMultiModalDataset(data.Dataset):
-    """Paired synthetic `(hazy RGB, clear RGB, TIR, density, completion mask)` samples."""
+    """Synthetic Source samples with optional density supervision during training."""
 
     def __init__(self, root, train=True, size=256, haze_levels=None, density_gt_semantics="density",
                  density_map_normalization="dtype_range", density_fixed_min=None, density_fixed_max=None,
                  density_calibrated_min=None, density_calibrated_max=None, tir_normalization_config=None,
-                 pair_alignment_policy="strict", augmentation_seed_base=0, sampler_epoch=0):
+                 pair_alignment_policy="strict", augmentation_seed_base=0, sampler_epoch=0,
+                 allow_missing_density=False):
         self.root, self.train, self.size = os.fspath(root), bool(train), size
         self.haze_levels = tuple(haze_levels or DEFAULT_HAZE_LEVELS)
         self.density_gt_semantics, self.density_map_normalization = density_gt_semantics, density_map_normalization
@@ -228,6 +229,7 @@ class SynthMultiModalDataset(data.Dataset):
             raise ValueError("pair_alignment_policy must be 'strict' or 'resize_tir_to_rgb'")
         self.pair_alignment_policy = pair_alignment_policy
         self.augmentation_seed_base, self.sampler_epoch = int(augmentation_seed_base), int(sampler_epoch)
+        self.allow_missing_density = bool(allow_missing_density)
         self.samples, self.level_counts = [], {level: 0 for level in self.haze_levels}
         self.missing_counts = {"clear": 0, "ir": 0, "density": 0, "mask": 0}
         clear_index, tir_index = _stem_index(os.path.join(root, "clear"), SYNTH_IMAGE_EXTS), _stem_index(os.path.join(root, "ir"), SYNTH_IMAGE_EXTS)
@@ -242,7 +244,9 @@ class SynthMultiModalDataset(data.Dataset):
                 tir_path, _ = _lookup_stem(tir_index, stem)
                 density_path, _ = _lookup_stem(density_index, stem)
                 mask_path, _ = _lookup_stem(mask_index, stem)
-                if clear_path is None or tir_path is None or density_path is None or mask_path is None:
+                missing_required = clear_path is None or tir_path is None or mask_path is None
+                missing_density = density_path is None
+                if missing_required or (missing_density and not self.allow_missing_density):
                     self.missing_counts["clear"] += int(clear_path is None)
                     self.missing_counts["ir"] += int(tir_path is None)
                     self.missing_counts["density"] += int(density_path is None)
@@ -250,7 +254,8 @@ class SynthMultiModalDataset(data.Dataset):
                     continue
                 self.samples.append({"image_name": filename, "haze_level": level,
                                       "hazy_path": os.path.join(hazy_dir, filename), "clear_path": clear_path,
-                                      "tir_path": tir_path, "density_path": density_path, "mask_path": mask_path})
+                                      "tir_path": tir_path, "density_path": density_path, "mask_path": mask_path,
+                                      "density_valid": density_path is not None})
                 self.level_counts[level] += 1
 
     def set_sampler_epoch(self, epoch):
@@ -295,17 +300,21 @@ class SynthMultiModalDataset(data.Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        sizes = {name: _image_size(sample[f"{name}_path"]) for name in ("hazy", "clear", "tir", "density", "mask")}
-        if sizes["clear"] != sizes["hazy"] or sizes["density"] != sizes["hazy"] or sizes["mask"] != sizes["hazy"] or (
+        sizes = {name: _image_size(sample[f"{name}_path"]) for name in ("hazy", "clear", "tir", "mask")}
+        if sample["density_path"] is not None:
+            sizes["density"] = _image_size(sample["density_path"])
+        if sizes["clear"] != sizes["hazy"] or sizes["mask"] != sizes["hazy"] or (
+            "density" in sizes and sizes["density"] != sizes["hazy"]
+        ) or (
             sizes["tir"] != sizes["hazy"] and self.pair_alignment_policy != "resize_tir_to_rgb"
         ):
             raise ValueError(f"pair alignment failed policy={self.pair_alignment_policy}, sizes={sizes}")
         hazy, clear = _load_rgb(sample["hazy_path"]), _load_rgb(sample["clear_path"])
         tir = load_tir_as_float_tensor(sample["tir_path"], self.tir_normalization_config)
-        density = convert_density_semantics(load_scalar_map_as_float_tensor(
-            sample["density_path"], normalization=self.density_map_normalization, **self.density_normalization_kwargs
-        ), self.density_gt_semantics)
         completion_mask = (load_scalar_map_as_float_tensor(sample["mask_path"]) > 0.5).float()
+        density = (convert_density_semantics(load_scalar_map_as_float_tensor(
+            sample["density_path"], normalization=self.density_map_normalization, **self.density_normalization_kwargs
+        ), self.density_gt_semantics) if sample["density_valid"] else torch.zeros_like(completion_mask))
         if tir.shape[-2:] != hazy.shape[-2:]:
             tir = F.interpolate(tir.unsqueeze(0), size=hazy.shape[-2:], mode="bilinear", align_corners=False)[0]
         if self.train:
@@ -313,7 +322,8 @@ class SynthMultiModalDataset(data.Dataset):
                 [hazy, clear, tir, density, completion_mask], self.geometry_description(index, hazy.shape[-2:]),
                 interpolation_modes=("bilinear", "bilinear", "bilinear", "bilinear", "nearest"),
             )
-        return hazy, clear, tir, density.clamp(0.0, 1.0), (completion_mask > 0.5).float()
+        result = (hazy, clear, tir, density.clamp(0.0, 1.0), (completion_mask > 0.5).float())
+        return result + (torch.tensor(sample["density_valid"], dtype=torch.bool),) if self.allow_missing_density else result
 
     def __len__(self):
         return len(self.samples)

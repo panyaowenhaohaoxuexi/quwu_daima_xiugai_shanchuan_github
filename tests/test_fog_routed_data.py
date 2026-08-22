@@ -89,6 +89,31 @@ def test_synth_dataset_returns_aligned_binary_completion_mask(tmp_path):
     assert float(tir.max()) <= 1.0
 
 
+def test_synth_training_dataset_keeps_mask_supervised_sample_without_density_gt(tmp_path):
+    for directory in ("clear", "ir", "hazy/1_mist", "mask_GT/1_mist"):
+        (tmp_path / directory).mkdir(parents=True, exist_ok=True)
+    _write_rgb(tmp_path / "clear" / "partial.png", value=20)
+    _write_rgb(tmp_path / "ir" / "partial.png", value=30)
+    _write_rgb(tmp_path / "hazy" / "1_mist" / "partial.png", value=40)
+    Image.fromarray(np.full((7, 9), 255, dtype=np.uint8), mode="L").save(
+        tmp_path / "mask_GT" / "1_mist" / "partial.png"
+    )
+
+    strict = SynthMultiModalDataset(str(tmp_path), train=True, size=7, haze_levels=("1_mist",))
+    partial = SynthMultiModalDataset(
+        str(tmp_path), train=True, size=7, haze_levels=("1_mist",), allow_missing_density=True,
+    )
+
+    assert len(strict) == 0
+    assert len(partial) == 1
+    hazy, clear, tir, density, completion_mask, density_valid = partial[0]
+    assert hazy.shape == clear.shape == tir.shape == (3, 7, 7)
+    assert density.shape == completion_mask.shape == (1, 7, 7)
+    assert torch.equal(density, torch.zeros_like(density))
+    assert completion_mask.bool().all()
+    assert density_valid.item() is False
+
+
 def test_real_dataset_returns_only_hazy_tir_and_metadata(tmp_path):
     hazy_dir, tir_dir = tmp_path / "hazy", tmp_path / "tir"
     hazy_dir.mkdir()

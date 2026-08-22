@@ -175,7 +175,7 @@ def main(argv=None):
         density_fixed_min=args.density_fixed_min, density_fixed_max=args.density_fixed_max,
         density_calibrated_min=args.density_calibrated_min, density_calibrated_max=args.density_calibrated_max,
         tir_normalization_config=tir_normalization_config_from_args(args), pair_alignment_policy=args.pair_alignment_policy,
-        augmentation_seed_base=args.model_init_seed)
+        augmentation_seed_base=args.model_init_seed, allow_missing_density=True)
     real_loader = DataLoader(real_dataset, batch_size=args.real_batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_real)
     source_loader = DataLoader(source_dataset, batch_size=args.source_anchor_batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_synth)
     validation_dataset = SynthMultiModalDataset(args.validation_data_dir, train=False, size="full",

@@ -124,7 +124,7 @@ def route_consistency_multiplier(step, *, warmup_steps, ramp_steps):
 def style_source_batch(source_batch, target_hazy, target_tir, *, generator, probability,
                        beta_min, beta_max, min_gain, max_gain, max_abs_bias):
     """Apply target statistics only to Source modalities, never to physical labels."""
-    hazy, clear, tir, density_gt, completion_mask_gt = source_batch
+    hazy, clear, tir, density_gt, completion_mask_gt, *extra_labels = source_batch
     if target_hazy.shape[0] != hazy.shape[0] or target_tir.shape[0] != hazy.shape[0]:
         raise ValueError("target reference batch size must match the Source batch")
     if not 0.0 <= float(probability) <= 1.0 or not 0.0 <= float(beta_min) <= float(beta_max) <= 1.0:
@@ -139,7 +139,7 @@ def style_source_batch(source_batch, target_hazy, target_tir, *, generator, prob
         target_tir.to(device=hazy.device, dtype=hazy.dtype), beta=beta,
         min_gain=min_gain, max_gain=max_gain, max_abs_bias=max_abs_bias,
     )
-    return (styled.hazy, styled.clear, styled.tir, density_gt, completion_mask_gt), apply_mask.to(hazy.device)
+    return (styled.hazy, styled.clear, styled.tir, density_gt, completion_mask_gt, *extra_labels), apply_mask.to(hazy.device)
 
 
 def build_target_reference_loader(dataset, *, batch_size, num_workers, drop_last):
@@ -173,7 +173,7 @@ def _build_datasets_and_loaders(args, *, target_batch_size, target_drop_last=Fal
         density_fixed_min=args.density_fixed_min, density_fixed_max=args.density_fixed_max,
         density_calibrated_min=args.density_calibrated_min, density_calibrated_max=args.density_calibrated_max,
         tir_normalization_config=normalizer, pair_alignment_policy=args.pair_alignment_policy,
-        augmentation_seed_base=args.model_init_seed,
+        augmentation_seed_base=args.model_init_seed, allow_missing_density=True,
     )
     validation_dataset = SynthMultiModalDataset(
         args.validation_data_dir, train=False, size="full", density_gt_semantics=args.density_gt_semantics,

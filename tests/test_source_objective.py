@@ -44,6 +44,43 @@ def test_physical_mask_objective_is_finite_for_empty_and_full_masks():
         assert 1.0 <= float(losses["pos_weight"]) <= 100.0
 
 
+def test_physical_mask_objective_computes_density_only_for_samples_with_density_gt():
+    prediction = torch.zeros(2, 3, 2, 2)
+    density = torch.ones(2, 1, 2, 2, requires_grad=True)
+    density_gt = torch.cat((torch.zeros_like(density[:1]), torch.full_like(density[1:], 100.0)))
+    logits = torch.zeros_like(density, requires_grad=True)
+    route = torch.zeros_like(density)
+    losses = compute_physical_mask_losses(
+        prediction, prediction, density, density_gt, logits, torch.zeros_like(density),
+        density_valid=torch.tensor([True, False]), route_for_reconstruction=route,
+        boundary_map=route, hazy_rgb=prediction,
+        global_ssim_criterion=lambda _pred, _clear: prediction.new_tensor(1.0),
+        global_contrast_criterion=lambda _pred, _clear, _hazy: prediction.new_zeros(()),
+        density_smooth_l1_beta=0.1,
+    )
+
+    assert losses["density"].item() == pytest.approx(0.95)
+    assert losses["density_valid_samples"].item() == 1
+
+
+def test_physical_mask_objective_has_zero_density_loss_when_no_density_gt_is_available():
+    prediction = torch.zeros(2, 3, 2, 2)
+    density = torch.ones(2, 1, 2, 2, requires_grad=True)
+    logits = torch.zeros_like(density)
+    route = torch.zeros_like(density)
+    losses = compute_physical_mask_losses(
+        prediction, prediction, density, torch.zeros_like(density), logits, torch.zeros_like(density),
+        density_valid=torch.tensor([False, False]), route_for_reconstruction=route,
+        boundary_map=route, hazy_rgb=prediction,
+        global_ssim_criterion=lambda _pred, _clear: prediction.new_tensor(1.0),
+        global_contrast_criterion=lambda _pred, _clear, _hazy: prediction.new_zeros(()),
+    )
+
+    losses["density"].backward()
+    assert losses["density"].item() == 0.0
+    assert torch.equal(density.grad, torch.zeros_like(density.grad))
+
+
 def test_regional_reconstruction_uses_old_global_fuse_comp_boundary_weights():
     prediction = torch.ones(1, 3, 8, 8)
     target = torch.zeros_like(prediction)

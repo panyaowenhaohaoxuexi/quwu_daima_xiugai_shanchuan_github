@@ -87,7 +87,8 @@ def test_stage_a_entrypoint_writes_a_source_checkpoint(tmp_path, monkeypatch):
     Teacher.main(["--train_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path),
                   "--train_size", "32", "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu",
                   "--base_channels", "8", "--memory_max_tokens", "16", "--memory_topk", "2",
-                  "--saved_model_dir", str(source_dir), "--exp_dir", str(tmp_path / "source-exp")])
+                  "--saved_model_dir", str(source_dir), "--exp_dir", str(tmp_path / "source-exp"),
+                  "--source_probe_hazy", "", "--source_probe_tir", "", "--source_probe_output_dir", ""])
     uda_dir = tmp_path / "uda"
     probe_dir = tmp_path / "probe"
     UDA.main(["--stage", "source_style", "--source_checkpoint", str(source_dir / "source_last.pt"),
@@ -144,9 +145,10 @@ def test_stage_b_entrypoint_delays_real_route_consistency(tmp_path, monkeypatch)
     monkeypatch.setattr(EMA, "initialize_coa_clip", lambda device: (ZeroClip().to(device), torch.zeros(1, 1, device=device)))
     source_dir = tmp_path / "source"
     Teacher.main(["--train_data_dir", str(tmp_path), "--validation_data_dir", str(tmp_path), "--train_size", "32",
-                  "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu", "--base_channels", "8",
-                  "--memory_max_tokens", "16", "--memory_topk", "2", "--saved_model_dir", str(source_dir),
-                  "--exp_dir", str(tmp_path / "source-exp")])
+                      "--epochs", "1", "--iters_per_epoch", "1", "--device", "cpu", "--base_channels", "8",
+                      "--memory_max_tokens", "16", "--memory_topk", "2", "--saved_model_dir", str(source_dir),
+                      "--exp_dir", str(tmp_path / "source-exp"), "--source_probe_hazy", "",
+                      "--source_probe_tir", "", "--source_probe_output_dir", ""])
     uda_dir = tmp_path / "uda-ema"
     exp_dir = tmp_path / "uda-ema-exp"
     UDA.main(["--stage", "ema", "--source_checkpoint", str(source_dir / "source_last.pt"),

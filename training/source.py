@@ -26,8 +26,14 @@ def source_route_schedule(global_step, *, tau_start, tau_end, temperature_anneal
 
 
 def compute_physical_mask_batch_losses(model, source_batch, args, global_step, *, reconstruction_criteria):
-    """The sole Source loss entry point; consumes five tensors and decodes once."""
-    hazy, clear, tir, density_gt, completion_mask_gt = source_batch
+    """The sole Source loss entry point; supports full and density-partial Source batches."""
+    if len(source_batch) == 5:
+        hazy, clear, tir, density_gt, completion_mask_gt = source_batch
+        density_valid = None
+    elif len(source_batch) == 6:
+        hazy, clear, tir, density_gt, completion_mask_gt, density_valid = source_batch
+    else:
+        raise ValueError("Source batch must contain five tensors plus an optional density_valid flag")
     state = source_route_schedule(
         global_step, tau_start=args.route_tau_start, tau_end=args.route_tau_end,
         temperature_anneal_steps=args.route_temperature_anneal_steps,
@@ -42,6 +48,7 @@ def compute_physical_mask_batch_losses(model, source_batch, args, global_step, *
         completion_mask_gt, route_for_reconstruction=gate, boundary_map=output["boundary_map"],
         hazy_rgb=hazy, global_ssim_criterion=global_ssim_criterion,
         global_contrast_criterion=global_contrast_criterion, lambda_density=args.lambda_density,
+        density_valid=density_valid,
         lambda_route=args.lambda_route, density_smooth_l1_beta=args.density_smooth_l1_beta,
         lambda_global=args.lambda_global, lambda_fuse=args.lambda_fuse, lambda_comp=args.lambda_comp,
         lambda_boundary=args.lambda_boundary, global_l1_weight=args.global_l1_weight,

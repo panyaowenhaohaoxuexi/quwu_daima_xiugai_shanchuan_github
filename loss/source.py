@@ -22,6 +22,7 @@ def build_regional_reconstruction_criteria(device):
 def compute_physical_mask_losses(pred_clear, clear_rgb, density_map, density_gt, route_logits,
                                  completion_mask_gt, *, route_for_reconstruction, boundary_map,
                                  hazy_rgb, global_ssim_criterion, global_contrast_criterion,
+                                 density_valid=None,
                                  lambda_density=1.0, lambda_route=1.0,
                                  density_smooth_l1_beta=0.1,
                                  lambda_global=1.0, lambda_fuse=1.0, lambda_comp=1.0,
@@ -55,7 +56,17 @@ def compute_physical_mask_losses(pred_clear, clear_rgb, density_map, density_gt,
     boundary_value = regional_reconstruction_error(pred_clear, clear_rgb, boundary, **regional_kwargs)
     reconstruction = (float(lambda_global) * global_loss + float(lambda_fuse) * fuse +
                       float(lambda_comp) * comp + float(lambda_boundary) * boundary_value)
-    density = F.smooth_l1_loss(density_map, density_gt, beta=density_smooth_l1_beta)
+    if density_valid is None:
+        density_valid = torch.ones(density_map.shape[0], dtype=torch.bool, device=density_map.device)
+    else:
+        density_valid = torch.as_tensor(density_valid, device=density_map.device, dtype=torch.bool).reshape(-1)
+        if density_valid.numel() != density_map.shape[0]:
+            raise ValueError("density_valid must contain one flag per batch sample")
+    density_per_sample = F.smooth_l1_loss(
+        density_map, density_gt, beta=density_smooth_l1_beta, reduction="none",
+    ).flatten(1).mean(dim=1)
+    density_weights = density_valid.to(dtype=density_per_sample.dtype)
+    density = (density_per_sample * density_weights).sum() / density_weights.sum().clamp_min(1.0)
     positives = completion_mask_gt.sum()
     negatives = completion_mask_gt.numel() - positives
     pos_weight = (negatives / positives.clamp_min(1.0)).clamp(1.0, 100.0).detach()
@@ -64,4 +75,5 @@ def compute_physical_mask_losses(pred_clear, clear_rgb, density_map, density_gt,
     return {"reconstruction": reconstruction, "global": global_loss, "global_l1": global_l1,
             "global_ssim": global_ssim, "global_contrast": global_contrast, "fuse": fuse,
             "comp": comp, "boundary": boundary_value, "density": density, "route": route,
-            "total": total, "pos_weight": pos_weight}
+            "total": total, "pos_weight": pos_weight,
+            "density_valid_samples": density_valid.sum().detach()}
