@@ -16,21 +16,21 @@ from utils.model_config_validation import MODEL_CONFIG_KEYS
 UDA_RUN_STAGE = "source_style"  # "source_style" first, then change to "ema"
 UDA_DEVICE = "cuda"
 
-UDA_FLIR_TRAIN_DIR = r"/root/autodl-tmp/1_FLIR/train"
-UDA_FLIR_VALIDATION_DIR = r"/root/autodl-tmp/1_FLIR/test"
+UDA_FLIR_TRAIN_DIR = r"/root/autodl-tmp/1_FLIR_v2/train"
+UDA_FLIR_VALIDATION_DIR = r"/root/autodl-tmp/1_FLIR_v2/test"
 UDA_M3FD_ROOT_DIR = r"/root/autodl-tmp/2_M3FD_IVDehaze"
 UDA_M3FD_TIR_DIR = r"/root/autodl-tmp/2_M3FD_IVDehaze/ir"
-UDA_SOURCE_CHECKPOINT = r"/root/autodl-tmp/train_data_model/1_Teacher_train/source_best.pt"
+UDA_SOURCE_CHECKPOINT = r"/root/autodl-tmp/train_data_model_v3/1_Teacher_train/source_best.pt"
 
-UDA_STAGE_A_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model/2_StageA_train"
-UDA_STAGE_B_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model/3_StageB_train"
+UDA_STAGE_A_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model_v3/2_StageA_train"
+UDA_STAGE_B_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model_v3/3_StageB_train"
 UDA_PROBE_HAZY = r"/root/autodl-tmp/2_M3FD_IVDehaze/hazy/00896.png"
 UDA_PROBE_TIR = r"/root/autodl-tmp/2_M3FD_IVDehaze/ir/00896.png"
 # Optional Stage-A batch probe.  Files are paired by stem; ``vis-*`` hazy
 # names also pair with ``ir-*`` TIR names.  Leave all three empty to disable.
-UDA_SOURCE_PROBE_HAZY = r"/root/autodl-tmp/train_test/hazy"
-UDA_SOURCE_PROBE_TIR = r"/root/autodl-tmp/train_test/ir"
-UDA_SOURCE_PROBE_OUTPUT_DIR = r"/root/autodl-tmp/train_test/output"
+UDA_SOURCE_PROBE_HAZY = r"/root/autodl-tmp/train_test_v3/hazy"
+UDA_SOURCE_PROBE_TIR = r"/root/autodl-tmp/train_test_v3/ir"
+UDA_SOURCE_PROBE_OUTPUT_DIR = r"/root/autodl-tmp/train_test_v3/output_v2"
 
 UDA_EPOCHS = 10
 UDA_ITERS_PER_EPOCH = 1000
