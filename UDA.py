@@ -18,6 +18,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision.transforms import functional as TF
 
+from Teacher import save_source_probe_directory
 from data.data_loader import (RealMultiModalDataset, SynthMultiModalDataset, collate_real, collate_synth,
                               load_tir_as_float_tensor)
 from loss.source import build_regional_reconstruction_criteria
@@ -107,6 +108,19 @@ def _write_probe_if_requested(model, args, probe, *, prefix):
         return None
     return save_target_probe(
         model, *probe, args.probe_output_dir, route_temperature=args.route_tau_end, prefix=prefix,
+    )
+
+
+def write_source_style_best_probe_if_requested(model, args, device, *, is_best, epoch, global_step):
+    """Export a configured batch probe only when Stage-A validation improves."""
+    if not is_best or not args.source_probe_hazy:
+        return None
+    return save_source_probe_directory(
+        model, args.source_probe_hazy, args.source_probe_tir, args.source_probe_output_dir,
+        device=device, route_temperature=args.route_tau_end,
+        pair_alignment_policy=args.pair_alignment_policy,
+        tir_normalization_config=tir_normalization_config_from_args(args),
+        prefix=f"source_style_best_epoch_{epoch:04d}_step_{global_step:08d}",
     )
 
 
@@ -301,6 +315,11 @@ def _run_source_style_stage(args, checkpoint, checkpoint_config):
             torch.save(candidate, output_dir / "source_style_last.pt")
         logger.log_event("validation", epoch=epoch + 1, global_step=global_step, psnr=validation["psnr"],
                          ssim=validation["ssim"], best_psnr=best_psnr, is_best=is_best)
+        source_probe_metrics = write_source_style_best_probe_if_requested(
+            model, args, device, is_best=is_best, epoch=epoch + 1, global_step=global_step,
+        )
+        if source_probe_metrics is not None:
+            logger.log_event("source_probe", epoch=epoch + 1, global_step=global_step, **source_probe_metrics)
         probe_metrics = _write_probe_if_requested(model, args, probe, prefix=f"source_style_epoch_{epoch + 1:04d}")
         if probe_metrics is not None:
             logger.log_event("target_probe", epoch=epoch + 1, global_step=global_step,

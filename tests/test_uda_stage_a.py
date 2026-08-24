@@ -4,6 +4,61 @@ from UDA import (build_source_anchor_loader, build_target_reference_loader,
                  route_consistency_multiplier, style_source_batch)
 
 
+def test_uda_parser_accepts_source_style_directory_probe_configuration():
+    from option.UDA import build_parser
+
+    args = build_parser().parse_args([
+        "--source_probe_hazy", "/tmp/hazy",
+        "--source_probe_tir", "/tmp/ir",
+        "--source_probe_output_dir", "/tmp/outputs",
+    ])
+
+    assert args.source_probe_hazy == "/tmp/hazy"
+    assert args.source_probe_tir == "/tmp/ir"
+    assert args.source_probe_output_dir == "/tmp/outputs"
+
+
+def test_source_style_directory_probe_runs_only_for_a_best_checkpoint(monkeypatch, tmp_path):
+    import UDA
+
+    calls = []
+    monkeypatch.setattr(
+        UDA,
+        "save_source_probe_directory",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {"probe_samples": 2},
+    )
+    args = type("Args", (), {
+        "source_probe_hazy": str(tmp_path / "hazy"),
+        "source_probe_tir": str(tmp_path / "ir"),
+        "source_probe_output_dir": str(tmp_path / "outputs"),
+        "route_tau_end": 0.2,
+        "pair_alignment_policy": "strict",
+        "tir_normalization": "dtype_range",
+        "tir_fixed_min": None,
+        "tir_fixed_max": None,
+        "tir_percentile_low": 1.0,
+        "tir_percentile_high": 99.0,
+        "tir_percentile_scope": "image",
+        "tir_dataset_percentile_low_value": None,
+        "tir_dataset_percentile_high_value": None,
+        "tir_channel_tolerance_code_values": 0.0,
+        "tir_channel_tolerance_float": 0.0,
+    })()
+
+    skipped = UDA.write_source_style_best_probe_if_requested(
+        object(), args, torch.device("cpu"), is_best=False, epoch=2, global_step=20,
+    )
+    saved = UDA.write_source_style_best_probe_if_requested(
+        object(), args, torch.device("cpu"), is_best=True, epoch=3, global_step=30,
+    )
+
+    assert skipped is None
+    assert saved == {"probe_samples": 2}
+    assert len(calls) == 1
+    assert calls[0][0][1:4] == (args.source_probe_hazy, args.source_probe_tir, args.source_probe_output_dir)
+    assert calls[0][1]["prefix"] == "source_style_best_epoch_0003_step_00000030"
+
+
 def test_stage_a_target_reference_loader_discards_only_incomplete_multi_image_batch():
     dataset = [(torch.zeros(3, 8, 8), torch.zeros(3, 8, 8), {"sample_id": str(index)}) for index in range(5)]
 
@@ -99,6 +154,7 @@ def test_stage_a_entrypoint_writes_a_source_checkpoint(tmp_path, monkeypatch):
                   "--source_anchor_batch_size", "1", "--real_batch_size", "1", "--num_workers", "0",
                   "--exp_dir", str(tmp_path / "uda-exp"), "--probe_hazy", str(tmp_path / "real" / "hazy" / "real.png"),
               "--probe_tir", str(tmp_path / "real" / "tir" / "real.png"), "--probe_output_dir", str(probe_dir),
+              "--source_probe_hazy", "", "--source_probe_tir", "", "--source_probe_output_dir", "",
               "--saved_data_dir", str(tmp_path / "uda-diagnostics")])
     checkpoint = torch.load(uda_dir / "source_style_last.pt", map_location="cpu")
     assert checkpoint["training_stage"] == "source"

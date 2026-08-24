@@ -26,6 +26,11 @@ UDA_STAGE_A_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model/2_StageA_train"
 UDA_STAGE_B_OUTPUT_DIR = r"/root/autodl-tmp/train_data_model/3_StageB_train"
 UDA_PROBE_HAZY = r"/root/autodl-tmp/2_M3FD_IVDehaze/hazy/00896.png"
 UDA_PROBE_TIR = r"/root/autodl-tmp/2_M3FD_IVDehaze/ir/00896.png"
+# Optional Stage-A batch probe.  Files are paired by stem; ``vis-*`` hazy
+# names also pair with ``ir-*`` TIR names.  Leave all three empty to disable.
+UDA_SOURCE_PROBE_HAZY = r"/root/autodl-tmp/train_test/hazy"
+UDA_SOURCE_PROBE_TIR = r"/root/autodl-tmp/train_test/ir"
+UDA_SOURCE_PROBE_OUTPUT_DIR = r"/root/autodl-tmp/train_test/output"
 
 UDA_EPOCHS = 10
 UDA_ITERS_PER_EPOCH = 1000
@@ -86,6 +91,9 @@ def _direct_defaults():
         "route_consistency_ramp_steps": UDA_ROUTE_CONSISTENCY_RAMP_STEPS,
         "probe_hazy": UDA_PROBE_HAZY, "probe_tir": UDA_PROBE_TIR,
         "probe_output_dir": str(Path(output_dir) / "probe"),
+        "source_probe_hazy": UDA_SOURCE_PROBE_HAZY,
+        "source_probe_tir": UDA_SOURCE_PROBE_TIR,
+        "source_probe_output_dir": UDA_SOURCE_PROBE_OUTPUT_DIR,
     }
 
 
@@ -94,6 +102,7 @@ UDA_SEMANTIC_KEYS = (
     "style_min_gain", "style_max_gain", "style_max_abs_bias",
     "route_consistency_warmup_steps", "route_consistency_ramp_steps",
     "probe_hazy", "probe_tir", "probe_output_dir",
+    "source_probe_hazy", "source_probe_tir", "source_probe_output_dir",
 )
 
 
@@ -112,6 +121,9 @@ def build_parser():
     parser.add_argument("--probe_hazy", default=UDA_PROBE_HAZY)
     parser.add_argument("--probe_tir", default=UDA_PROBE_TIR)
     parser.add_argument("--probe_output_dir", default="")
+    parser.add_argument("--source_probe_hazy", default=UDA_SOURCE_PROBE_HAZY)
+    parser.add_argument("--source_probe_tir", default=UDA_SOURCE_PROBE_TIR)
+    parser.add_argument("--source_probe_output_dir", default=UDA_SOURCE_PROBE_OUTPUT_DIR)
     parser.set_defaults(**_direct_defaults())
     return parser
 
@@ -131,6 +143,10 @@ def validate_config(args):
         raise ValueError("probe_hazy and probe_tir must be provided together")
     if args.probe_hazy and not args.probe_output_dir:
         raise ValueError("probe_output_dir is required when a target probe is configured")
+    if bool(args.source_probe_hazy) != bool(args.source_probe_tir):
+        raise ValueError("source_probe_hazy and source_probe_tir must be provided together")
+    if args.source_probe_hazy and not args.source_probe_output_dir:
+        raise ValueError("source_probe_output_dir is required when a Source probe is configured")
     if all(key in vars(args) for key in MODEL_CONFIG_KEYS):
         validate_ema_config(args)
     return args
